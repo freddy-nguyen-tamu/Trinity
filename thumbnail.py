@@ -108,11 +108,6 @@ def get_playlist_entries(playlist_url):
     return [entry for entry in entries if not is_private_or_unavailable(entry)]
 
 
-def expected_mp3_path(title, video_id):
-    safe_title = title.replace("/", "_").replace("\\", "_").strip()
-    return os.path.join(DOWNLOAD_DIR, f"{safe_title} [{video_id}].mp3")
-
-
 def try_download(
     video_id,
     title_hint=None,
@@ -235,15 +230,9 @@ def download_playlist(playlist_url):
                     break
 
         if success:
-            mp3_path = expected_mp3_path(title, video_id)
-
-            if os.path.exists(mp3_path):
-                history.add(video_id)
-                save_history(history)
-                print(f"Saved to history: {title}")
-            else:
-                print(f"Download reported success, but mp3 not found: {mp3_path}")
-                print(f"Not adding to {HISTORY_FILE}")
+            history.add(video_id)
+            save_history(history)
+            print(f"Saved to history immediately after successful download: {title}")
         else:
             print(f"Giving up for now: {title}")
 
