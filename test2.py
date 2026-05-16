@@ -5,10 +5,12 @@ import time
 import unicodedata
 import requests
 
+from openai import OpenAI
+
 from mutagen import File
 from mutagen.mp3 import MP3
 from mutagen.flac import FLAC
-from mutagen.mp4 import MP4, MP4FreeForm
+from mutagen.mp4 import MP4
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, USLT, ID3NoHeaderError
 from mutagen.wave import WAVE
 from mutagen.aiff import AIFF
@@ -18,9 +20,9 @@ from mutagen.oggopus import OggOpus
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 AUDIO_FOLDER = os.path.join(BASE_DIR, "downloads")
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.1-8b-instant"
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+NVIDIA_MODEL = "deepseek-ai/deepseek-v3.2"
 
 LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
 LRCLIB_GET_URL = "https://lrclib.net/api/get"
@@ -39,11 +41,16 @@ SUPPORTED_EXTENSIONS = {
     ".aac",
 }
 
-if not GROQ_API_KEY:
-    raise SystemExit("GROQ_API_KEY is not set in the environment.")
+if not NVIDIA_API_KEY:
+    raise SystemExit("NVIDIA_API_KEY is not set.")
 
 if not os.path.isdir(AUDIO_FOLDER):
     raise SystemExit(f"Folder not found: {AUDIO_FOLDER}")
+
+client = OpenAI(
+    base_url=NVIDIA_BASE_URL,
+    api_key=NVIDIA_API_KEY
+)
 
 file_names = sorted(
     f for f in os.listdir(AUDIO_FOLDER)
@@ -53,11 +60,6 @@ file_names = sorted(
 
 if not file_names:
     raise SystemExit("No supported audio files found in folder.")
-
-headers = {
-    "Authorization": f"Bearer {GROQ_API_KEY}",
-    "Content-Type": "application/json",
-}
 
 lyrics_headers = {
     "User-Agent": "audio-lyrics-tagger/1.0"
@@ -161,71 +163,61 @@ def ensure_dict(obj):
     raise ValueError(f"Expected dict but got {type(obj).__name__}")
 
 
-def parse_retry_after_seconds(resp: requests.Response) -> float:
-    ra = resp.headers.get("retry-after")
-    if ra:
-        try:
-            return float(ra)
-        except ValueError:
-            pass
-
-    try:
-        j = resp.json()
-        msg = j.get("error", {}).get("message", "")
-        m = re.search(r"try again in\s+([0-9]*\.?[0-9]+)s", msg, re.IGNORECASE)
-        if m:
-            return float(m.group(1))
-    except Exception:
-        pass
-
-    return 2.0
-
-
-def groq_chat(messages, max_tokens=220, temperature=0, timeout=60, max_retries=8, json_mode=True):
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
-
+def nvidia_chat(messages, max_tokens=220, temperature=1.0, timeout=60, max_retries=8, json_mode=True):
     backoff = 1.0
 
     for attempt in range(1, max_retries + 1):
         try:
-            resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=timeout)
-        except requests.RequestException as e:
-            if attempt == max_retries:
-                raise SystemExit(f"Network error calling Groq: {e}")
-            wait_s = backoff + 0.25
-            print(f"[NET] Sleeping {wait_s:.2f}s (attempt {attempt}/{max_retries})")
-            time.sleep(wait_s)
-            backoff = min(backoff * 1.6, 20.0)
-            continue
+            kwargs = {
+                "model": NVIDIA_MODEL,
+                "messages": messages,
+                "temperature": temperature,
+                "top_p": 0.95,
+                "max_tokens": max_tokens,
+                "extra_body": {"chat_template_kwargs": {"thinking": True}},
+                "stream": True,
+            }
 
-        if resp.status_code == 200:
-            return resp.json()
+            if json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
 
-        if resp.status_code == 429:
-            wait_s = max(parse_retry_after_seconds(resp), backoff) + 0.25
-            print(f"[429] Rate limited. Sleeping {wait_s:.2f}s (attempt {attempt}/{max_retries})")
-            time.sleep(wait_s)
-            backoff = min(backoff * 1.6, 20.0)
-            continue
+            completion = client.chat.completions.create(**kwargs)
 
-        if resp.status_code == 400:
-            try:
-                err = resp.json()
-            except Exception:
-                err = {}
+            content_parts = []
+            reasoning_parts = []
 
-            code = err.get("error", {}).get("code", "")
-            if code == "json_validate_failed" and json_mode:
-                print("[400] JSON validation failed in JSON mode. Retrying without JSON mode...")
-                return groq_chat(
+            for chunk in completion:
+                if not getattr(chunk, "choices", None):
+                    continue
+
+                delta = chunk.choices[0].delta
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+
+                if delta.content is not None:
+                    content_parts.append(delta.content)
+
+            content = "".join(content_parts)
+            reasoning_content = "".join(reasoning_parts)
+
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": content,
+                            "reasoning_content": reasoning_content,
+                        }
+                    }
+                ]
+            }
+
+        except Exception as e:
+            err_text = str(e)
+
+            if json_mode and ("json" in err_text.lower() or "response_format" in err_text.lower()):
+                print("[WARN] JSON mode not supported or failed. Retrying without JSON mode...")
+                return nvidia_chat(
                     messages=messages,
                     max_tokens=max_tokens,
                     temperature=temperature,
@@ -234,9 +226,15 @@ def groq_chat(messages, max_tokens=220, temperature=0, timeout=60, max_retries=8
                     json_mode=False,
                 )
 
-        raise SystemExit(f"Groq API error: {resp.status_code} {resp.text}")
+            if attempt == max_retries:
+                raise SystemExit(f"NVIDIA API error: {e}")
 
-    raise SystemExit("Groq API error: too many retries.")
+            wait_s = backoff + 0.25
+            print(f"[API] Sleeping {wait_s:.2f}s (attempt {attempt}/{max_retries})")
+            time.sleep(wait_s)
+            backoff = min(backoff * 1.6, 20.0)
+
+    raise SystemExit("NVIDIA API error: too many retries.")
 
 
 def build_single_prompt(item_id, file_name):
@@ -264,7 +262,7 @@ def build_single_prompt(item_id, file_name):
 
 
 def call_and_parse(messages, max_tokens=220, json_mode=True):
-    data_json = groq_chat(messages, max_tokens=max_tokens, temperature=0, json_mode=json_mode)
+    data_json = nvidia_chat(messages, max_tokens=max_tokens, temperature=1, json_mode=json_mode)
     content = data_json["choices"][0]["message"]["content"]
 
     try:
@@ -274,7 +272,7 @@ def call_and_parse(messages, max_tokens=220, json_mode=True):
             {"role": "system", "content": "You repair malformed JSON. Return only valid JSON."},
             {"role": "user", "content": "Fix this into valid JSON only:\n\n" + content},
         ]
-        fixed = groq_chat(fix_messages, max_tokens=max_tokens, temperature=0, json_mode=False)
+        fixed = nvidia_chat(fix_messages, max_tokens=max_tokens, temperature=1, json_mode=False)
         fixed_content = fixed["choices"][0]["message"]["content"]
         return ensure_dict(extract_json_object(fixed_content))
 
@@ -400,7 +398,6 @@ def get_existing_basic_tags(file_path: str):
                 pass
 
         else:
-            # Generic fallback for other mutagen-supported formats
             if audio.tags:
                 title = _first_tag_value(audio.tags.get("title"))
                 artist = _first_tag_value(audio.tags.get("artist"))
@@ -576,7 +573,6 @@ def write_tags(file_path: str, title: str, artist: str, album: str = ""):
             tags.save(file_path, v2_version=3)
             return
 
-        # Generic fallback
         if audio.tags is None:
             try:
                 audio.add_tags()
