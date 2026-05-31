@@ -3,7 +3,9 @@ import json
 import time
 from yt_dlp import YoutubeDL
 
-DOWNLOAD_DIR = "downloads"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_BASE_DIR = r"C:\ytb"
+DOWNLOAD_DIR = os.path.join(OUTPUT_BASE_DIR, "_working_downloads")
 HISTORY_FILE = "download_history.json"
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLBkuXLqNhqX5FsS2CEaSDlGTKAHIBPtLe"
 

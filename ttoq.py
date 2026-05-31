@@ -2,7 +2,7 @@ import shutil
 from pathlib import Path
 
 # Source and destination paths
-src = Path(r"C:\Users\qacer\Downloads\ytb\downloads")
+src = Path(r"C:\ytb\finished")
 dst = Path(r"\\wsl.localhost\Ubuntu\home\qacer6973\projects\qshare_server\shared")
 
 # Ensure destination exists

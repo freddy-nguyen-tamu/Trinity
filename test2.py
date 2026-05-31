@@ -18,7 +18,7 @@ from mutagen.oggvorbis import OggVorbis
 from mutagen.oggopus import OggOpus
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-AUDIO_FOLDER = os.path.join(BASE_DIR, "downloads")
+AUDIO_FOLDER = r"C:\ytb\_working_downloads"
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")

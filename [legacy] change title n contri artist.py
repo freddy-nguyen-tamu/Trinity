@@ -3,7 +3,7 @@ from mutagen.easyid3 import EasyID3
 from mutagen.mp3 import MP3
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MP3_FOLDER = os.path.join(BASE_DIR, "downloads")
+MP3_FOLDER = r"C:\ytb\_working_downloads"
 
 # Hardcoded metadata for newly downloaded MP3 files
 metadata_list = []

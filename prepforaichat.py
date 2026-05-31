@@ -3,7 +3,7 @@ import io
 import subprocess
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-folder_path = os.path.join(BASE_DIR, "downloads")
+folder_path = r"C:\ytb\_working_downloads"
 
 # StringIO buffer to capture everything we print
 buffer = io.StringIO()

@@ -1,7 +1,7 @@
 import os
 import json
 
-folder_path = r"C:\Users\qacer\Downloads\ytb\downloads"
+folder_path = r"C:\ytb\finished"
 output_file = r"C:\Users\qacer\Downloads\ytb\filenames.json"
 
 file_names = [
