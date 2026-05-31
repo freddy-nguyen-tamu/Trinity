@@ -10,6 +10,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
 HISTORY_FILE = "download_history.json"
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLBkuXLqNhqX5FsS2CEaSDlGTKAHIBPtLe"
+ALREADY_DOWNLOADED_STREAK_LIMIT = 10
 
 # Use Firefox instead of Chrome to avoid DPAPI issues on Windows
 BROWSER = ("firefox",)
@@ -149,18 +150,29 @@ def download_playlist(playlist_url):
     # ------------------------------------------------------------------
     # DOWNLOAD EACH VIDEO
     # ------------------------------------------------------------------
+    already_downloaded_streak = 0
+
     for index, entry in enumerate(video_entries, start=1):
         video_id = entry.get("id")
         video_title = entry.get("title") or video_id
 
         if not video_id:
             print(f"Skipping entry #{index}: missing video id")
+            already_downloaded_streak = 0
             continue
 
         if video_id in history:
             print(f"Skipping already downloaded: {video_title}")
+            already_downloaded_streak += 1
+            if already_downloaded_streak >= ALREADY_DOWNLOADED_STREAK_LIMIT:
+                print(
+                    f"Reached {ALREADY_DOWNLOADED_STREAK_LIMIT} already-downloaded "
+                    "videos in a row; skipping the rest of this playlist."
+                )
+                break
             continue
 
+        already_downloaded_streak = 0
         print(f"[{index}/{len(video_entries)}] Downloading: {video_title}")
 
         # First try without cookies

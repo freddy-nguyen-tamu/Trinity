@@ -6,6 +6,7 @@ from yt_dlp import YoutubeDL
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
 HISTORY_FILE = "download_history.json"
+ALREADY_DOWNLOADED_STREAK_LIMIT = 10
 
 # Use Firefox instead of Chrome to avoid DPAPI issues on Windows
 BROWSER = ("firefox",)
@@ -43,14 +44,24 @@ def download_playlist(playlist_url):
     print(f"Playlist has {len(video_entries)} videos.")
 
     # Download each video
+    already_downloaded_streak = 0
+
     for entry in video_entries:
         video_id = entry.get("id")
         video_title = entry.get("title")
 
         if video_id in history:
             print(f"Skipping already downloaded: {video_title}")
+            already_downloaded_streak += 1
+            if already_downloaded_streak >= ALREADY_DOWNLOADED_STREAK_LIMIT:
+                print(
+                    f"Reached {ALREADY_DOWNLOADED_STREAK_LIMIT} already-downloaded "
+                    "videos in a row; skipping the rest of this playlist."
+                )
+                break
             continue
 
+        already_downloaded_streak = 0
         print(f"⬇ Downloading: {video_title}")
 
         ydl_opts_dl = {

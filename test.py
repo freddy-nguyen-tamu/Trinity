@@ -783,3 +783,11 @@ for idx, original_file_name in enumerate(file_names, start=1):
 
 print("\nDone.")
 print(json.dumps(all_metadata, ensure_ascii=False, indent=2))
+
+try:
+    from trinity import FINISHED_DIR, move_working_items_to_finished
+
+    moved_count = move_working_items_to_finished()
+    print(f"\nMOVED {moved_count} WORKING ITEM(S) TO: {FINISHED_DIR}")
+except Exception as e:
+    raise SystemExit(f"Could not move working files to finished: {e}")

@@ -7,6 +7,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
 HISTORY_FILE = "download_history.json"
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLBkuXLqNhqX5FsS2CEaSDlGTKAHIBPtLe"
+ALREADY_DOWNLOADED_STREAK_LIMIT = 10
 
 USE_COOKIES = False
 BROWSER = ("firefox",)
@@ -178,10 +179,13 @@ def download_playlist(playlist_url):
     entries = get_playlist_entries(playlist_url)
     print(f"Playlist has {len(entries)} downloadable videos.")
 
+    already_downloaded_streak = 0
+
     for index, entry in enumerate(entries, start=1):
         if is_private_or_unavailable(entry):
             title = entry.get("title") or f"video #{index}"
             print(f"Skipping private/unavailable video: {title}")
+            already_downloaded_streak = 0
             continue
 
         video_id = entry.get("id")
@@ -189,12 +193,21 @@ def download_playlist(playlist_url):
 
         if not video_id:
             print(f"Skipping entry #{index}: missing video id")
+            already_downloaded_streak = 0
             continue
 
         if video_id in history:
             print(f"Skipping already downloaded: {title}")
+            already_downloaded_streak += 1
+            if already_downloaded_streak >= ALREADY_DOWNLOADED_STREAK_LIMIT:
+                print(
+                    f"Reached {ALREADY_DOWNLOADED_STREAK_LIMIT} already-downloaded "
+                    "videos in a row; skipping the rest of this playlist."
+                )
+                break
             continue
 
+        already_downloaded_streak = 0
         print(f"\n[{index}/{len(entries)}] Processing: {title}")
 
         success = False
