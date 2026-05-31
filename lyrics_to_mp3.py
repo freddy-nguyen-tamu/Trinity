@@ -10,7 +10,7 @@ from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, USLT, ID3NoHeaderError
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MP3_FOLDER = r"C:\ytb\_working_downloads"
+MP3_FOLDER = os.path.join(BASE_DIR, "_working_downloads")
 
 # xAI / Grok
 XAI_API_KEY = os.getenv("XAI_API_KEY")

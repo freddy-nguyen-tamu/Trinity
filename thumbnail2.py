@@ -4,8 +4,7 @@ from yt_dlp import YoutubeDL
 
 # Config
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_BASE_DIR = r"C:\ytb"
-DOWNLOAD_DIR = os.path.join(OUTPUT_BASE_DIR, "_working_downloads")
+DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
 HISTORY_FILE = "download_history.json"
 
 # Use Firefox instead of Chrome to avoid DPAPI issues on Windows

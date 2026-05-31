@@ -8,9 +8,8 @@ PYTHON_EXE = r"C:\Users\qacer\AppData\Local\Python\pythoncore-3.14-64\python.exe
 
 # Folder where all scripts live
 SCRIPTS_DIR = r"C:\Users\qacer\Downloads\ytb"
-OUTPUT_BASE_DIR = r"C:\ytb"
-WORKING_DOWNLOADS_DIR = os.path.join(OUTPUT_BASE_DIR, "_working_downloads")
-FINISHED_DIR = os.path.join(OUTPUT_BASE_DIR, "finished")
+WORKING_DOWNLOADS_DIR = os.path.join(SCRIPTS_DIR, "_working_downloads")
+FINISHED_DIR = os.path.join(SCRIPTS_DIR, "finished")
 
 
 def prepare_output_dirs():

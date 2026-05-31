@@ -16,7 +16,7 @@ from mutagen.oggvorbis import OggVorbis
 from mutagen.oggopus import OggOpus
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-AUDIO_FOLDER = r"C:\ytb\_working_downloads"
+AUDIO_FOLDER = os.path.join(BASE_DIR, "_working_downloads")
 
 GROQ_API_KEYS = []
 

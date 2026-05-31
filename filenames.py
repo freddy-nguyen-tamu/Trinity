@@ -1,8 +1,9 @@
 import os
 import json
 
-folder_path = r"C:\ytb\finished"
-output_file = r"C:\Users\qacer\Downloads\ytb\filenames.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+folder_path = os.path.join(BASE_DIR, "finished")
+output_file = os.path.join(BASE_DIR, "filenames.json")
 
 file_names = [
     name for name in os.listdir(folder_path)
