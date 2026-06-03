@@ -6,7 +6,11 @@ _working_downloads/
 finished/
 trinity_run_log.txt
 _last_downloaded_manifest.json
+_last_test_manifest.json
 _last_upload_summary.json
+_test_processed_history.json
 _android_uploaded_history.json
 upload_debug_*.html
 upload_debug_*.png
+'download_history.json'  
+download_history.json 
