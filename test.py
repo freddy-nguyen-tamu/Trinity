@@ -1,3 +1,4 @@
+import argparse
 import os
 import json
 import re
@@ -16,7 +17,30 @@ from mutagen.oggvorbis import OggVorbis
 from mutagen.oggopus import OggOpus
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-AUDIO_FOLDER = os.path.join(BASE_DIR, "_working_downloads")
+DEFAULT_AUDIO_FOLDER = os.path.join(BASE_DIR, "_working_downloads")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Tag audio files and add lyrics.")
+    parser.add_argument(
+        "--audio-folder",
+        default=DEFAULT_AUDIO_FOLDER,
+        help="Folder to scan when --manifest is not provided.",
+    )
+    parser.add_argument(
+        "--manifest",
+        help="JSON manifest containing a files array of exact audio paths to process.",
+    )
+    parser.add_argument(
+        "--no-move",
+        action="store_true",
+        help="Process files in place and do not move _working_downloads to finished.",
+    )
+    return parser.parse_args()
+
+
+ARGS = parse_args()
+AUDIO_FOLDER = os.path.abspath(ARGS.audio_folder)
 
 GROQ_API_KEYS = []
 
@@ -58,17 +82,82 @@ if not GROQ_API_KEYS:
 
 print(f"Loaded {len(GROQ_API_KEYS)} Groq API key(s): " + ", ".join(name for name, _ in GROQ_API_KEYS))
 
-if not os.path.isdir(AUDIO_FOLDER):
-    raise SystemExit(f"Folder not found: {AUDIO_FOLDER}")
 
-file_names = sorted(
-    f for f in os.listdir(AUDIO_FOLDER)
-    if os.path.isfile(os.path.join(AUDIO_FOLDER, f))
-    and os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS
-)
+def is_supported_audio_path(path):
+    return os.path.splitext(path)[1].lower() in SUPPORTED_EXTENSIONS
 
-if not file_names:
-    raise SystemExit("No supported audio files found in folder.")
+
+def load_manifest_file_entries(manifest_path):
+    manifest_path = os.path.abspath(manifest_path)
+
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as e:
+        raise SystemExit(f"Could not read manifest {manifest_path}: {e}")
+
+    raw_files = payload.get("files", []) if isinstance(payload, dict) else payload
+    if not isinstance(raw_files, list):
+        raise SystemExit(f"Manifest {manifest_path} must contain a files array.")
+
+    entries = []
+    seen = set()
+
+    for item in raw_files:
+        if isinstance(item, dict):
+            raw_path = item.get("path") or item.get("file") or ""
+            display_name = item.get("name") or ""
+        else:
+            raw_path = str(item)
+            display_name = ""
+
+        if not raw_path:
+            print(f"Skipping manifest item without path: {item}")
+            continue
+
+        if not os.path.isabs(raw_path):
+            raw_path = os.path.join(BASE_DIR, raw_path)
+
+        file_path = os.path.abspath(raw_path)
+        if file_path in seen:
+            continue
+        seen.add(file_path)
+
+        if not os.path.isfile(file_path):
+            print(f"Skipping missing manifest file: {file_path}")
+            continue
+
+        if not is_supported_audio_path(file_path):
+            print(f"Skipping unsupported manifest file: {file_path}")
+            continue
+
+        entries.append((display_name or os.path.basename(file_path), file_path))
+
+    return sorted(entries, key=lambda item: item[0].casefold())
+
+
+def load_folder_file_entries(folder):
+    if not os.path.isdir(folder):
+        raise SystemExit(f"Folder not found: {folder}")
+
+    return sorted(
+        (
+            f,
+            os.path.join(folder, f),
+        )
+        for f in os.listdir(folder)
+        if os.path.isfile(os.path.join(folder, f))
+        and is_supported_audio_path(f)
+    )
+
+
+if ARGS.manifest:
+    file_entries = load_manifest_file_entries(ARGS.manifest)
+else:
+    file_entries = load_folder_file_entries(AUDIO_FOLDER)
+
+if not file_entries:
+    raise SystemExit("No supported audio files found.")
 
 def make_groq_headers(api_key):
     return {
@@ -708,15 +797,13 @@ def write_lyrics(file_path: str, lyrics: str):
 
 all_metadata = []
 
-for idx, original_file_name in enumerate(file_names, start=1):
-    file_path = os.path.join(AUDIO_FOLDER, original_file_name)
-
+for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
     existing_title, existing_artist, existing_album = get_existing_basic_tags(file_path)
     already_has_lyrics = has_lyrics(file_path)
 
     cleaned_name_for_ai = clean_input_filename(original_file_name)
 
-    print(f"[{idx}/{len(file_names)}] Reading: {original_file_name}")
+    print(f"[{idx}/{len(file_entries)}] Reading: {original_file_name}")
 
     messages = [
         {"role": "system", "content": "Return valid JSON only."},
@@ -784,10 +871,13 @@ for idx, original_file_name in enumerate(file_names, start=1):
 print("\nDone.")
 print(json.dumps(all_metadata, ensure_ascii=False, indent=2))
 
-try:
-    from trinity import FINISHED_DIR, move_working_items_to_finished
+if ARGS.no_move:
+    print("\nNO MOVE requested; processed files in place.")
+else:
+    try:
+        from trinity import FINISHED_DIR, move_working_items_to_finished
 
-    moved_paths = move_working_items_to_finished()
-    print(f"\nMOVED {len(moved_paths)} WORKING ITEM(S) TO: {FINISHED_DIR}")
-except Exception as e:
-    raise SystemExit(f"Could not move working files to finished: {e}")
+        moved_paths = move_working_items_to_finished()
+        print(f"\nMOVED {len(moved_paths)} WORKING ITEM(S) TO: {FINISHED_DIR}")
+    except Exception as e:
+        raise SystemExit(f"Could not move working files to finished: {e}")

@@ -14,7 +14,9 @@ WORKING_DOWNLOADS_DIR = os.path.join(SCRIPTS_DIR, "_working_downloads")
 FINISHED_DIR = os.path.join(SCRIPTS_DIR, "finished")
 LOG_FILE = os.path.join(SCRIPTS_DIR, "trinity_run_log.txt")
 DOWNLOAD_MANIFEST_FILE = os.path.join(SCRIPTS_DIR, "_last_downloaded_manifest.json")
+TEST_MANIFEST_FILE = os.path.join(SCRIPTS_DIR, "_last_test_manifest.json")
 UPLOAD_SUMMARY_FILE = os.path.join(SCRIPTS_DIR, "_last_upload_summary.json")
+TEST_PROCESSED_HISTORY_FILE = os.path.join(SCRIPTS_DIR, "_test_processed_history.json")
 UPLOADED_HISTORY_FILE = os.path.join(SCRIPTS_DIR, "_android_uploaded_history.json")
 SUPPORTED_AUDIO_EXTENSIONS = {
     ".mp3",
@@ -172,15 +174,15 @@ def uploaded_history_key(path):
     return f"{name}|{size}"
 
 
-def load_uploaded_history():
-    if not os.path.exists(UPLOADED_HISTORY_FILE):
+def load_history_file(path, purpose):
+    if not os.path.exists(path):
         return set()
 
     try:
-        with open(UPLOADED_HISTORY_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        log(f"Could not read uploaded history; treating all finished files as pending: {e}")
+        log(f"Could not read {purpose} history; treating matching finished files as pending: {e}")
         return set()
 
     if isinstance(data, list):
@@ -189,9 +191,29 @@ def load_uploaded_history():
     return set()
 
 
-def save_uploaded_history(history):
-    with open(UPLOADED_HISTORY_FILE, "w", encoding="utf-8") as f:
+def save_history_file(path, history):
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(sorted(history), f, indent=2, ensure_ascii=False)
+
+
+def load_uploaded_history():
+    return load_history_file(UPLOADED_HISTORY_FILE, "uploaded")
+
+
+def save_uploaded_history(history):
+    save_history_file(UPLOADED_HISTORY_FILE, history)
+
+
+def test_processed_history_key(path):
+    return uploaded_history_key(path)
+
+
+def load_test_processed_history():
+    return load_history_file(TEST_PROCESSED_HISTORY_FILE, "test.py processed")
+
+
+def save_test_processed_history(history):
+    save_history_file(TEST_PROCESSED_HISTORY_FILE, history)
 
 
 def pending_finished_upload_files():
@@ -202,6 +224,19 @@ def pending_finished_upload_files():
         if not is_supported_audio_file(path):
             continue
         if uploaded_history_key(path) not in uploaded_history:
+            pending.append(path)
+
+    return pending
+
+
+def pending_finished_test_files():
+    processed_history = load_test_processed_history()
+    pending = []
+
+    for path in sorted(snapshot_finished_files()):
+        if not is_supported_audio_file(path):
+            continue
+        if test_processed_history_key(path) not in processed_history:
             pending.append(path)
 
     return pending
@@ -222,6 +257,20 @@ def remember_successful_uploads(successful_items):
     log(f"Recorded {len(successful_items)} successful upload(s) in uploaded history.")
 
 
+def remember_test_processed_files(paths):
+    paths = [path for path in paths if path and os.path.exists(path) and is_supported_audio_file(path)]
+    if not paths:
+        return
+
+    processed_history = load_test_processed_history()
+
+    for path in paths:
+        processed_history.add(test_processed_history_key(path))
+
+    save_test_processed_history(processed_history)
+    log(f"Recorded {len(paths)} file(s) in test.py processed history.")
+
+
 def write_download_manifest(paths):
     payload = {
         "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -233,6 +282,19 @@ def write_download_manifest(paths):
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
     log(f"Wrote download manifest: {DOWNLOAD_MANIFEST_FILE}")
+
+
+def write_test_manifest(paths):
+    payload = {
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "finished_dir": FINISHED_DIR,
+        "files": sorted(os.path.abspath(path) for path in paths),
+    }
+
+    with open(TEST_MANIFEST_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    log(f"Wrote test.py manifest: {TEST_MANIFEST_FILE}")
 
 
 def load_upload_summary(downloaded_paths):
@@ -321,6 +383,49 @@ def run_upload_step(downloaded_paths):
     )
 
     return load_upload_summary(downloaded_paths), return_code
+
+
+def process_unprocessed_finished_files():
+    pending = pending_finished_test_files()
+    if not pending:
+        log("")
+        log("No unprocessed finished/ audio files found before upload.")
+        return []
+
+    log("")
+    log(f"Found {len(pending)} finished/ audio file(s) not yet processed by test.py.")
+    print_numbered_files("Running test.py on finished/ files:", pending)
+    write_test_manifest(pending)
+
+    run_script(
+        "test.py",
+        [
+            "--manifest",
+            TEST_MANIFEST_FILE,
+            "--no-move",
+        ],
+    )
+
+    remember_test_processed_files(pending)
+    return pending
+
+
+def prepare_upload_candidates_after_test(finished_before, moved_after_test, mark_downloaded_as_test_processed):
+    new_finished = snapshot_finished_files() - finished_before
+    downloaded_paths = sorted(set(moved_after_test) | new_finished)
+
+    if mark_downloaded_as_test_processed:
+        remember_test_processed_files(downloaded_paths)
+
+    process_unprocessed_finished_files()
+
+    upload_candidates = sorted(
+        path
+        for path in set(downloaded_paths) | set(pending_finished_upload_files())
+        if is_supported_audio_file(path)
+    )
+
+    return downloaded_paths, upload_candidates
 
 
 def is_nonfatal_upload_failure(upload_summary):
@@ -461,14 +566,12 @@ def main():
         for script in scripts_before_upload:
             if script == "test.py" and not has_working_audio_files():
                 log("")
-                log("No new working audio files found; skipping test.py.")
+                log("No new working audio files found; skipping normal _working_downloads test.py.")
                 moved_after_test = move_working_items_to_finished()
-                new_finished = snapshot_finished_files() - finished_before
-                downloaded_paths = sorted(set(moved_after_test) | new_finished)
-                upload_candidates = sorted(
-                    path
-                    for path in set(downloaded_paths) | set(pending_finished_upload_files())
-                    if is_supported_audio_file(path)
+                downloaded_paths, upload_candidates = prepare_upload_candidates_after_test(
+                    finished_before,
+                    moved_after_test,
+                    mark_downloaded_as_test_processed=False,
                 )
                 upload_summary, upload_return_code = run_upload_step(upload_candidates)
                 if upload_return_code != 0:
@@ -486,12 +589,10 @@ def main():
 
             if script == "test.py":
                 moved_after_test = move_working_items_to_finished()
-                new_finished = snapshot_finished_files() - finished_before
-                downloaded_paths = sorted(set(moved_after_test) | new_finished)
-                upload_candidates = sorted(
-                    path
-                    for path in set(downloaded_paths) | set(pending_finished_upload_files())
-                    if is_supported_audio_file(path)
+                downloaded_paths, upload_candidates = prepare_upload_candidates_after_test(
+                    finished_before,
+                    moved_after_test,
+                    mark_downloaded_as_test_processed=True,
                 )
                 upload_summary, upload_return_code = run_upload_step(upload_candidates)
                 if upload_return_code != 0:
