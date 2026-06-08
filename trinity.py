@@ -5,6 +5,11 @@ import shutil
 import subprocess
 import sys
 
+try:
+    from mutagen import File as MutagenFile
+except Exception:
+    MutagenFile = None
+
 # Path to Python interpreter
 PYTHON_EXE = r"C:\Users\qacer\AppData\Local\Python\pythoncore-3.14-64\python.exe"
 
@@ -16,8 +21,16 @@ LOG_FILE = os.path.join(SCRIPTS_DIR, "trinity_run_log.txt")
 DOWNLOAD_MANIFEST_FILE = os.path.join(SCRIPTS_DIR, "_last_downloaded_manifest.json")
 TEST_MANIFEST_FILE = os.path.join(SCRIPTS_DIR, "_last_test_manifest.json")
 UPLOAD_SUMMARY_FILE = os.path.join(SCRIPTS_DIR, "_last_upload_summary.json")
+DRIVE_UPLOAD_MANIFEST_FILE = os.path.join(SCRIPTS_DIR, "_last_drive_upload_delete_manifest.json")
+DRIVE_UPLOAD_SUMMARY_FILE = os.path.join(SCRIPTS_DIR, "_last_drive_upload_delete_summary.json")
 TEST_PROCESSED_HISTORY_FILE = os.path.join(SCRIPTS_DIR, "_test_processed_history.json")
 UPLOADED_HISTORY_FILE = os.path.join(SCRIPTS_DIR, "_android_uploaded_history.json")
+DRIVE_UPLOADED_HISTORY_FILE = os.path.join(SCRIPTS_DIR, "_drive_uploaded_history.json")
+DRIVE_FOLDER_ID = "1qbVH_yaNn1aagSrMGvZIggCjSvRzZRSs"
+DRIVE_SERVICE_ACCOUNT_EMAIL = "trinitydrive@wavestack2.iam.gserviceaccount.com"
+DRIVE_SERVICE_ACCOUNT_JSON_FILE = os.path.join(SCRIPTS_DIR, "wavestack2-cbe4e94e8a01.json")
+DRIVE_OAUTH_CLIENT_JSON_FILE = os.path.join(SCRIPTS_DIR, "google_drive_oauth_client.json")
+DRIVE_OAUTH_TOKEN_FILE = os.path.join(SCRIPTS_DIR, "_google_drive_oauth_token.json")
 SUPPORTED_AUDIO_EXTENSIONS = {
     ".mp3",
     ".m4a",
@@ -174,6 +187,22 @@ def uploaded_history_key(path):
     return f"{name}|{size}"
 
 
+def history_key_from_item(item):
+    path = safe_finished_path(item.get("path", ""))
+    name = relative_finished_name(path) if path else item.get("name", "")
+    size = item.get("size")
+
+    if size is None and path and os.path.exists(path):
+        size = os.path.getsize(path)
+
+    try:
+        size = int(size)
+    except (TypeError, ValueError):
+        size = 0
+
+    return f"{name}|{size}"
+
+
 def load_history_file(path, purpose):
     if not os.path.exists(path):
         return set()
@@ -204,6 +233,14 @@ def save_uploaded_history(history):
     save_history_file(UPLOADED_HISTORY_FILE, history)
 
 
+def load_drive_uploaded_history():
+    return load_history_file(DRIVE_UPLOADED_HISTORY_FILE, "Drive uploaded")
+
+
+def save_drive_uploaded_history(history):
+    save_history_file(DRIVE_UPLOADED_HISTORY_FILE, history)
+
+
 def test_processed_history_key(path):
     return uploaded_history_key(path)
 
@@ -229,6 +266,33 @@ def pending_finished_upload_files():
     return pending
 
 
+def first_tag_value(value):
+    if isinstance(value, list):
+        return str(value[0]).strip() if value else ""
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def audio_missing_title_or_artist(path):
+    if MutagenFile is None:
+        log("Mutagen is not available in trinity.py; relying on test.py processed history only.")
+        return False
+
+    try:
+        audio = MutagenFile(path, easy=True)
+    except Exception as e:
+        log(f"Could not inspect audio tags, will reprocess with test.py: {path} ({e})")
+        return True
+
+    if not audio or not audio.tags:
+        return True
+
+    title = first_tag_value(audio.tags.get("title"))
+    artist = first_tag_value(audio.tags.get("artist"))
+    return not title or not artist
+
+
 def pending_finished_test_files():
     processed_history = load_test_processed_history()
     pending = []
@@ -236,8 +300,33 @@ def pending_finished_test_files():
     for path in sorted(snapshot_finished_files()):
         if not is_supported_audio_file(path):
             continue
-        if test_processed_history_key(path) not in processed_history:
+        history_key = test_processed_history_key(path)
+        if history_key not in processed_history:
             pending.append(path)
+            continue
+        if audio_missing_title_or_artist(path):
+            log(f"Finished audio is missing title/artist tags; reprocessing: {path}")
+            pending.append(path)
+
+    return pending
+
+
+def pending_finished_drive_upload_files():
+    uploaded_history = load_uploaded_history()
+    drive_uploaded_history = load_drive_uploaded_history()
+    pending = []
+
+    for path in sorted(snapshot_finished_files()):
+        if not is_supported_audio_file(path):
+            continue
+
+        history_key = uploaded_history_key(path)
+        if history_key not in uploaded_history:
+            continue
+        if history_key in drive_uploaded_history:
+            continue
+
+        pending.append(path)
 
     return pending
 
@@ -255,6 +344,23 @@ def remember_successful_uploads(successful_items):
 
     save_uploaded_history(uploaded_history)
     log(f"Recorded {len(successful_items)} successful upload(s) in uploaded history.")
+
+
+def remember_successful_drive_uploads(summary):
+    successful_items = summary.get("successful") or []
+    if not successful_items:
+        return
+
+    drive_uploaded_history = load_drive_uploaded_history()
+
+    for item in successful_items:
+        if isinstance(item, dict):
+            history_key = history_key_from_item(item)
+            if history_key:
+                drive_uploaded_history.add(history_key)
+
+    save_drive_uploaded_history(drive_uploaded_history)
+    log(f"Recorded {len(successful_items)} successful Drive upload(s) in Drive history.")
 
 
 def remember_test_processed_files(paths):
@@ -327,9 +433,10 @@ def run_script(script_name, extra_args=None, check=True):
 
     child_env = os.environ.copy()
     child_env["PYTHONIOENCODING"] = "utf-8"
+    child_env["PYTHONUNBUFFERED"] = "1"
 
     process = subprocess.Popen(
-        [PYTHON_EXE, script_path, *args],
+        [PYTHON_EXE, "-u", script_path, *args],
         cwd=SCRIPTS_DIR,
         text=True,
         encoding="utf-8",
@@ -339,9 +446,21 @@ def run_script(script_name, extra_args=None, check=True):
         env=child_env,
     )
 
-    if process.stdout:
-        for line in process.stdout:
-            write_log_raw(line)
+    try:
+        if process.stdout:
+            for line in process.stdout:
+                write_log_raw(line)
+    except KeyboardInterrupt:
+        log("")
+        log(f"Interrupted while running {script_name}; terminating child process...")
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            log(f"{script_name} did not exit after terminate; killing it...")
+            process.kill()
+            process.wait()
+        raise
 
     return_code = process.wait()
 
@@ -358,7 +477,7 @@ def run_script(script_name, extra_args=None, check=True):
 def run_upload_step(downloaded_paths):
     if not downloaded_paths:
         log("")
-        log("No newly downloaded files to upload.")
+        log("No finished/ files need Android upload.")
         return {
             "attempted": [],
             "successful": [],
@@ -483,41 +602,177 @@ def safe_finished_path(path):
     return abs_path
 
 
-def prompt_delete_successful_uploads(successful_items):
-    if not successful_items:
-        log("")
-        log("No successful uploads; nothing to delete from finished/.")
-        return
+def write_drive_upload_manifest(successful_items):
+    files = []
 
-    log("")
-    log("Successfully uploaded files:")
-    for index, item in enumerate(successful_items, start=1):
-        log(f"  {index}. {item.get('name') or relative_finished_name(item.get('path', ''))}")
-
-    log("")
-    log("Delete successfully uploaded files from finished/? Type yes to delete, or anything else to keep them.")
-    answer = input("> ").strip()
-    log(f"Delete prompt answer: {answer}")
-
-    if answer.lower() not in {"y", "yes"}:
-        log("Kept successfully uploaded files in finished/.")
-        return
-
-    deleted_count = 0
     for item in successful_items:
-        path = safe_finished_path(item.get("path", ""))
+        if isinstance(item, dict):
+            raw_path = item.get("path", "")
+        else:
+            raw_path = str(item)
+
+        path = safe_finished_path(raw_path)
         if not path:
-            log(f"Skipped delete outside finished/: {item}")
+            log(f"Skipped Drive manifest item outside finished/: {item}")
             continue
         if not os.path.exists(path):
-            log(f"Already missing, could not delete: {path}")
+            log(f"Skipped missing Drive manifest item: {path}")
+            continue
+        if not is_supported_audio_file(path):
+            log(f"Skipped non-audio Drive manifest item: {path}")
             continue
 
-        os.remove(path)
-        deleted_count += 1
-        log(f"Deleted uploaded file: {path}")
+        files.append(os.path.abspath(path))
 
-    log(f"Deleted {deleted_count} uploaded file(s) from finished/.")
+    payload = {
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "finished_dir": FINISHED_DIR,
+        "drive_folder_id": DRIVE_FOLDER_ID,
+        "files": sorted(files),
+    }
+
+    with open(DRIVE_UPLOAD_MANIFEST_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    log(f"Wrote Drive upload/delete manifest: {DRIVE_UPLOAD_MANIFEST_FILE}")
+    return files
+
+
+def load_drive_upload_summary():
+    if not os.path.exists(DRIVE_UPLOAD_SUMMARY_FILE):
+        return {
+            "attempted": [],
+            "successful": [],
+            "failed": [],
+            "deleted": [],
+            "delete_failed": [],
+            "error": "Drive upload/delete summary was not created.",
+        }
+
+    try:
+        with open(DRIVE_UPLOAD_SUMMARY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        return {
+            "attempted": [],
+            "successful": [],
+            "failed": [],
+            "deleted": [],
+            "delete_failed": [],
+            "error": f"Could not read Drive upload/delete summary: {e}",
+        }
+
+
+def print_drive_upload_summary(summary):
+    attempted = summary.get("attempted") or []
+    successful = summary.get("successful") or []
+    failed = summary.get("failed") or []
+    deleted = summary.get("deleted") or []
+    delete_failed = summary.get("delete_failed") or []
+
+    log("")
+    log("GOOGLE DRIVE UPLOAD/DELETE SUMMARY")
+    log("-" * 50)
+    log(f"Attempted Drive upload: {len(attempted)} file(s)")
+    log(f"Successfully uploaded to Drive: {len(successful)} file(s)")
+    print_numbered_files("Drive upload successes:", successful)
+    log(f"Failed Drive upload: {len(failed)} file(s)")
+    print_numbered_files("Drive upload failures:", failed)
+    log(f"Deleted from finished/ after Drive upload: {len(deleted)} file(s)")
+    print_numbered_files("Deleted local files:", deleted)
+    log(f"Uploaded to Drive but failed local delete: {len(delete_failed)} file(s)")
+    print_numbered_files("Local delete failures:", delete_failed)
+
+    if summary.get("error"):
+        log(f"Drive upload/delete error: {summary['error']}")
+
+
+def prompt_drive_upload_then_delete(drive_candidates):
+    if not drive_candidates:
+        log("")
+        log("No finished/ files are waiting for Drive upload/delete.")
+        return
+
+    log("")
+    log("Finished files already sent to Android and waiting for Drive upload/delete:")
+    print_numbered_files("Pending Drive files:", drive_candidates)
+
+    log("")
+    log(f"Google Drive target folder ID: {DRIVE_FOLDER_ID}")
+    log(f"Using OAuth client JSON: {DRIVE_OAUTH_CLIENT_JSON_FILE}")
+    log(f"OAuth token cache: {DRIVE_OAUTH_TOKEN_FILE}")
+    log("First OAuth run prints a login URL to copy into your chosen browser.")
+    log("Future runs reuse the cached token.")
+    log("")
+    log(
+        "Upload these files to Google Drive, "
+        "then delete each local finished/ file only after its Drive upload succeeds?"
+    )
+    log("Type yes to upload to Drive and delete confirmed Drive uploads, or anything else to keep them locally.")
+    answer = input("> ").strip()
+    log(f"Drive upload/delete prompt answer: {answer}")
+
+    if answer.lower() not in {"y", "yes"}:
+        log("Kept successfully Android-uploaded files in finished/.")
+        return
+
+    files_to_upload = write_drive_upload_manifest(drive_candidates)
+    if not files_to_upload:
+        log("No valid finished/ files were available for Drive upload/delete.")
+        return
+
+    if not os.path.exists(DRIVE_OAUTH_CLIENT_JSON_FILE):
+        log(f"OAuth client JSON does not exist: {DRIVE_OAUTH_CLIENT_JSON_FILE}")
+        log("Create a Google Cloud OAuth Client ID with application type Desktop app,")
+        log("download its JSON, and save it as google_drive_oauth_client.json inside ytb/.")
+        log("The service-account JSON cannot upload into a normal My Drive shared folder because")
+        log("Google service accounts do not have Drive storage quota.")
+        log("Kept files in finished/.")
+        return
+
+    log("")
+    log("DRIVE UPLOAD/DELETE PERMISSION GRANTED")
+    log("-" * 50)
+    log(f"This will upload {len(files_to_upload)} file(s) to Google Drive folder:")
+    log(f"  {DRIVE_FOLDER_ID}")
+    log("")
+    log("After each file uploads successfully to Drive, that same local file will be deleted from:")
+    log(f"  {FINISHED_DIR}")
+    log("")
+    log("Files that fail Drive upload will NOT be deleted.")
+
+    if os.path.exists(DRIVE_UPLOAD_SUMMARY_FILE):
+        os.remove(DRIVE_UPLOAD_SUMMARY_FILE)
+
+    return_code = run_script(
+        "drive_upload_then_delete.py",
+        [
+            "--manifest",
+            DRIVE_UPLOAD_MANIFEST_FILE,
+            "--oauth-client-json",
+            DRIVE_OAUTH_CLIENT_JSON_FILE,
+            "--oauth-token-json",
+            DRIVE_OAUTH_TOKEN_FILE,
+            "--folder-id",
+            DRIVE_FOLDER_ID,
+            "--summary-json",
+            DRIVE_UPLOAD_SUMMARY_FILE,
+            "--delete-after-upload",
+        ],
+        check=False,
+    )
+
+    summary = load_drive_upload_summary()
+    print_drive_upload_summary(summary)
+    remember_successful_drive_uploads(summary)
+
+    if return_code == 0:
+        log("Drive upload/delete completed.")
+    else:
+        log(
+            "Drive upload/delete finished with errors. "
+            "Any file that failed Drive upload was kept in finished/."
+        )
 
 
 def print_run_summary(downloaded_paths, upload_summary, upload_candidates):
@@ -627,6 +882,7 @@ def main():
 
     successful_items = print_run_summary(downloaded_paths, upload_summary, upload_candidates)
     remember_successful_uploads(successful_items)
+    drive_candidates = pending_finished_drive_upload_files()
 
     if exit_code == 0:
         log("")
@@ -636,7 +892,7 @@ def main():
         log(f"STOPPED WITH EXIT CODE {exit_code}")
 
     try:
-        prompt_delete_successful_uploads(successful_items)
+        prompt_drive_upload_then_delete(drive_candidates)
     finally:
         close_run_log()
 
