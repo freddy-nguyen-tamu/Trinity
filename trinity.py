@@ -290,23 +290,33 @@ def audio_missing_title_or_artist(path):
 
     title = first_tag_value(audio.tags.get("title"))
     artist = first_tag_value(audio.tags.get("artist"))
-    return not title or not artist
+    return not title or not artist or artist.lower() == "unknown"
 
 
 def pending_finished_test_files():
     processed_history = load_test_processed_history()
     pending = []
+    already_tagged_count = 0
 
     for path in sorted(snapshot_finished_files()):
         if not is_supported_audio_file(path):
             continue
+
         history_key = test_processed_history_key(path)
-        if history_key not in processed_history:
-            pending.append(path)
-            continue
         if audio_missing_title_or_artist(path):
             log(f"Finished audio is missing title/artist tags; reprocessing: {path}")
             pending.append(path)
+            continue
+        if history_key not in processed_history:
+            processed_history.add(history_key)
+            already_tagged_count += 1
+
+    if already_tagged_count:
+        save_test_processed_history(processed_history)
+        log(
+            "Skipped and recorded "
+            f"{already_tagged_count} finished/ audio file(s) that already had title/artist tags."
+        )
 
     return pending
 

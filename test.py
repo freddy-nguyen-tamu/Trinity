@@ -795,47 +795,59 @@ def write_lyrics(file_path: str, lyrics: str):
         raise RuntimeError(f"Lyrics write failed: {e}")
 
 
+def has_usable_title_and_artist(title, artist):
+    title = norm_text(title)
+    artist = norm_text(artist)
+    return bool(title) and bool(artist) and artist.lower() != "unknown"
+
+
 all_metadata = []
 
 for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
     existing_title, existing_artist, existing_album = get_existing_basic_tags(file_path)
     already_has_lyrics = has_lyrics(file_path)
+    skipped_tag_update_existing = has_usable_title_and_artist(existing_title, existing_artist)
 
     cleaned_name_for_ai = clean_input_filename(original_file_name)
 
     print(f"[{idx}/{len(file_entries)}] Reading: {original_file_name}")
 
-    messages = [
-        {"role": "system", "content": "Return valid JSON only."},
-        {"role": "user", "content": build_single_prompt(idx, cleaned_name_for_ai)},
-    ]
+    if skipped_tag_update_existing:
+        title = existing_title
+        artist = existing_artist
+        print(f"  Skipped tag update: existing title='{title}' | artist='{artist}'")
+    else:
+        messages = [
+            {"role": "system", "content": "Return valid JSON only."},
+            {"role": "user", "content": build_single_prompt(idx, cleaned_name_for_ai)},
+        ]
 
-    try:
-        one = call_and_parse(messages, max_tokens=220, json_mode=True)
-        title = norm_text(str(one.get("title") or ""))
-        artist = norm_text(str(one.get("artist") or "Unknown")) or "Unknown"
+        try:
+            one = call_and_parse(messages, max_tokens=220, json_mode=True)
+            title = norm_text(str(one.get("title") or ""))
+            artist = norm_text(str(one.get("artist") or "Unknown")) or "Unknown"
 
-        if looks_bad(title):
-            print(f"  Suspicious title detected, using filename fallback: {title}")
+            if looks_bad(title):
+                print(f"  Suspicious title detected, using filename fallback: {title}")
+                title = conservative_filename_title(original_file_name)
+
+            if looks_bad(artist):
+                print(f"  Suspicious artist detected, using Unknown: {artist}")
+                artist = "Unknown"
+
+        except Exception as e:
+            print(f"  AI parse failed: {e}")
+            title = conservative_filename_title(original_file_name)
+            artist = existing_artist or "Unknown"
+
+        if not title:
             title = conservative_filename_title(original_file_name)
 
-        if looks_bad(artist):
-            print(f"  Suspicious artist detected, using Unknown: {artist}")
-            artist = "Unknown"
-
-    except Exception as e:
-        print(f"  AI parse failed: {e}")
-        title = conservative_filename_title(original_file_name)
-        artist = existing_artist or "Unknown"
-
-    if not title:
-        title = conservative_filename_title(original_file_name)
-
-    try:
-        write_tags(file_path, title=title, artist=artist, album=existing_album)
-        print(f"  Updated tags -> title='{title}' | artist='{artist}'")
-    except Exception as e:
-        print(f"  Error updating tags: {e}")
+        try:
+            write_tags(file_path, title=title, artist=artist, album=existing_album)
+            print(f"  Updated tags -> title='{title}' | artist='{artist}'")
+        except Exception as e:
+            print(f"  Error updating tags: {e}")
 
     lyrics_found = already_has_lyrics
     if already_has_lyrics:
@@ -862,6 +874,7 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
         "file_name": original_file_name,
         "title": title,
         "artist": artist,
+        "tag_update_skipped_existing": skipped_tag_update_existing,
         "lyrics_found": lyrics_found,
         "lyrics_skipped_existing": already_has_lyrics,
     })
