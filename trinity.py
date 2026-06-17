@@ -1,14 +1,23 @@
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 
 try:
     from mutagen import File as MutagenFile
+    from mutagen.aiff import AIFF
+    from mutagen.flac import FLAC
+    from mutagen.id3 import ID3
+    from mutagen.mp4 import MP4
+    from mutagen.oggopus import OggOpus
+    from mutagen.oggvorbis import OggVorbis
+    from mutagen.wave import WAVE
 except Exception:
     MutagenFile = None
+    AIFF = FLAC = ID3 = MP4 = OggOpus = OggVorbis = WAVE = None
 
 # Path to Python interpreter
 PYTHON_EXE = r"C:\Users\qacer\AppData\Local\Python\pythoncore-3.14-64\python.exe"
@@ -24,6 +33,7 @@ UPLOAD_SUMMARY_FILE = os.path.join(SCRIPTS_DIR, "_last_upload_summary.json")
 DRIVE_UPLOAD_MANIFEST_FILE = os.path.join(SCRIPTS_DIR, "_last_drive_upload_delete_manifest.json")
 DRIVE_UPLOAD_SUMMARY_FILE = os.path.join(SCRIPTS_DIR, "_last_drive_upload_delete_summary.json")
 TEST_PROCESSED_HISTORY_FILE = os.path.join(SCRIPTS_DIR, "_test_processed_history.json")
+LYRICS_LIBRARY_CHECKED_HISTORY_FILE = os.path.join(SCRIPTS_DIR, "_lyrics_library_checked_history.json")
 UPLOADED_HISTORY_FILE = os.path.join(SCRIPTS_DIR, "_android_uploaded_history.json")
 DRIVE_UPLOADED_HISTORY_FILE = os.path.join(SCRIPTS_DIR, "_drive_uploaded_history.json")
 DRIVE_FOLDER_ID = "1qbVH_yaNn1aagSrMGvZIggCjSvRzZRSs"
@@ -44,6 +54,7 @@ SUPPORTED_AUDIO_EXTENSIONS = {
     ".aif",
     ".aac",
 }
+MP4_LYRICS_KEYS = ("\xa9lyr", "\xc2\xa9lyr")
 
 _LOG_HANDLE = None
 
@@ -253,6 +264,14 @@ def save_test_processed_history(history):
     save_history_file(TEST_PROCESSED_HISTORY_FILE, history)
 
 
+def load_lyrics_library_checked_history():
+    return load_history_file(LYRICS_LIBRARY_CHECKED_HISTORY_FILE, "lyrics library checked")
+
+
+def save_lyrics_library_checked_history(history):
+    save_history_file(LYRICS_LIBRARY_CHECKED_HISTORY_FILE, history)
+
+
 def pending_finished_upload_files():
     uploaded_history = load_uploaded_history()
     pending = []
@@ -293,10 +312,169 @@ def audio_missing_title_or_artist(path):
     return not title or not artist or artist.lower() == "unknown"
 
 
+def text_value_present(value):
+    if isinstance(value, list):
+        return any(str(item).strip() for item in value)
+    return bool(value and str(value).strip())
+
+
+def iter_tag_text_values(value):
+    if isinstance(value, list):
+        for item in value:
+            text = str(item).strip()
+            if text:
+                yield text
+        return
+
+    if value and str(value).strip():
+        yield str(value).strip()
+
+
+def text_has_square_bracket_content(text):
+    return bool(re.search(r"\[[^\[\]\r\n]*\]", text or ""))
+
+
+def id3_has_lyrics(path):
+    if ID3 is None:
+        return False
+
+    try:
+        tags = ID3(path)
+    except Exception:
+        return False
+
+    for frame in tags.getall("USLT"):
+        text = frame.text
+        if isinstance(text, list):
+            text = " ".join(str(item) for item in text)
+        if str(text).strip():
+            return True
+
+    return False
+
+
+def id3_lyrics_need_square_bracket_cleanup(path):
+    if ID3 is None:
+        return False
+
+    try:
+        tags = ID3(path)
+    except Exception:
+        return False
+
+    for frame in tags.getall("USLT"):
+        text = frame.text
+        if isinstance(text, list):
+            text = " ".join(str(item) for item in text)
+        if text_has_square_bracket_content(str(text)):
+            return True
+
+    return False
+
+
+def audio_has_lyrics(path):
+    if MutagenFile is None:
+        log("Mutagen is not available in trinity.py; cannot inspect lyrics.")
+        return False
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".mp3":
+        return id3_has_lyrics(path)
+
+    try:
+        audio = MutagenFile(path)
+    except Exception as e:
+        log(f"Could not inspect lyrics, will reprocess with test.py: {path} ({e})")
+        return False
+
+    if not audio or audio.tags is None:
+        return False
+
+    if MP4 is not None and isinstance(audio, MP4):
+        return any(text_value_present(audio.tags.get(key)) for key in MP4_LYRICS_KEYS)
+
+    if (
+        (FLAC is not None and isinstance(audio, FLAC))
+        or (OggVorbis is not None and isinstance(audio, OggVorbis))
+        or (OggOpus is not None and isinstance(audio, OggOpus))
+    ):
+        for key in ("lyrics", "unsyncedlyrics", "lyric"):
+            if text_value_present(audio.tags.get(key)):
+                return True
+        return False
+
+    if (
+        (WAVE is not None and isinstance(audio, WAVE))
+        or (AIFF is not None and isinstance(audio, AIFF))
+    ):
+        return id3_has_lyrics(path)
+
+    for key in ("lyrics", "unsyncedlyrics", "lyric", *MP4_LYRICS_KEYS):
+        try:
+            if text_value_present(audio.tags.get(key)):
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def audio_lyrics_need_square_bracket_cleanup(path):
+    if MutagenFile is None:
+        return False
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".mp3":
+        return id3_lyrics_need_square_bracket_cleanup(path)
+
+    try:
+        audio = MutagenFile(path)
+    except Exception:
+        return False
+
+    if not audio or audio.tags is None:
+        return False
+
+    if MP4 is not None and isinstance(audio, MP4):
+        for key in MP4_LYRICS_KEYS:
+            for text in iter_tag_text_values(audio.tags.get(key)):
+                if text_has_square_bracket_content(text):
+                    return True
+        return False
+
+    if (
+        (FLAC is not None and isinstance(audio, FLAC))
+        or (OggVorbis is not None and isinstance(audio, OggVorbis))
+        or (OggOpus is not None and isinstance(audio, OggOpus))
+    ):
+        for key in ("lyrics", "unsyncedlyrics", "lyric"):
+            for text in iter_tag_text_values(audio.tags.get(key)):
+                if text_has_square_bracket_content(text):
+                    return True
+        return False
+
+    if (
+        (WAVE is not None and isinstance(audio, WAVE))
+        or (AIFF is not None and isinstance(audio, AIFF))
+    ):
+        return id3_lyrics_need_square_bracket_cleanup(path)
+
+    for key in ("lyrics", "unsyncedlyrics", "lyric", *MP4_LYRICS_KEYS):
+        try:
+            for text in iter_tag_text_values(audio.tags.get(key)):
+                if text_has_square_bracket_content(text):
+                    return True
+        except Exception:
+            pass
+
+    return False
+
+
 def pending_finished_test_files():
     processed_history = load_test_processed_history()
+    lyrics_library_checked_history = load_lyrics_library_checked_history()
     pending = []
-    already_tagged_count = 0
+    already_complete_count = 0
 
     for path in sorted(snapshot_finished_files()):
         if not is_supported_audio_file(path):
@@ -307,15 +485,27 @@ def pending_finished_test_files():
             log(f"Finished audio is missing title/artist tags; reprocessing: {path}")
             pending.append(path)
             continue
+        if not audio_has_lyrics(path):
+            log(f"Finished audio is missing lyrics; running lyrics lookup: {path}")
+            pending.append(path)
+            continue
+        if audio_lyrics_need_square_bracket_cleanup(path):
+            log(f"Finished audio lyrics contain square-bracket text; cleaning/rechecking: {path}")
+            pending.append(path)
+            continue
+        if history_key not in lyrics_library_checked_history:
+            log(f"Finished audio has lyrics but needs LRCLIB comparison check: {path}")
+            pending.append(path)
+            continue
         if history_key not in processed_history:
             processed_history.add(history_key)
-            already_tagged_count += 1
+            already_complete_count += 1
 
-    if already_tagged_count:
+    if already_complete_count:
         save_test_processed_history(processed_history)
         log(
             "Skipped and recorded "
-            f"{already_tagged_count} finished/ audio file(s) that already had title/artist tags."
+            f"{already_complete_count} finished/ audio file(s) that already had title, artist, and lyrics."
         )
 
     return pending
@@ -385,6 +575,24 @@ def remember_test_processed_files(paths):
 
     save_test_processed_history(processed_history)
     log(f"Recorded {len(paths)} file(s) in test.py processed history.")
+
+
+def remember_lyrics_library_checked_files(paths):
+    paths = [
+        path
+        for path in paths
+        if path and os.path.exists(path) and is_supported_audio_file(path) and audio_has_lyrics(path)
+    ]
+    if not paths:
+        return
+
+    checked_history = load_lyrics_library_checked_history()
+
+    for path in paths:
+        checked_history.add(uploaded_history_key(path))
+
+    save_lyrics_library_checked_history(checked_history)
+    log(f"Recorded {len(paths)} file(s) in lyrics library checked history.")
 
 
 def write_download_manifest(paths):
@@ -536,6 +744,7 @@ def process_unprocessed_finished_files():
     )
 
     remember_test_processed_files(pending)
+    remember_lyrics_library_checked_files(pending)
     return pending
 
 
@@ -545,6 +754,7 @@ def prepare_upload_candidates_after_test(finished_before, moved_after_test, mark
 
     if mark_downloaded_as_test_processed:
         remember_test_processed_files(downloaded_paths)
+        remember_lyrics_library_checked_files(downloaded_paths)
 
     process_unprocessed_finished_files()
 
