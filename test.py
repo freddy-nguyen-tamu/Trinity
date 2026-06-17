@@ -8,6 +8,7 @@ import time
 import unicodedata
 import requests
 from xml.etree import ElementTree
+from urllib.parse import parse_qs, urlparse
 
 from yt_dlp import YoutubeDL
 
@@ -439,8 +440,13 @@ def build_single_prompt(item_id, file_name):
     )
 
 
-def call_and_parse(messages, max_tokens=220, json_mode=True):
-    data_json = groq_chat(messages, max_tokens=max_tokens, temperature=0, json_mode=json_mode)
+def call_and_parse(messages, max_tokens=220, json_mode=True, temperature=0):
+    data_json = groq_chat(
+        messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        json_mode=json_mode,
+    )
     content = data_json["choices"][0]["message"]["content"]
 
     try:
@@ -937,6 +943,17 @@ def subtitle_track_display_name(language_code, track):
     return f"{language_code} {name}".strip()
 
 
+def subtitle_url_hints(url):
+    try:
+        query = parse_qs(urlparse(url or "").query)
+    except Exception:
+        return "", ""
+
+    source_language = (query.get("lang") or [""])[0]
+    translated_to = (query.get("tlang") or [""])[0]
+    return source_language, translated_to
+
+
 def iter_subtitle_candidates(info, automatic=False):
     key = "automatic_captions" if automatic else "subtitles"
     tracks_by_language = info.get(key) or {}
@@ -945,6 +962,7 @@ def iter_subtitle_candidates(info, automatic=False):
         chosen = choose_subtitle_format(formats)
         if not chosen:
             continue
+        source_language, translated_to = subtitle_url_hints(chosen.get("url"))
 
         yield {
             "language_code": language_code,
@@ -952,6 +970,9 @@ def iter_subtitle_candidates(info, automatic=False):
             "url": chosen.get("url"),
             "ext": str(chosen.get("ext", "")).lower(),
             "automatic": automatic,
+            "source_language_code": source_language,
+            "translated_to_language_code": translated_to,
+            "is_translated": bool(translated_to),
         }
 
 
@@ -1110,59 +1131,154 @@ def groq_same_language(video_title, subtitle_text, candidate):
     return same_language
 
 
+def subtitle_candidate_kind(candidate):
+    if not candidate.get("automatic"):
+        return "manual_human"
+    if candidate.get("is_translated"):
+        return "automatic_translated"
+    return "automatic_original"
+
+
+def default_subtitle_candidate_order(manual_candidates, automatic_candidates):
+    automatic_order = sorted(
+        automatic_candidates,
+        key=lambda item: (
+            bool(item.get("is_translated")),
+            item.get("language_code") or "",
+            item.get("name") or "",
+        ),
+    )
+    return manual_candidates + automatic_order
+
+
+def subtitle_candidate_prompt_item(candidate):
+    return {
+        "id": candidate.get("rank_id"),
+        "kind": subtitle_candidate_kind(candidate),
+        "language_code": candidate.get("language_code"),
+        "name": candidate.get("name"),
+        "source_language_code": candidate.get("source_language_code"),
+        "translated_to_language_code": candidate.get("translated_to_language_code"),
+    }
+
+
+def rank_subtitle_candidates_with_groq(video_title, candidates, info):
+    if not candidates:
+        return []
+
+    for index, candidate in enumerate(candidates, start=1):
+        prefix = "auto" if candidate.get("automatic") else "manual"
+        candidate["rank_id"] = f"{prefix}-{index}"
+
+    prompt = {
+        "youtube_title": video_title,
+        "youtube_track": info.get("track"),
+        "youtube_artist": info.get("artist") or info.get("artists"),
+        "instructions": (
+            "Rank subtitle tracks for song lyrics extraction. Prefer the track whose language "
+            "matches the YouTube title/song language. Prefer manual_human over automatic tracks "
+            "only when it matches the title language. Prefer automatic_original over "
+            "automatic_translated when no matching manual track exists. Avoid translated tracks "
+            "to unrelated languages."
+        ),
+        "candidates": [subtitle_candidate_prompt_item(candidate) for candidate in candidates],
+    }
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You choose subtitle priority for lyric extraction. Return JSON only. "
+                "Use exact candidate ids from the provided list."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"{json.dumps(prompt, ensure_ascii=False)}\n\n"
+                "Return exactly this JSON shape:\n"
+                '{ "detected_title_language": "language", '
+                '"priority_ids": ["candidate-id-1", "candidate-id-2"], '
+                '"reason": "short reason" }'
+            ),
+        },
+    ]
+
+    try:
+        result = call_and_parse(messages, max_tokens=900, json_mode=True)
+    except Exception as e:
+        print(f"  Groq subtitle priority ranking failed; using safe fallback order: {e}")
+        return candidates
+
+    priority_ids = result.get("priority_ids") or []
+    if isinstance(priority_ids, str):
+        priority_ids = re.split(r"[\s,]+", priority_ids)
+
+    id_map = {candidate["rank_id"]: candidate for candidate in candidates}
+    ranked = []
+    seen = set()
+
+    for candidate_id in priority_ids:
+        candidate_id = str(candidate_id).strip()
+        candidate = id_map.get(candidate_id)
+        if candidate and candidate_id not in seen:
+            ranked.append(candidate)
+            seen.add(candidate_id)
+
+    for candidate in candidates:
+        candidate_id = candidate["rank_id"]
+        if candidate_id not in seen:
+            ranked.append(candidate)
+            seen.add(candidate_id)
+
+    detected = result.get("detected_title_language") or "unknown"
+    preview = ", ".join(candidate.get("name") or candidate.get("rank_id") for candidate in ranked[:8])
+    print(f"  Groq subtitle priority language={detected}; first choices: {preview}")
+    return ranked
+
+
 def get_lyrics_from_youtube_subtitles(video_id, video_title):
     info = get_youtube_info(video_id)
     if not info:
         return None, None
 
-    title_for_language_check = video_title or info.get("title") or video_id
+    title_for_language_check = info.get("track") or info.get("title") or video_title or video_id
     manual_candidates = list(iter_subtitle_candidates(info, automatic=False))
     automatic_candidates = list(iter_subtitle_candidates(info, automatic=True))
+    ranked_candidates = default_subtitle_candidate_order(manual_candidates, automatic_candidates)
 
     print(
         f"  YouTube subtitles: {len(manual_candidates)} manual track(s), "
         f"{len(automatic_candidates)} automatic/translated track(s)."
     )
 
-    for index, candidate in enumerate(manual_candidates, start=1):
-        print(
-            f"  Checking manual subtitle #{index}/{len(manual_candidates)} "
-            f"in listed order: {candidate['name']}"
-        )
+    ranked_candidates = rank_subtitle_candidates_with_groq(
+        video_title=title_for_language_check,
+        candidates=ranked_candidates,
+        info=info,
+    )
+    first_parseable = None
+
+    for index, candidate in enumerate(ranked_candidates, start=1):
+        kind = subtitle_candidate_kind(candidate).replace("_", " ")
+        print(f"  Checking ranked subtitle #{index}/{len(ranked_candidates)} ({kind}): {candidate['name']}")
         text = download_subtitle_text(candidate)
         if not text:
             continue
+        if first_parseable is None:
+            first_parseable = (text, candidate)
         if groq_same_language(title_for_language_check, text, candidate):
             return text, candidate
 
-        print(f"  Manual subtitle language did not match title: {candidate['name']}")
+        print(f"  Subtitle language did not match title: {candidate['name']}")
 
-    if manual_candidates:
+    if first_parseable:
+        text, candidate = first_parseable
         print(
-            "  Manual subtitle track(s) exist, but none matched the title language. "
-            "Skipping automatic/translated subtitles because human subtitles are prioritized."
+            "  No subtitle passed the second language check; using highest-ranked "
+            f"parseable subtitle: {candidate['name']}"
         )
-        return None, None
-    else:
-        print("  No manual subtitle tracks available; trying automatic/translated subtitles.")
-
-    for index, candidate in enumerate(automatic_candidates, start=1):
-        print(
-            f"  Checking automatic/translated subtitle #{index}/{len(automatic_candidates)}: "
-            f"{candidate['name']}"
-        )
-        text = download_subtitle_text(candidate)
-        if not text:
-            continue
-        if groq_same_language(title_for_language_check, text, candidate):
-            return text, candidate
-
-    if automatic_candidates:
-        print("  No automatic subtitle matched the title language; using first parseable automatic subtitle.")
-        for candidate in automatic_candidates:
-            text = download_subtitle_text(candidate)
-            if text:
-                return text, candidate
+        return text, candidate
 
     return None, None
 
@@ -1194,7 +1310,134 @@ def lyric_similarity(left, right):
     return max(sequence_ratio, overlap_ratio)
 
 
-def choose_best_lyrics(library_lyrics, subtitle_lyrics, subtitle_candidate):
+def lyric_vote_sample(text, max_chars=4500):
+    text = clean_lyrics_for_tag(text or "")
+    if len(text) <= max_chars:
+        return text
+
+    edge = max_chars // 2
+    return text[:edge].rstrip() + "\n...\n" + text[-edge:].lstrip()
+
+
+def normalize_lyric_vote_choice(choice):
+    choice = norm_text(str(choice or "")).lower()
+    choice = choice.replace("-", "_").replace(" ", "_")
+
+    if choice in {"lrclib", "library", "library_search", "library_lyrics"}:
+        return "lrclib"
+    if choice in {
+        "subtitle",
+        "subtitles",
+        "youtube_subtitle",
+        "youtube_subtitles",
+        "caption",
+        "captions",
+    }:
+        return "youtube_subtitles"
+
+    return None
+
+
+def groq_choose_lyric_source_once(title, artist, library_lyrics, subtitle_lyrics, subtitle_candidate, similarity, vote_number):
+    subtitle_source = subtitle_candidate.get("name") if subtitle_candidate else "YouTube subtitles"
+    prompt = {
+        "vote_number": vote_number,
+        "song_title": title,
+        "artist": artist,
+        "lrclib_subtitle_similarity": similarity,
+        "subtitle_source": subtitle_source,
+        "subtitle_language_code": subtitle_candidate.get("language_code") if subtitle_candidate else None,
+        "subtitle_kind": subtitle_candidate_kind(subtitle_candidate) if subtitle_candidate else None,
+        "task": (
+            "Choose which lyrics should be saved for this song. Prefer the candidate that "
+            "looks like the real complete song lyrics in the song's original language. "
+            "Reject unrelated translations, wrong-language captions, noisy transcript text, "
+            "or text that does not match the title/artist."
+        ),
+        "choices": {
+            "lrclib": lyric_vote_sample(library_lyrics),
+            "youtube_subtitles": lyric_vote_sample(subtitle_lyrics),
+        },
+    }
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You judge competing lyric candidates. Return JSON only. "
+                "The choice must be exactly lrclib or youtube_subtitles."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"{json.dumps(prompt, ensure_ascii=False)}\n\n"
+                "Return exactly this JSON shape:\n"
+                '{ "choice": "lrclib", "confidence": 0.0, "reason": "short reason" }'
+            ),
+        },
+    ]
+
+    result = call_and_parse(messages, max_tokens=220, json_mode=True, temperature=0.35)
+    return normalize_lyric_vote_choice(result.get("choice")), result.get("reason") or ""
+
+
+def groq_vote_lyric_source(title, artist, library_lyrics, subtitle_lyrics, subtitle_candidate, similarity):
+    votes = {"lrclib": 0, "youtube_subtitles": 0}
+    valid_votes = 0
+
+    print("  LRCLIB/subtitle similarity is below 80%; asking Groq to vote on which lyrics to keep.")
+
+    for vote_number in range(1, 12):
+        try:
+            choice, reason = groq_choose_lyric_source_once(
+                title=title,
+                artist=artist,
+                library_lyrics=library_lyrics,
+                subtitle_lyrics=subtitle_lyrics,
+                subtitle_candidate=subtitle_candidate,
+                similarity=similarity,
+                vote_number=vote_number,
+            )
+        except Exception as e:
+            print(f"  Groq lyric vote {vote_number}/11 failed: {e}")
+            continue
+
+        if not choice:
+            print(f"  Groq lyric vote {vote_number}/11 returned no usable choice.")
+            continue
+
+        votes[choice] += 1
+        valid_votes += 1
+        reason_suffix = f" ({reason})" if reason else ""
+        print(
+            f"  Groq lyric vote {vote_number}/11: {choice} "
+            f"[LRCLIB {votes['lrclib']}, subtitles {votes['youtube_subtitles']}]" + reason_suffix
+        )
+
+        if votes[choice] >= 6:
+            print(f"  Groq lyric vote stopped early: {choice} reached 6 votes.")
+            break
+
+    if votes["lrclib"] > votes["youtube_subtitles"]:
+        winner = "lrclib"
+    elif votes["youtube_subtitles"] > votes["lrclib"]:
+        winner = "youtube_subtitles"
+    else:
+        winner = "youtube_subtitles"
+        if valid_votes:
+            print("  Groq lyric vote tied; keeping subtitle lyrics as fallback.")
+        else:
+            print("  No valid Groq lyric votes; keeping subtitle lyrics as fallback.")
+
+    print(
+        "  Groq lyric vote result: "
+        f"{winner} wins [LRCLIB {votes['lrclib']}, subtitles {votes['youtube_subtitles']}]."
+    )
+    return winner, votes
+
+
+def choose_best_lyrics(library_lyrics, subtitle_lyrics, subtitle_candidate, title="", artist=""):
     if library_lyrics and subtitle_lyrics:
         similarity = lyric_similarity(library_lyrics, subtitle_lyrics)
         print(f"  LRCLIB/subtitle lyric similarity: {similarity:.2%}")
@@ -1203,8 +1446,20 @@ def choose_best_lyrics(library_lyrics, subtitle_lyrics, subtitle_candidate):
             return library_lyrics, "lrclib", similarity
 
         source = subtitle_candidate.get("name") if subtitle_candidate else "YouTube subtitles"
-        print(f"  Using subtitle lyrics from {source} because LRCLIB did not match enough.")
-        return subtitle_lyrics, "youtube_subtitles", similarity
+        winner, votes = groq_vote_lyric_source(
+            title=title,
+            artist=artist,
+            library_lyrics=library_lyrics,
+            subtitle_lyrics=subtitle_lyrics,
+            subtitle_candidate=subtitle_candidate,
+            similarity=similarity,
+        )
+        if winner == "lrclib":
+            print(f"  Using LRCLIB lyrics after Groq vote against subtitle source {source}.")
+            return library_lyrics, "lrclib_groq_vote", similarity
+
+        print(f"  Using subtitle lyrics from {source} after Groq vote.")
+        return subtitle_lyrics, "youtube_subtitles_groq_vote", similarity
 
     if library_lyrics:
         print("  Using LRCLIB lyrics; no usable YouTube subtitle lyrics were found.")
@@ -1565,6 +1820,8 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
                 library_lyrics=library_lyrics,
                 subtitle_lyrics=subtitle_lyrics,
                 subtitle_candidate=subtitle_candidate,
+                title=title,
+                artist=artist,
             )
 
             if lyrics:
