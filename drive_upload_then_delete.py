@@ -4,6 +4,7 @@ import json
 import mimetypes
 import os
 import sys
+import time
 from pathlib import Path
 
 DRIVE_FOLDER_ID = "1qbVH_yaNn1aagSrMGvZIggCjSvRzZRSs"
@@ -39,13 +40,36 @@ def now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
+def retry_file_operation(description, operation, attempts=8, initial_delay=0.75):
+    delay = initial_delay
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except (PermissionError, OSError) as e:
+            last_error = e
+            if attempt >= attempts:
+                break
+
+            print(
+                f"File busy while {description}; retrying in {delay:.1f}s "
+                f"({attempt}/{attempts}): {e}",
+                flush=True,
+            )
+            time.sleep(delay)
+            delay = min(delay * 1.5, 5.0)
+
+    raise last_error
+
+
 def load_manifest_files(manifest_path):
     manifest = Path(manifest_path)
 
     if not manifest.exists():
         raise FileNotFoundError(f"Manifest file does not exist: {manifest}")
 
-    with manifest.open("r", encoding="utf-8") as f:
+    with manifest.open("r", encoding="utf-8-sig") as f:
         data = json.load(f)
 
     raw_files = data.get("files") if isinstance(data, dict) else data
@@ -90,15 +114,18 @@ def write_summary(summary_path, summary):
         return
 
     path = Path(summary_path)
-    path.write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False),
-        encoding="utf-8",
+    retry_file_operation(
+        f"writing summary {path}",
+        lambda: path.write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        ),
     )
 
 
 def validate_service_account_file(json_path):
     try:
-        data = json.loads(json_path.read_text(encoding="utf-8"))
+        data = json.loads(json_path.read_text(encoding="utf-8-sig"))
     except Exception as e:
         raise RuntimeError(f"Could not read service account JSON: {e}")
 
@@ -181,7 +208,10 @@ def build_oauth_drive_service(oauth_client_json, oauth_token_json):
             ),
         )
 
-    token_path.write_text(credentials.to_json(), encoding="utf-8")
+    retry_file_operation(
+        f"writing OAuth token {token_path}",
+        lambda: token_path.write_text(credentials.to_json(), encoding="utf-8"),
+    )
 
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
@@ -363,7 +393,10 @@ def main():
 
                 if args.delete_after_upload:
                     try:
-                        os.remove(file_path)
+                        retry_file_operation(
+                            f"deleting uploaded local file {file_path}",
+                            lambda p=file_path: os.remove(p),
+                        )
                         deleted_item = dict(success_item)
                         summary["deleted"].append(deleted_item)
                         print(f"Deleted local file after Drive upload: {file_path}")

@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 try:
     from mutagen import File as MutagenFile
@@ -33,7 +34,6 @@ UPLOAD_SUMMARY_FILE = os.path.join(SCRIPTS_DIR, "_last_upload_summary.json")
 DRIVE_UPLOAD_MANIFEST_FILE = os.path.join(SCRIPTS_DIR, "_last_drive_upload_delete_manifest.json")
 DRIVE_UPLOAD_SUMMARY_FILE = os.path.join(SCRIPTS_DIR, "_last_drive_upload_delete_summary.json")
 TEST_PROCESSED_HISTORY_FILE = os.path.join(SCRIPTS_DIR, "_test_processed_history.json")
-LYRICS_LIBRARY_CHECKED_HISTORY_FILE = os.path.join(SCRIPTS_DIR, "_lyrics_library_checked_history.json")
 UPLOADED_HISTORY_FILE = os.path.join(SCRIPTS_DIR, "_android_uploaded_history.json")
 DRIVE_UPLOADED_HISTORY_FILE = os.path.join(SCRIPTS_DIR, "_drive_uploaded_history.json")
 DRIVE_FOLDER_ID = "1qbVH_yaNn1aagSrMGvZIggCjSvRzZRSs"
@@ -101,6 +101,35 @@ def log(message=""):
     write_log_raw(f"{message}\n")
 
 
+def retry_file_operation(description, operation, attempts=8, initial_delay=0.75):
+    delay = initial_delay
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except (PermissionError, OSError) as e:
+            last_error = e
+            if attempt >= attempts:
+                break
+
+            log(
+                f"File busy while {description}; retrying in {delay:.1f}s "
+                f"({attempt}/{attempts}): {e}"
+            )
+            time.sleep(delay)
+            delay = min(delay * 1.5, 5.0)
+
+    raise last_error
+
+
+def remove_file_if_exists(path, description):
+    if not os.path.exists(path):
+        return
+
+    retry_file_operation(description, lambda: os.remove(path))
+
+
 def prepare_output_dirs():
     os.makedirs(WORKING_DOWNLOADS_DIR, exist_ok=True)
     os.makedirs(FINISHED_DIR, exist_ok=True)
@@ -148,9 +177,15 @@ def move_working_items_to_finished():
     for item_name in sorted(os.listdir(WORKING_DOWNLOADS_DIR)):
         source_path = os.path.join(WORKING_DOWNLOADS_DIR, item_name)
         destination_path = unique_destination(os.path.join(FINISHED_DIR, item_name))
-        shutil.move(source_path, destination_path)
-        moved_paths.append(destination_path)
-        log(f"Moved to finished: {destination_path}")
+        try:
+            retry_file_operation(
+                f"moving {source_path} to finished/",
+                lambda s=source_path, d=destination_path: shutil.move(s, d),
+            )
+            moved_paths.append(destination_path)
+            log(f"Moved to finished: {destination_path}")
+        except Exception as e:
+            log(f"WARNING: Could not move working item to finished/ after retries: {source_path} ({e})")
 
     return expand_files(moved_paths)
 
@@ -262,14 +297,6 @@ def load_test_processed_history():
 
 def save_test_processed_history(history):
     save_history_file(TEST_PROCESSED_HISTORY_FILE, history)
-
-
-def load_lyrics_library_checked_history():
-    return load_history_file(LYRICS_LIBRARY_CHECKED_HISTORY_FILE, "lyrics library checked")
-
-
-def save_lyrics_library_checked_history(history):
-    save_history_file(LYRICS_LIBRARY_CHECKED_HISTORY_FILE, history)
 
 
 def pending_finished_upload_files():
@@ -471,44 +498,11 @@ def audio_lyrics_need_square_bracket_cleanup(path):
 
 
 def pending_finished_test_files():
-    processed_history = load_test_processed_history()
-    lyrics_library_checked_history = load_lyrics_library_checked_history()
-    pending = []
-    already_complete_count = 0
-
-    for path in sorted(snapshot_finished_files()):
-        if not is_supported_audio_file(path):
-            continue
-
-        history_key = test_processed_history_key(path)
-        if audio_missing_title_or_artist(path):
-            log(f"Finished audio is missing title/artist tags; reprocessing: {path}")
-            pending.append(path)
-            continue
-        if not audio_has_lyrics(path):
-            log(f"Finished audio is missing lyrics; running lyrics lookup: {path}")
-            pending.append(path)
-            continue
-        if audio_lyrics_need_square_bracket_cleanup(path):
-            log(f"Finished audio lyrics contain square-bracket text; cleaning/rechecking: {path}")
-            pending.append(path)
-            continue
-        if history_key not in lyrics_library_checked_history:
-            log(f"Finished audio has lyrics but needs LRCLIB comparison check: {path}")
-            pending.append(path)
-            continue
-        if history_key not in processed_history:
-            processed_history.add(history_key)
-            already_complete_count += 1
-
-    if already_complete_count:
-        save_test_processed_history(processed_history)
-        log(
-            "Skipped and recorded "
-            f"{already_complete_count} finished/ audio file(s) that already had title, artist, and lyrics."
-        )
-
-    return pending
+    return [
+        path
+        for path in sorted(snapshot_finished_files())
+        if is_supported_audio_file(path)
+    ]
 
 
 def pending_finished_drive_upload_files():
@@ -575,24 +569,6 @@ def remember_test_processed_files(paths):
 
     save_test_processed_history(processed_history)
     log(f"Recorded {len(paths)} file(s) in test.py processed history.")
-
-
-def remember_lyrics_library_checked_files(paths):
-    paths = [
-        path
-        for path in paths
-        if path and os.path.exists(path) and is_supported_audio_file(path) and audio_has_lyrics(path)
-    ]
-    if not paths:
-        return
-
-    checked_history = load_lyrics_library_checked_history()
-
-    for path in paths:
-        checked_history.add(uploaded_history_key(path))
-
-    save_lyrics_library_checked_history(checked_history)
-    log(f"Recorded {len(paths)} file(s) in lyrics library checked history.")
 
 
 def write_download_manifest(paths):
@@ -705,8 +681,7 @@ def run_upload_step(downloaded_paths):
 
     write_download_manifest(downloaded_paths)
 
-    if os.path.exists(UPLOAD_SUMMARY_FILE):
-        os.remove(UPLOAD_SUMMARY_FILE)
+    remove_file_if_exists(UPLOAD_SUMMARY_FILE, "removing old Android upload summary")
 
     return_code = run_script(
         "find_lan_upload.py",
@@ -722,15 +697,15 @@ def run_upload_step(downloaded_paths):
     return load_upload_summary(downloaded_paths), return_code
 
 
-def process_unprocessed_finished_files():
+def process_finished_files_before_upload():
     pending = pending_finished_test_files()
     if not pending:
         log("")
-        log("No unprocessed finished/ audio files found before upload.")
+        log("No finished/ audio files found before upload.")
         return []
 
     log("")
-    log(f"Found {len(pending)} finished/ audio file(s) not yet processed by test.py.")
+    log(f"Running test.py on all {len(pending)} finished/ audio file(s).")
     print_numbered_files("Running test.py on finished/ files:", pending)
     write_test_manifest(pending)
 
@@ -744,7 +719,6 @@ def process_unprocessed_finished_files():
     )
 
     remember_test_processed_files(pending)
-    remember_lyrics_library_checked_files(pending)
     return pending
 
 
@@ -754,9 +728,8 @@ def prepare_upload_candidates_after_test(finished_before, moved_after_test, mark
 
     if mark_downloaded_as_test_processed:
         remember_test_processed_files(downloaded_paths)
-        remember_lyrics_library_checked_files(downloaded_paths)
 
-    process_unprocessed_finished_files()
+    process_finished_files_before_upload()
 
     upload_candidates = sorted(
         path
@@ -961,8 +934,7 @@ def prompt_drive_upload_then_delete(drive_candidates):
     log("")
     log("Files that fail Drive upload will NOT be deleted.")
 
-    if os.path.exists(DRIVE_UPLOAD_SUMMARY_FILE):
-        os.remove(DRIVE_UPLOAD_SUMMARY_FILE)
+    remove_file_if_exists(DRIVE_UPLOAD_SUMMARY_FILE, "removing old Drive upload/delete summary")
 
     return_code = run_script(
         "drive_upload_then_delete.py",

@@ -24,6 +24,8 @@ from mutagen.oggopus import OggOpus
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_AUDIO_FOLDER = os.path.join(BASE_DIR, "_working_downloads")
+LYRICS_NOT_FOUND_HISTORY_PATH = os.path.join(BASE_DIR, "_lyrics_not_found_history.json")
+LYRICS_NOT_FOUND_HISTORY_VERSION = 1
 
 
 def parse_args():
@@ -41,6 +43,11 @@ def parse_args():
         "--no-move",
         action="store_true",
         help="Process files in place and do not move _working_downloads to finished.",
+    )
+    parser.add_argument(
+        "--retry-missing-lyrics",
+        action="store_true",
+        help="Ignore the not-found lyrics cache and try LRCLIB/subtitles again.",
     )
     return parser.parse_args()
 
@@ -372,6 +379,11 @@ def groq_chat(messages, max_tokens=220, temperature=0, timeout=60, max_retries=8
                 )
                 continue
 
+            if resp.status_code == 413:
+                raise RuntimeError(
+                    "Groq request too large. Reduce prompt size before retrying this step."
+                )
+
             if resp.status_code == 400:
                 try:
                     err = resp.json()
@@ -466,6 +478,42 @@ def looks_bad(text: str) -> bool:
         return True
     bad_markers = ["�", "CÑA", "TÙN", "\\u", "???"]
     return any(x in text for x in bad_markers)
+
+
+def is_file_busy_error(error):
+    text = str(error).lower()
+    return (
+        isinstance(error, (PermissionError, OSError))
+        or "being used by another process" in text
+        or "permission denied" in text
+        or "access is denied" in text
+        or "winerror 32" in text
+    )
+
+
+def retry_file_operation(description, operation, attempts=8, initial_delay=0.75):
+    delay = initial_delay
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except Exception as e:
+            if not is_file_busy_error(e):
+                raise
+
+            last_error = e
+            if attempt >= attempts:
+                break
+
+            print(
+                f"  File busy while {description}; retrying in {delay:.1f}s "
+                f"({attempt}/{attempts}): {e}"
+            )
+            time.sleep(delay)
+            delay = min(delay * 1.5, 5.0)
+
+    raise last_error
 
 
 def get_audio_object(file_path: str):
@@ -954,6 +1002,19 @@ def subtitle_url_hints(url):
     return source_language, translated_to
 
 
+def subtitle_language_root(language_code):
+    language_code = str(language_code or "").strip().lower()
+    if not language_code:
+        return ""
+    return re.split(r"[-_]", language_code, maxsplit=1)[0]
+
+
+def is_live_chat_subtitle(language_code, display_name):
+    text = f"{language_code or ''} {display_name or ''}".strip().lower()
+    text = re.sub(r"\s+", "_", text)
+    return "live_chat" in text
+
+
 def iter_subtitle_candidates(info, automatic=False):
     key = "automatic_captions" if automatic else "subtitles"
     tracks_by_language = info.get(key) or {}
@@ -962,11 +1023,15 @@ def iter_subtitle_candidates(info, automatic=False):
         chosen = choose_subtitle_format(formats)
         if not chosen:
             continue
+        display_name = subtitle_track_display_name(language_code, chosen)
+        if is_live_chat_subtitle(language_code, display_name):
+            continue
+
         source_language, translated_to = subtitle_url_hints(chosen.get("url"))
 
         yield {
             "language_code": language_code,
-            "name": subtitle_track_display_name(language_code, chosen),
+            "name": display_name,
             "url": chosen.get("url"),
             "ext": str(chosen.get("ext", "")).lower(),
             "automatic": automatic,
@@ -1068,10 +1133,17 @@ def parse_subtitle_text(text, ext):
 
 
 def download_subtitle_text(candidate):
+    candidate.pop("download_error_status", None)
     try:
         response = requests.get(candidate["url"], timeout=30)
         response.raise_for_status()
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        candidate["download_error_status"] = status
+        print(f"  Could not download subtitle {candidate.get('name')}: {e}")
+        return None
     except Exception as e:
+        candidate["download_error_status"] = None
         print(f"  Could not download subtitle {candidate.get('name')}: {e}")
         return None
 
@@ -1139,11 +1211,28 @@ def subtitle_candidate_kind(candidate):
     return "automatic_original"
 
 
+def automatic_original_language_from_metadata(candidate):
+    if subtitle_candidate_kind(candidate) != "automatic_original":
+        return False
+
+    source_language = subtitle_language_root(candidate.get("source_language_code"))
+    track_language = subtitle_language_root(candidate.get("language_code"))
+
+    if not source_language:
+        return False
+    if not track_language:
+        return True
+    return source_language == track_language
+
+
 def default_subtitle_candidate_order(manual_candidates, automatic_candidates):
     automatic_order = sorted(
         automatic_candidates,
         key=lambda item: (
             bool(item.get("is_translated")),
+            not automatic_original_language_from_metadata(item),
+            subtitle_language_root(item.get("source_language_code")),
+            subtitle_language_root(item.get("translated_to_language_code")),
             item.get("language_code") or "",
             item.get("name") or "",
         ),
@@ -1151,15 +1240,23 @@ def default_subtitle_candidate_order(manual_candidates, automatic_candidates):
     return manual_candidates + automatic_order
 
 
-def subtitle_candidate_prompt_item(candidate):
-    return {
-        "id": candidate.get("rank_id"),
-        "kind": subtitle_candidate_kind(candidate),
-        "language_code": candidate.get("language_code"),
-        "name": candidate.get("name"),
-        "source_language_code": candidate.get("source_language_code"),
-        "translated_to_language_code": candidate.get("translated_to_language_code"),
-    }
+def truncate_prompt_text(text, max_chars):
+    text = norm_text(str(text or ""))
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip()
+
+
+def subtitle_candidate_prompt_line(candidate):
+    fields = [
+        candidate.get("rank_id"),
+        subtitle_candidate_kind(candidate),
+        f"code={candidate.get('language_code') or ''}",
+        f"src={candidate.get('source_language_code') or ''}",
+        f"to={candidate.get('translated_to_language_code') or ''}",
+        f"name={truncate_prompt_text(candidate.get('name'), 42)}",
+    ]
+    return "|".join(str(field or "") for field in fields)
 
 
 def rank_subtitle_candidates_with_groq(video_title, candidates, info):
@@ -1170,33 +1267,27 @@ def rank_subtitle_candidates_with_groq(video_title, candidates, info):
         prefix = "auto" if candidate.get("automatic") else "manual"
         candidate["rank_id"] = f"{prefix}-{index}"
 
-    prompt = {
-        "youtube_title": video_title,
-        "youtube_track": info.get("track"),
-        "youtube_artist": info.get("artist") or info.get("artists"),
-        "instructions": (
-            "Rank subtitle tracks for song lyrics extraction. Prefer the track whose language "
-            "matches the YouTube title/song language. Prefer manual_human over automatic tracks "
-            "only when it matches the title language. Prefer automatic_original over "
-            "automatic_translated when no matching manual track exists. Avoid translated tracks "
-            "to unrelated languages."
-        ),
-        "candidates": [subtitle_candidate_prompt_item(candidate) for candidate in candidates],
-    }
+    candidate_lines = "\n".join(subtitle_candidate_prompt_line(candidate) for candidate in candidates)
 
     messages = [
         {
             "role": "system",
             "content": (
-                "You choose subtitle priority for lyric extraction. Return JSON only. "
-                "Use exact candidate ids from the provided list."
+                "Rank subtitle tracks for lyric extraction. Return JSON only. "
+                "Prefer title-language matches. Prefer manual_human when it matches. "
+                "Prefer automatic_original over translated tracks when no manual match exists. "
+                "Avoid unrelated translations. Use exact ids."
             ),
         },
         {
             "role": "user",
             "content": (
-                f"{json.dumps(prompt, ensure_ascii=False)}\n\n"
-                "Return exactly this JSON shape:\n"
+                f"title={truncate_prompt_text(video_title, 120)}\n"
+                f"track={truncate_prompt_text(info.get('track'), 120)}\n"
+                f"artist={truncate_prompt_text(info.get('artist') or info.get('artists'), 120)}\n"
+                "candidate format: id|kind|code|src|to|name\n"
+                f"{candidate_lines}\n\n"
+                "Return JSON:\n"
                 '{ "detected_title_language": "language", '
                 '"priority_ids": ["candidate-id-1", "candidate-id-2"], '
                 '"reason": "short reason" }'
@@ -1205,7 +1296,7 @@ def rank_subtitle_candidates_with_groq(video_title, candidates, info):
     ]
 
     try:
-        result = call_and_parse(messages, max_tokens=900, json_mode=True)
+        result = call_and_parse(messages, max_tokens=420, json_mode=True)
     except Exception as e:
         print(f"  Groq subtitle priority ranking failed; using safe fallback order: {e}")
         return candidates
@@ -1245,40 +1336,80 @@ def get_lyrics_from_youtube_subtitles(video_id, video_title):
     title_for_language_check = info.get("track") or info.get("title") or video_title or video_id
     manual_candidates = list(iter_subtitle_candidates(info, automatic=False))
     automatic_candidates = list(iter_subtitle_candidates(info, automatic=True))
-    ranked_candidates = default_subtitle_candidate_order(manual_candidates, automatic_candidates)
 
     print(
         f"  YouTube subtitles: {len(manual_candidates)} manual track(s), "
         f"{len(automatic_candidates)} automatic/translated track(s)."
     )
 
-    ranked_candidates = rank_subtitle_candidates_with_groq(
+    ranked_manual_candidates = rank_subtitle_candidates_with_groq(
         video_title=title_for_language_check,
-        candidates=ranked_candidates,
+        candidates=manual_candidates,
         info=info,
     )
-    first_parseable = None
 
-    for index, candidate in enumerate(ranked_candidates, start=1):
-        kind = subtitle_candidate_kind(candidate).replace("_", " ")
-        print(f"  Checking ranked subtitle #{index}/{len(ranked_candidates)} ({kind}): {candidate['name']}")
+    for index, candidate in enumerate(ranked_manual_candidates, start=1):
+        print(f"  Checking manual subtitle #{index}/{len(ranked_manual_candidates)}: {candidate['name']}")
         text = download_subtitle_text(candidate)
         if not text:
+            blocked_status = candidate.get("download_error_status")
+            if blocked_status in {403, 429}:
+                print(
+                    f"  YouTube timedtext returned {blocked_status}; "
+                    "stopping subtitle downloads for this video."
+                )
+                return None, None
             continue
-        if first_parseable is None:
-            first_parseable = (text, candidate)
         if groq_same_language(title_for_language_check, text, candidate):
+            candidate = dict(candidate)
+            candidate["language_match_approved"] = True
             return text, candidate
 
-        print(f"  Subtitle language did not match title: {candidate['name']}")
+        print(f"  Manual subtitle language did not match title: {candidate['name']}")
 
-    if first_parseable:
-        text, candidate = first_parseable
+    if manual_candidates:
+        print("  No manual subtitle matched the title language; trying automatic subtitles.")
+    else:
+        print("  No manual subtitles available; trying automatic subtitles.")
+
+    ranked_automatic_candidates = default_subtitle_candidate_order([], automatic_candidates)
+    if ranked_automatic_candidates:
         print(
-            "  No subtitle passed the second language check; using highest-ranked "
-            f"parseable subtitle: {candidate['name']}"
+            "  Automatic subtitle order uses YouTube metadata: original captions first, "
+            "translated tracks later."
         )
-        return text, candidate
+
+    for index, candidate in enumerate(ranked_automatic_candidates, start=1):
+        kind = subtitle_candidate_kind(candidate).replace("_", " ")
+        print(f"  Checking automatic subtitle #{index}/{len(ranked_automatic_candidates)} ({kind}): {candidate['name']}")
+        text = download_subtitle_text(candidate)
+        if not text:
+            blocked_status = candidate.get("download_error_status")
+            if blocked_status in {403, 429}:
+                print(
+                    f"  YouTube timedtext returned {blocked_status}; "
+                    "stopping automatic subtitle downloads for this video."
+                )
+                break
+            continue
+        if automatic_original_language_from_metadata(candidate):
+            candidate = dict(candidate)
+            candidate["language_match_approved"] = True
+            candidate["language_match_source"] = "youtube_timedtext_original"
+            source_language = candidate.get("source_language_code") or candidate.get("language_code")
+            print(
+                f"  YouTube marks {candidate['name']} as original automatic captions "
+                f"(source={source_language}); accepting it before translated tracks."
+            )
+            return text, candidate
+        if groq_same_language(title_for_language_check, text, candidate):
+            candidate = dict(candidate)
+            candidate["language_match_approved"] = True
+            return text, candidate
+
+        print(f"  Automatic subtitle language did not match title: {candidate['name']}")
+
+    print("  No subtitle track was approved as the same language as the YouTube title.")
 
     return None, None
 
@@ -1310,131 +1441,30 @@ def lyric_similarity(left, right):
     return max(sequence_ratio, overlap_ratio)
 
 
-def lyric_vote_sample(text, max_chars=4500):
-    text = clean_lyrics_for_tag(text or "")
-    if len(text) <= max_chars:
-        return text
+def choose_low_similarity_lyrics(library_lyrics, subtitle_lyrics, subtitle_candidate):
+    source = subtitle_candidate.get("name") if subtitle_candidate else "YouTube subtitles"
+    library_lyrics = clean_lyrics_for_tag(library_lyrics)
+    subtitle_lyrics = clean_lyrics_for_tag(subtitle_lyrics)
 
-    edge = max_chars // 2
-    return text[:edge].rstrip() + "\n...\n" + text[-edge:].lstrip()
-
-
-def normalize_lyric_vote_choice(choice):
-    choice = norm_text(str(choice or "")).lower()
-    choice = choice.replace("-", "_").replace(" ", "_")
-
-    if choice in {"lrclib", "library", "library_search", "library_lyrics"}:
-        return "lrclib"
-    if choice in {
-        "subtitle",
-        "subtitles",
-        "youtube_subtitle",
-        "youtube_subtitles",
-        "caption",
-        "captions",
-    }:
-        return "youtube_subtitles"
-
-    return None
-
-
-def groq_choose_lyric_source_once(title, artist, library_lyrics, subtitle_lyrics, subtitle_candidate, similarity, vote_number):
-    subtitle_source = subtitle_candidate.get("name") if subtitle_candidate else "YouTube subtitles"
-    prompt = {
-        "vote_number": vote_number,
-        "song_title": title,
-        "artist": artist,
-        "lrclib_subtitle_similarity": similarity,
-        "subtitle_source": subtitle_source,
-        "subtitle_language_code": subtitle_candidate.get("language_code") if subtitle_candidate else None,
-        "subtitle_kind": subtitle_candidate_kind(subtitle_candidate) if subtitle_candidate else None,
-        "task": (
-            "Choose which lyrics should be saved for this song. Prefer the candidate that "
-            "looks like the real complete song lyrics in the song's original language. "
-            "Reject unrelated translations, wrong-language captions, noisy transcript text, "
-            "or text that does not match the title/artist."
-        ),
-        "choices": {
-            "lrclib": lyric_vote_sample(library_lyrics),
-            "youtube_subtitles": lyric_vote_sample(subtitle_lyrics),
-        },
-    }
-
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You judge competing lyric candidates. Return JSON only. "
-                "The choice must be exactly lrclib or youtube_subtitles."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"{json.dumps(prompt, ensure_ascii=False)}\n\n"
-                "Return exactly this JSON shape:\n"
-                '{ "choice": "lrclib", "confidence": 0.0, "reason": "short reason" }'
-            ),
-        },
-    ]
-
-    result = call_and_parse(messages, max_tokens=220, json_mode=True, temperature=0.35)
-    return normalize_lyric_vote_choice(result.get("choice")), result.get("reason") or ""
-
-
-def groq_vote_lyric_source(title, artist, library_lyrics, subtitle_lyrics, subtitle_candidate, similarity):
-    votes = {"lrclib": 0, "youtube_subtitles": 0}
-    valid_votes = 0
-
-    print("  LRCLIB/subtitle similarity is below 80%; asking Groq to vote on which lyrics to keep.")
-
-    for vote_number in range(1, 12):
-        try:
-            choice, reason = groq_choose_lyric_source_once(
-                title=title,
-                artist=artist,
-                library_lyrics=library_lyrics,
-                subtitle_lyrics=subtitle_lyrics,
-                subtitle_candidate=subtitle_candidate,
-                similarity=similarity,
-                vote_number=vote_number,
-            )
-        except Exception as e:
-            print(f"  Groq lyric vote {vote_number}/11 failed: {e}")
-            continue
-
-        if not choice:
-            print(f"  Groq lyric vote {vote_number}/11 returned no usable choice.")
-            continue
-
-        votes[choice] += 1
-        valid_votes += 1
-        reason_suffix = f" ({reason})" if reason else ""
+    if subtitle_candidate and subtitle_candidate_kind(subtitle_candidate) == "manual_human":
         print(
-            f"  Groq lyric vote {vote_number}/11: {choice} "
-            f"[LRCLIB {votes['lrclib']}, subtitles {votes['youtube_subtitles']}]" + reason_suffix
+            f"  Using human subtitle lyrics from {source} because Groq approved the language "
+            "match and LRCLIB/subtitle similarity is below 80%."
         )
+        return subtitle_lyrics, "youtube_subtitles_manual_language_match"
 
-        if votes[choice] >= 6:
-            print(f"  Groq lyric vote stopped early: {choice} reached 6 votes.")
-            break
-
-    if votes["lrclib"] > votes["youtube_subtitles"]:
-        winner = "lrclib"
-    elif votes["youtube_subtitles"] > votes["lrclib"]:
-        winner = "youtube_subtitles"
-    else:
-        winner = "youtube_subtitles"
-        if valid_votes:
-            print("  Groq lyric vote tied; keeping subtitle lyrics as fallback.")
-        else:
-            print("  No valid Groq lyric votes; keeping subtitle lyrics as fallback.")
+    if subtitle_candidate and subtitle_candidate.get("automatic") and subtitle_candidate.get("language_match_approved"):
+        print(
+            f"  Using automatic subtitle lyrics from {source} because Groq approved the language "
+            "match and LRCLIB/subtitle similarity is below 80%."
+        )
+        return subtitle_lyrics, "youtube_subtitles_automatic_language_match"
 
     print(
-        "  Groq lyric vote result: "
-        f"{winner} wins [LRCLIB {votes['lrclib']}, subtitles {votes['youtube_subtitles']}]."
+        f"  Using subtitle lyrics from {source} because LRCLIB did not match enough "
+        "and the chosen subtitle is not a manual human track."
     )
-    return winner, votes
+    return subtitle_lyrics, "youtube_subtitles"
 
 
 def choose_best_lyrics(library_lyrics, subtitle_lyrics, subtitle_candidate, title="", artist=""):
@@ -1445,21 +1475,12 @@ def choose_best_lyrics(library_lyrics, subtitle_lyrics, subtitle_candidate, titl
             print("  Using LRCLIB lyrics because they match subtitles by at least 80%.")
             return library_lyrics, "lrclib", similarity
 
-        source = subtitle_candidate.get("name") if subtitle_candidate else "YouTube subtitles"
-        winner, votes = groq_vote_lyric_source(
-            title=title,
-            artist=artist,
+        lyrics, source = choose_low_similarity_lyrics(
             library_lyrics=library_lyrics,
             subtitle_lyrics=subtitle_lyrics,
             subtitle_candidate=subtitle_candidate,
-            similarity=similarity,
         )
-        if winner == "lrclib":
-            print(f"  Using LRCLIB lyrics after Groq vote against subtitle source {source}.")
-            return library_lyrics, "lrclib_groq_vote", similarity
-
-        print(f"  Using subtitle lyrics from {source} after Groq vote.")
-        return subtitle_lyrics, "youtube_subtitles_groq_vote", similarity
+        return lyrics, source, similarity
 
     if library_lyrics:
         print("  Using LRCLIB lyrics; no usable YouTube subtitle lyrics were found.")
@@ -1497,7 +1518,10 @@ def write_tags(file_path: str, title: str, artist: str, album: str = ""):
                 audio["©ART"] = [artist]
             if album:
                 audio["©alb"] = [album]
-            audio.save()
+            retry_file_operation(
+                f"saving MP4 title/artist tags for {file_path}",
+                audio.save,
+            )
             return
 
         if isinstance(audio, (FLAC, OggVorbis, OggOpus)):
@@ -1507,7 +1531,10 @@ def write_tags(file_path: str, title: str, artist: str, album: str = ""):
                 audio["artist"] = [artist]
             if album:
                 audio["album"] = [album]
-            audio.save()
+            retry_file_operation(
+                f"saving Vorbis/FLAC title/artist tags for {file_path}",
+                audio.save,
+            )
             return
 
         if isinstance(audio, (MP3, WAVE, AIFF)):
@@ -1526,7 +1553,10 @@ def write_tags(file_path: str, title: str, artist: str, album: str = ""):
                 tags.delall("TALB")
                 tags.add(TALB(encoding=3, text=album))
 
-            tags.save(file_path, v2_version=3)
+            retry_file_operation(
+                f"saving ID3 title/artist tags for {file_path}",
+                lambda: tags.save(file_path, v2_version=3),
+            )
             return
 
         # Generic fallback
@@ -1545,7 +1575,10 @@ def write_tags(file_path: str, title: str, artist: str, album: str = ""):
             audio.tags["artist"] = [artist]
         if album:
             audio.tags["album"] = [album]
-        audio.save()
+        retry_file_operation(
+            f"saving generic title/artist tags for {file_path}",
+            audio.save,
+        )
 
     except Exception as e:
         raise RuntimeError(f"Tag write failed: {e}")
@@ -1577,7 +1610,10 @@ def write_lyrics(file_path: str, lyrics: str, replace_existing=False):
                         pass
 
             audio["\xa9lyr"] = [lyrics]
-            audio.save()
+            retry_file_operation(
+                f"saving MP4 lyrics for {file_path}",
+                audio.save,
+            )
             return
 
         if isinstance(audio, (FLAC, OggVorbis, OggOpus)):
@@ -1591,7 +1627,10 @@ def write_lyrics(file_path: str, lyrics: str, replace_existing=False):
                         return
 
             audio["lyrics"] = [lyrics]
-            audio.save()
+            retry_file_operation(
+                f"saving Vorbis/FLAC lyrics for {file_path}",
+                audio.save,
+            )
             return
 
         if isinstance(audio, (MP3, WAVE, AIFF)):
@@ -1611,7 +1650,10 @@ def write_lyrics(file_path: str, lyrics: str, replace_existing=False):
                         return
 
             tags.add(USLT(encoding=3, lang="eng", desc="", text=lyrics))
-            tags.save(file_path, v2_version=3)
+            retry_file_operation(
+                f"saving ID3 lyrics for {file_path}",
+                lambda: tags.save(file_path, v2_version=3),
+            )
             return
 
         raise RuntimeError(f"Lyrics writing not supported for this format: {type(audio).__name__}")
@@ -1637,7 +1679,10 @@ def clear_lyrics(file_path: str):
                     changed = True
 
             if changed:
-                audio.save()
+                retry_file_operation(
+                    f"saving MP4 lyrics cleanup for {file_path}",
+                    audio.save,
+                )
             return
 
         if isinstance(audio, (FLAC, OggVorbis, OggOpus)):
@@ -1651,7 +1696,10 @@ def clear_lyrics(file_path: str):
                     changed = True
 
             if changed:
-                audio.save()
+                retry_file_operation(
+                    f"saving Vorbis/FLAC lyrics cleanup for {file_path}",
+                    audio.save,
+                )
             return
 
         if isinstance(audio, (MP3, WAVE, AIFF)):
@@ -1662,7 +1710,10 @@ def clear_lyrics(file_path: str):
 
             if tags.getall("USLT"):
                 tags.delall("USLT")
-                tags.save(file_path, v2_version=3)
+                retry_file_operation(
+                    f"saving ID3 lyrics cleanup for {file_path}",
+                    lambda: tags.save(file_path, v2_version=3),
+                )
     except Exception as e:
         raise RuntimeError(f"Lyrics clear failed: {e}")
 
@@ -1673,7 +1724,110 @@ def has_usable_title_and_artist(title, artist):
     return bool(title) and bool(artist) and artist.lower() != "unknown"
 
 
+def current_timestamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def load_lyrics_not_found_history():
+    if not os.path.exists(LYRICS_NOT_FOUND_HISTORY_PATH):
+        return {"version": LYRICS_NOT_FOUND_HISTORY_VERSION, "items": {}}
+
+    try:
+        with open(LYRICS_NOT_FOUND_HISTORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"Could not read lyrics not-found history; starting fresh: {e}")
+        return {"version": LYRICS_NOT_FOUND_HISTORY_VERSION, "items": {}}
+
+    if not isinstance(data, dict):
+        return {"version": LYRICS_NOT_FOUND_HISTORY_VERSION, "items": {}}
+
+    items = data.get("items")
+    if not isinstance(items, dict):
+        items = {}
+
+    return {
+        "version": LYRICS_NOT_FOUND_HISTORY_VERSION,
+        "items": items,
+        "updated_at": data.get("updated_at"),
+    }
+
+
+def save_lyrics_not_found_history(history):
+    history["version"] = LYRICS_NOT_FOUND_HISTORY_VERSION
+    history["updated_at"] = current_timestamp()
+    temp_path = LYRICS_NOT_FOUND_HISTORY_PATH + ".tmp"
+
+    def write_history():
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(temp_path, LYRICS_NOT_FOUND_HISTORY_PATH)
+
+    retry_file_operation("saving lyrics not-found history", write_history)
+
+
+def lyrics_not_found_cache_key(file_path):
+    return os.path.normcase(os.path.abspath(file_path))
+
+
+def build_lyrics_not_found_signature(file_path, original_file_name, title, artist, album, video_id):
+    try:
+        file_size = os.path.getsize(file_path)
+    except Exception:
+        file_size = None
+
+    return {
+        "file_path": lyrics_not_found_cache_key(file_path),
+        "file_name": os.path.basename(file_path),
+        "original_file_name": original_file_name,
+        "title": norm_text(title).casefold(),
+        "artist": norm_text(artist).casefold(),
+        "album": norm_text(album).casefold(),
+        "video_id": video_id or "",
+        "file_size": file_size,
+    }
+
+
+def lyrics_not_found_signature_matches(record, signature):
+    if not isinstance(record, dict):
+        return False
+
+    for field in ("title", "artist", "album", "video_id", "file_size"):
+        if record.get(field) != signature.get(field):
+            return False
+
+    return True
+
+
+def lyrics_not_found_cache_hit(history, file_path, signature):
+    if ARGS.retry_missing_lyrics:
+        return False
+
+    record = history.get("items", {}).get(lyrics_not_found_cache_key(file_path))
+    return lyrics_not_found_signature_matches(record, signature)
+
+
+def remember_lyrics_not_found(history, signature):
+    key = signature["file_path"]
+    existing = history.setdefault("items", {}).get(key, {})
+    attempt_count = int(existing.get("attempt_count") or 0) + 1
+    record = dict(signature)
+    record["attempt_count"] = attempt_count
+    record["last_attempted_at"] = current_timestamp()
+    history["items"][key] = record
+    save_lyrics_not_found_history(history)
+
+
+def forget_lyrics_not_found(history, file_path):
+    key = lyrics_not_found_cache_key(file_path)
+    if key in history.get("items", {}):
+        history["items"].pop(key, None)
+        save_lyrics_not_found_history(history)
+
+
 all_metadata = []
+lyrics_not_found_history = load_lyrics_not_found_history()
 
 for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
     existing_title, existing_artist, existing_album = get_existing_basic_tags(file_path)
@@ -1749,62 +1903,37 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
     lyrics_source = "existing" if already_has_lyrics else None
     subtitle_track = None
     lyric_source_similarity = None
-    existing_lyrics = read_existing_lyrics(file_path) if already_has_lyrics else None
     existing_lyrics_cleaned_for_noise = False
+    lyrics_lookup_skipped_not_found_cache = False
+    lyrics_not_found_signature = build_lyrics_not_found_signature(
+        file_path=file_path,
+        original_file_name=original_file_name,
+        title=title,
+        artist=artist,
+        album=existing_album,
+        video_id=video_id,
+    )
 
-    if existing_lyrics:
-        try:
-            cleaned_existing_lyrics = clean_lyrics_for_tag(existing_lyrics)
-            if cleaned_existing_lyrics != existing_lyrics.strip():
-                if cleaned_existing_lyrics:
-                    write_lyrics(file_path, cleaned_existing_lyrics, replace_existing=True)
-                    existing_lyrics = cleaned_existing_lyrics
-                    existing_lyrics_cleaned_for_noise = True
-                    print("  Removed square-bracket content from existing lyrics.")
-                else:
-                    clear_lyrics(file_path)
-                    existing_lyrics = None
-                    lyrics_found = False
-                    lyrics_source = None
-                    existing_lyrics_cleaned_for_noise = True
-                    print("  Removed existing lyrics because they only contained square-bracket noise.")
-        except Exception as e:
-            print(f"  Existing lyrics cleanup error: {e}")
-
-    try:
-        duration = read_duration_seconds(file_path)
-        library_lyrics = get_lyrics_from_lrclib(
-            title=title,
-            artist=artist,
-            duration=duration,
-            album=existing_album
+    if already_has_lyrics:
+        forget_lyrics_not_found(lyrics_not_found_history, file_path)
+        print("  Skipped lyrics: already present")
+    elif lyrics_not_found_cache_hit(lyrics_not_found_history, file_path, lyrics_not_found_signature):
+        lyrics_lookup_skipped_not_found_cache = True
+        lyrics_source = "lyrics_not_found_cache"
+        print(
+            "  Skipped lyrics lookup: previously attempted and not found "
+            "for this same title/artist/video id."
         )
+    else:
+        try:
+            duration = read_duration_seconds(file_path)
+            library_lyrics = get_lyrics_from_lrclib(
+                title=title,
+                artist=artist,
+                duration=duration,
+                album=existing_album
+            )
 
-        if existing_lyrics:
-            print("  Existing lyrics found; still checking LRCLIB for possible upgrade.")
-            if library_lyrics:
-                lyric_source_similarity = lyric_similarity(library_lyrics, existing_lyrics)
-                print(
-                    "  LRCLIB/existing lyric similarity: "
-                    f"{lyric_source_similarity:.2%} "
-                    "(normalized text ratio plus word-overlap ratio; using the higher score)"
-                )
-
-                if lyric_source_similarity >= 0.80:
-                    write_lyrics(file_path, library_lyrics, replace_existing=True)
-                    lyrics_source = "lrclib"
-                    lyrics_found = True
-                    print(
-                        "  Replaced existing lyrics with LRCLIB lyrics because they "
-                        "matched by at least 80%."
-                    )
-                else:
-                    lyrics_source = "existing"
-                    print("  Kept existing lyrics because LRCLIB did not match by at least 80%.")
-            else:
-                lyrics_source = "existing"
-                print("  Kept existing lyrics because LRCLIB returned no lyrics.")
-        else:
             subtitle_lyrics = None
             subtitle_candidate = None
 
@@ -1814,9 +1943,9 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
                     video_title=cleaned_name_for_ai,
                 )
             else:
-                print("  No YouTube video id found in filename; skipping subtitle lyrics.")
+                print("  No YouTube video id found in filename; cannot look up subtitle lyrics.")
 
-            lyrics, lyrics_source, lyric_source_similarity = choose_best_lyrics(
+            lyrics, selected_lyrics_source, lyric_source_similarity = choose_best_lyrics(
                 library_lyrics=library_lyrics,
                 subtitle_lyrics=subtitle_lyrics,
                 subtitle_candidate=subtitle_candidate,
@@ -1827,18 +1956,22 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
             if lyrics:
                 cleaned_lyrics = clean_lyrics_for_tag(lyrics)
                 if cleaned_lyrics:
-                    write_lyrics(file_path, cleaned_lyrics, replace_existing=already_has_lyrics)
+                    write_lyrics(file_path, cleaned_lyrics, replace_existing=True)
                     lyrics_found = True
+                    lyrics_source = selected_lyrics_source
                     subtitle_track = subtitle_candidate.get("name") if subtitle_candidate else None
-                    print(f"  Added lyrics from {lyrics_source} ({len(cleaned_lyrics)} chars)")
-                elif existing_lyrics_cleaned_for_noise:
-                    print("  Lyrics candidate only contained square-bracket noise; not writing lyrics.")
+                    print(f"  Wrote lyrics from {lyrics_source} ({len(cleaned_lyrics)} chars)")
                 else:
                     print("  No lyrics found after square-bracket cleanup")
             else:
                 print("  No lyrics found")
-    except Exception as e:
-        print(f"  Lyrics error: {e}")
+
+            if lyrics_found:
+                forget_lyrics_not_found(lyrics_not_found_history, file_path)
+            else:
+                remember_lyrics_not_found(lyrics_not_found_history, lyrics_not_found_signature)
+        except Exception as e:
+            print(f"  Lyrics error: {e}")
 
     all_metadata.append({
         "file_name": original_file_name,
@@ -1847,7 +1980,10 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
         "tag_update_skipped_existing": skipped_tag_update_existing,
         "tag_source": tag_source,
         "lyrics_found": lyrics_found,
+        "lyrics_had_existing_before": already_has_lyrics,
         "lyrics_skipped_existing": already_has_lyrics,
+        "lyrics_lookup_skipped_not_found_cache": lyrics_lookup_skipped_not_found_cache,
+        "lyrics_existing_cleaned": existing_lyrics_cleaned_for_noise,
         "lyrics_source": lyrics_source,
         "subtitle_track": subtitle_track,
         "lrclib_subtitle_similarity": lyric_source_similarity,
