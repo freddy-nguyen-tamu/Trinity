@@ -1,21 +1,36 @@
-download_history.json
+# Runtime download/output folders
+_working_downloads/
+finished/
+
+# Build outputs and caches
 build/
 dist/
 __pycache__/
-_working_downloads/
-finished/
+*.pyc
+*.pyo
+*.exe
+*.apk
+*.aab
+.gradle/
+local.properties
+*.iml
+app/build/
+
+# Logs and debug captures
+*.log
 trinity_run_log.txt
-_last_downloaded_manifest.json
-_last_test_manifest.json
-_last_upload_summary.json
-_last_drive_upload_delete_manifest.json
-_last_drive_upload_delete_summary.json
-_test_processed_history.json
-_android_uploaded_history.json
-_drive_uploaded_history.json
-_google_drive_oauth_token.json
 upload_debug_*.html
 upload_debug_*.png
+
+# Generated manifests, summaries, and histories
+download_history.json
+*_history.json
+_last_*.json
+_manual_*.json
+filenames.json
+
+# Local Google credentials and tokens
+_google_drive_oauth_token.json
 google_drive_oauth_client.json
 client_secret*.json
 *.service-account.json
@@ -23,5 +38,3 @@ client_secret*.json
 *service-account*.json
 *serviceaccount*.json
 wavestack2-*.json
-'download_history.json'  
-download_history.json 

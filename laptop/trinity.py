@@ -23,8 +23,14 @@ except Exception:
 # Path to Python interpreter
 PYTHON_EXE = r"C:\Users\qacer\AppData\Local\Python\pythoncore-3.14-64\python.exe"
 
-# Folder where all scripts live
-SCRIPTS_DIR = r"C:\Users\qacer\Downloads\ytb"
+def current_app_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+# Folder where all laptop scripts and runtime files live.
+SCRIPTS_DIR = current_app_dir()
 WORKING_DOWNLOADS_DIR = os.path.join(SCRIPTS_DIR, "_working_downloads")
 FINISHED_DIR = os.path.join(SCRIPTS_DIR, "finished")
 LOG_FILE = os.path.join(SCRIPTS_DIR, "trinity_run_log.txt")
