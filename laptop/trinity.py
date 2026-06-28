@@ -531,6 +531,22 @@ def pending_finished_drive_upload_files():
     return pending
 
 
+def finished_files_uploaded_to_android_and_drive():
+    uploaded_history = load_uploaded_history()
+    drive_uploaded_history = load_drive_uploaded_history()
+    ready = []
+
+    for path in sorted(snapshot_finished_files()):
+        if not is_supported_audio_file(path):
+            continue
+
+        history_key = uploaded_history_key(path)
+        if history_key in uploaded_history and history_key in drive_uploaded_history:
+            ready.append(path)
+
+    return ready
+
+
 def remember_successful_uploads(successful_items):
     if not successful_items:
         return
@@ -886,7 +902,51 @@ def print_drive_upload_summary(summary):
         log(f"Drive upload/delete error: {summary['error']}")
 
 
-def prompt_drive_upload_then_delete(drive_candidates):
+def delete_finished_files_already_uploaded_to_both(paths):
+    if not paths:
+        log("")
+        log("No finished/ files already uploaded to both Android and Drive need local cleanup.")
+        return
+
+    log("")
+    log("Deleting finished/ files already recorded as uploaded to both Android and Drive:")
+    print_numbered_files("Already uploaded to both:", paths)
+
+    deleted = []
+    failed = []
+
+    for path in paths:
+        safe_path = safe_finished_path(path)
+        if not safe_path or not os.path.exists(safe_path):
+            continue
+
+        try:
+            remove_file_if_exists(
+                safe_path,
+                f"deleting already uploaded finished file {safe_path}",
+            )
+            deleted.append(safe_path)
+            log(f"Deleted local file already uploaded to Android and Drive: {safe_path}")
+        except Exception as e:
+            failed.append(
+                {
+                    "path": safe_path,
+                    "name": relative_finished_name(safe_path),
+                    "error": str(e),
+                }
+            )
+            log(
+                "WARNING: Could not delete file already uploaded to Android and Drive: "
+                f"{safe_path} ({e})"
+            )
+
+    log(f"Deleted already-uploaded local files: {len(deleted)}")
+    if failed:
+        log(f"Failed to delete already-uploaded local files: {len(failed)}")
+        print_numbered_files("Already-uploaded delete failures:", failed)
+
+
+def auto_drive_upload_then_delete(drive_candidates):
     if not drive_candidates:
         log("")
         log("No finished/ files are waiting for Drive upload/delete.")
@@ -904,16 +964,9 @@ def prompt_drive_upload_then_delete(drive_candidates):
     log("Future runs reuse the cached token.")
     log("")
     log(
-        "Upload these files to Google Drive, "
-        "then delete each local finished/ file only after its Drive upload succeeds?"
+        "Automatically uploading these Android-confirmed files to Google Drive, "
+        "then deleting each local finished/ file only after its Drive upload succeeds."
     )
-    log("Type yes to upload to Drive and delete confirmed Drive uploads, or anything else to keep them locally.")
-    answer = input("> ").strip()
-    log(f"Drive upload/delete prompt answer: {answer}")
-
-    if answer.lower() not in {"y", "yes"}:
-        log("Kept successfully Android-uploaded files in finished/.")
-        return
 
     files_to_upload = write_drive_upload_manifest(drive_candidates)
     if not files_to_upload:
@@ -930,7 +983,7 @@ def prompt_drive_upload_then_delete(drive_candidates):
         return
 
     log("")
-    log("DRIVE UPLOAD/DELETE PERMISSION GRANTED")
+    log("AUTOMATIC DRIVE UPLOAD/DELETE")
     log("-" * 50)
     log(f"This will upload {len(files_to_upload)} file(s) to Google Drive folder:")
     log(f"  {DRIVE_FOLDER_ID}")
@@ -955,6 +1008,8 @@ def prompt_drive_upload_then_delete(drive_candidates):
             DRIVE_FOLDER_ID,
             "--summary-json",
             DRIVE_UPLOAD_SUMMARY_FILE,
+            "--android-uploaded-history-json",
+            UPLOADED_HISTORY_FILE,
             "--delete-after-upload",
         ],
         check=False,
@@ -1090,7 +1145,10 @@ def main():
         log(f"STOPPED WITH EXIT CODE {exit_code}")
 
     try:
-        prompt_drive_upload_then_delete(drive_candidates)
+        auto_drive_upload_then_delete(drive_candidates)
+        delete_finished_files_already_uploaded_to_both(
+            finished_files_uploaded_to_android_and_drive()
+        )
     finally:
         close_run_log()
 

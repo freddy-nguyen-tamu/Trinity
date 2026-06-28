@@ -17,11 +17,17 @@ UPLOAD_CHUNK_SIZE = 1024 * 1024
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_UPLOAD_DIR = str(BASE_DIR / "finished")
+DEFAULT_TOKEN_FILE = str(BASE_DIR / "_trinity_android_token.json")
+TOKEN_HEADER = "X-Trinity-Token"
 
 # Keep the old Android-server guesses as a fallback, but prefer this laptop's
 # actual LAN subnets first so 10.0.73.x, 192.168.x.x, etc. are covered.
 LEGACY_PREFERRED_THIRDS = [24, 33]
 RECEIVER_APP_NAMES = {"Trinity", "YtbLanReceiver"}
+
+
+class UploadAuthError(RuntimeError):
+    pass
 
 
 def local_ipv4_addresses():
@@ -129,6 +135,66 @@ def re_starts_with_scheme(url):
     return url.lower().startswith(("http://", "https://"))
 
 
+def normalize_token(raw):
+    return "".join(ch.lower() for ch in str(raw or "") if ch.isalnum())
+
+
+def load_pairing_token(token_file):
+    path = Path(token_file)
+    if not path.exists():
+        return ""
+
+    try:
+        with path.open("r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return normalize_token(data.get("token", ""))
+        return normalize_token(data)
+    except Exception as e:
+        print(f"Could not read Trinity token file, will ask again: {path} ({e})")
+        return ""
+
+
+def save_pairing_token(token_file, token):
+    token = normalize_token(token)
+    if not token:
+        return ""
+
+    path = Path(token_file)
+    path.write_text(
+        json.dumps(
+            {
+                "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "token": token,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return token
+
+
+def prompt_for_pairing_token(token_file):
+    print("")
+    print("No Trinity Android pairing token is saved yet.")
+    print("Open the Trinity app on Android and type the Laptop pairing token shown there.")
+    print(f"It will be saved for future runs at: {token_file}")
+    try:
+        token = input().strip()
+    except EOFError:
+        return ""
+    return save_pairing_token(token_file, token)
+
+
+def request_headers(token=""):
+    headers = {"User-Agent": "trinity-lan-uploader/1.0"}
+    token = normalize_token(token)
+    if token:
+        headers[TOKEN_HEADER] = token
+    return headers
+
+
 def normalize_base_url(url):
     url = (url or "").strip()
     if not url:
@@ -153,7 +219,7 @@ def response_is_receiver(body):
     return app_name in RECEIVER_APP_NAMES
 
 
-def probe_url(ip_or_url):
+def probe_url(ip_or_url, token=""):
     if re_starts_with_scheme(ip_or_url):
         base_url = normalize_base_url(ip_or_url)
     else:
@@ -162,7 +228,7 @@ def probe_url(ip_or_url):
     for endpoint in ("ping", "health"):
         probe = urllib.parse.urljoin(base_url, endpoint)
         try:
-            req = urllib.request.Request(probe, headers={"User-Agent": "trinity-lan-uploader/1.0"})
+            req = urllib.request.Request(probe, headers=request_headers(token))
             with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
                 body = response.read(1024).decode("utf-8", errors="replace")
                 if response.status == 200 and response_is_receiver(body):
@@ -172,7 +238,7 @@ def probe_url(ip_or_url):
     return None
 
 
-def find_first_server():
+def find_first_server(token=""):
     ip_iterator = iter(generate_ips())
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -183,7 +249,7 @@ def find_first_server():
                 ip = next(ip_iterator)
             except StopIteration:
                 break
-            pending.add(executor.submit(probe_url, ip))
+            pending.add(executor.submit(probe_url, ip, token))
 
         while pending:
             done, pending = wait(pending, return_when=FIRST_COMPLETED)
@@ -197,7 +263,7 @@ def find_first_server():
 
                 try:
                     ip = next(ip_iterator)
-                    pending.add(executor.submit(probe_url, ip))
+                    pending.add(executor.submit(probe_url, ip, token))
                 except StopIteration:
                     pass
 
@@ -285,7 +351,7 @@ def write_summary(summary_path, summary):
     )
 
 
-def upload_one_file(base_url, file_path):
+def upload_one_file(base_url, file_path, token=""):
     file_path = Path(file_path).resolve()
     parsed = urllib.parse.urlparse(base_url)
     if parsed.scheme != "http":
@@ -301,6 +367,9 @@ def upload_one_file(base_url, file_path):
         conn.putrequest("POST", remote_path, skip_accept_encoding=True)
         conn.putheader("Host", f"{host}:{port}")
         conn.putheader("User-Agent", "trinity-lan-uploader/1.0")
+        token = normalize_token(token)
+        if token:
+            conn.putheader(TOKEN_HEADER, token)
         conn.putheader("Content-Type", "audio/mpeg")
         conn.putheader("Content-Length", str(size))
         conn.endheaders()
@@ -314,6 +383,8 @@ def upload_one_file(base_url, file_path):
 
         response = conn.getresponse()
         body = response.read().decode("utf-8", errors="replace")
+        if response.status == 401:
+            raise UploadAuthError(f"Android receiver rejected the pairing token: {body}")
         if response.status < 200 or response.status >= 300:
             raise RuntimeError(f"Android receiver returned HTTP {response.status}: {body}")
 
@@ -325,7 +396,7 @@ def upload_one_file(base_url, file_path):
         conn.close()
 
 
-def upload_files(base_url, files):
+def upload_files(base_url, files, token=""):
     successful = []
     failed = []
 
@@ -333,7 +404,7 @@ def upload_files(base_url, files):
         item = file_items([file_path])[0]
         print(f"[{index}/{len(files)}] Uploading: {item['name']} ({item['size']} bytes)")
         try:
-            response = upload_one_file(base_url, file_path)
+            response = upload_one_file(base_url, file_path, token=token)
             item["receiver_response"] = response
             successful.append(item)
             print(f"    OK: {item['name']}")
@@ -365,6 +436,16 @@ def main():
         help="Write upload result summary to this JSON file.",
     )
     parser.add_argument(
+        "--token-file",
+        default=DEFAULT_TOKEN_FILE,
+        help="JSON file where the Trinity Android pairing token is stored.",
+    )
+    parser.add_argument(
+        "--pair-token",
+        default=None,
+        help="Save this Trinity Android pairing token before scanning/uploading.",
+    )
+    parser.add_argument(
         "--url",
         default=None,
         help="Skip scanning and upload to this receiver URL directly, for example http://10.0.73.48:1234/.",
@@ -386,6 +467,10 @@ def main():
     )
     args = parser.parse_args()
 
+    token = normalize_token(args.pair_token) if args.pair_token else load_pairing_token(args.token_file)
+    if args.pair_token:
+        token = save_pairing_token(args.token_file, token)
+
     summary = {
         "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
         "url": None,
@@ -397,9 +482,9 @@ def main():
 
     if args.scan_only:
         try:
-            url = normalize_base_url(args.url) if args.url else find_first_server()
+            url = normalize_base_url(args.url) if args.url else find_first_server(token=token)
             if args.url:
-                url = probe_url(url) or url
+                url = probe_url(url, token=token) or url
         except Exception as e:
             summary["error"] = str(e)
             write_summary(args.summary_json, summary)
@@ -409,7 +494,7 @@ def main():
         if not url:
             summary["error"] = "No server found."
             write_summary(args.summary_json, summary)
-            print("No server found. Open the Trinity app on the same Wi-Fi and tap Start LAN Server.")
+            print("No server found. Open Trinity once on Android, keep the receiver enabled, and make sure both devices are on the same Wi-Fi.")
             sys.exit(1)
 
         summary["url"] = url
@@ -432,10 +517,20 @@ def main():
     summary["attempted"] = attempted
     source_label = args.manifest or args.dir
 
+    if not token:
+        token = prompt_for_pairing_token(args.token_file)
+
+    if not token:
+        summary["failed"] = attempted
+        summary["error"] = "No Trinity Android pairing token was provided."
+        write_summary(args.summary_json, summary)
+        print(summary["error"])
+        sys.exit(1)
+
     try:
-        url = normalize_base_url(args.url) if args.url else find_first_server()
+        url = normalize_base_url(args.url) if args.url else find_first_server(token=token)
         if args.url:
-            url = probe_url(url) or url
+            url = probe_url(url, token=token) or url
     except Exception as e:
         summary["failed"] = attempted
         summary["error"] = str(e)
@@ -447,14 +542,26 @@ def main():
         summary["failed"] = attempted
         summary["error"] = "No server found."
         write_summary(args.summary_json, summary)
-        print("No server found. Open the Trinity app on the same Wi-Fi and tap Start LAN Server.")
+        print("No server found. Open Trinity once on Android, keep the receiver enabled, and make sure both devices are on the same Wi-Fi.")
         sys.exit(1)
 
     summary["url"] = url
     print(f"Found Android receiver: {url}")
     print(f"Uploading {len(files)} MP3 file(s) from: {source_label}")
 
-    successful, failed = upload_files(url, files)
+    successful, failed = upload_files(url, files, token=token)
+    auth_failed = [item for item in failed if "pairing token" in item.get("error", "").lower()]
+    if auth_failed and len(auth_failed) == len(failed):
+        print("")
+        print("The saved Trinity Android pairing token did not work.")
+        print("Type the current token shown in the Trinity Android app to retry these files once.")
+        token = prompt_for_pairing_token(args.token_file)
+        if token:
+            retry_files = [item["path"] for item in failed]
+            retry_successful, retry_failed = upload_files(url, retry_files, token=token)
+            successful.extend(retry_successful)
+            failed = retry_failed
+
     summary["successful"] = successful
     summary["failed"] = failed
 

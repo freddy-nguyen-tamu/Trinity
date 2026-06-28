@@ -9,6 +9,9 @@ from pathlib import Path
 
 DRIVE_FOLDER_ID = "1qbVH_yaNn1aagSrMGvZIggCjSvRzZRSs"
 SERVICE_ACCOUNT_EMAIL = "trinitydrive@wavestack2.iam.gserviceaccount.com"
+SCRIPT_DIR = Path(__file__).resolve().parent
+FINISHED_DIR = SCRIPT_DIR / "finished"
+DEFAULT_ANDROID_UPLOADED_HISTORY_JSON = SCRIPT_DIR / "_android_uploaded_history.json"
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
@@ -107,6 +110,42 @@ def file_item(path):
         "name": path.name,
         "size": path.stat().st_size if path.exists() else 0,
     }
+
+
+def load_history_file(path, purpose):
+    history_path = Path(path).expanduser().resolve()
+
+    if not history_path.exists():
+        print(f"{purpose} history does not exist: {history_path}")
+        return set()
+
+    try:
+        with history_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"Could not read {purpose} history: {e}")
+        return set()
+
+    if isinstance(data, list):
+        return {str(item) for item in data}
+
+    print(f"Ignoring {purpose} history because it is not a JSON list: {history_path}")
+    return set()
+
+
+def relative_finished_name(path):
+    path = Path(path).resolve()
+
+    try:
+        return os.path.relpath(str(path), str(FINISHED_DIR.resolve()))
+    except ValueError:
+        return path.name
+
+
+def uploaded_history_key(path):
+    path = Path(path).resolve()
+    size = path.stat().st_size if path.exists() else 0
+    return f"{relative_finished_name(path)}|{size}"
 
 
 def write_summary(summary_path, summary):
@@ -327,7 +366,15 @@ def main():
     parser.add_argument(
         "--delete-after-upload",
         action="store_true",
-        help="Delete each local file only after that file uploads successfully.",
+        help=(
+            "Delete each local file only after that file uploads successfully "
+            "and is recorded in the Android uploaded history."
+        ),
+    )
+    parser.add_argument(
+        "--android-uploaded-history-json",
+        default=str(DEFAULT_ANDROID_UPLOADED_HISTORY_JSON),
+        help="JSON history proving which finished/ files were already uploaded to Android.",
     )
 
     args = parser.parse_args()
@@ -348,6 +395,12 @@ def main():
     try:
         files = load_manifest_files(args.manifest)
         summary["attempted"] = [file_item(path) for path in files]
+        android_uploaded_history = set()
+        if args.delete_after_upload:
+            android_uploaded_history = load_history_file(
+                args.android_uploaded_history_json,
+                "Android uploaded",
+            )
 
         print(f"Using Drive folder: {args.folder_id}")
         print(f"Uploading {len(files)} file(s) to Google Drive...")
@@ -392,6 +445,19 @@ def main():
                 print(f"Uploaded: {file_path.name}")
 
                 if args.delete_after_upload:
+                    history_key = uploaded_history_key(file_path)
+                    if history_key not in android_uploaded_history:
+                        delete_failed_item = dict(success_item)
+                        delete_failed_item["delete_error"] = (
+                            "Not deleted because this file is not recorded as uploaded to Android."
+                        )
+                        summary["delete_failed"].append(delete_failed_item)
+                        print(
+                            "Kept local file after Drive upload because it is not recorded "
+                            f"as uploaded to Android: {file_path}"
+                        )
+                        continue
+
                     try:
                         retry_file_operation(
                             f"deleting uploaded local file {file_path}",
