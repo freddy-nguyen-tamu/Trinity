@@ -7,9 +7,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
 HISTORY_FILE = "download_history.json"
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLBkuXLqNhqX5FsS2CEaSDlGTKAHIBPtLe"
-ALREADY_DOWNLOADED_STREAK_LIMIT = 10
+ALREADY_DOWNLOADED_STREAK_LIMIT = 30
 
-USE_COOKIES = False
 BROWSER = ("firefox",)
 
 CLIENT_GROUPS = [
@@ -89,18 +88,18 @@ def is_private_or_unavailable(entry):
     if title in {"[private video]", "private video", "[deleted video]", "deleted video"}:
         return True
 
-    if availability in {"private", "needs_auth", "subscriber_only", "premium_only"}:
+    if availability in {"private", "subscriber_only", "premium_only"}:
         return True
 
     return False
 
 
-def get_playlist_entries(playlist_url):
+def get_playlist_entries(playlist_url, use_cookies=False):
     ydl_opts = {
         "extract_flat": True,
         "skip_download": True,
         "lazy_playlist": True,
-        **make_common_opts(use_cookies=USE_COOKIES, player_clients=["android_vr"]),
+        **make_common_opts(use_cookies=use_cookies, player_clients=["android_vr"]),
     }
 
     with YoutubeDL(ydl_opts) as ydl:
@@ -176,7 +175,13 @@ def download_playlist(playlist_url):
     print(f"Loaded {len(history)} previously downloaded entries from {HISTORY_FILE}.")
 
     print("Fetching playlist information...")
-    entries = get_playlist_entries(playlist_url)
+    try:
+        entries = get_playlist_entries(playlist_url, use_cookies=False)
+    except Exception as e:
+        print(f"Playlist fetch failed without cookies: {e}")
+        print("Retrying playlist fetch with Firefox browser cookies...")
+        entries = get_playlist_entries(playlist_url, use_cookies=True)
+
     print(f"Playlist has {len(entries)} downloadable videos.")
 
     already_downloaded_streak = 0
@@ -227,7 +232,8 @@ def download_playlist(playlist_url):
             if success:
                 break
 
-        if not success and USE_COOKIES:
+        if not success:
+            print("Retrying failed download with Firefox browser cookies...")
             for clients in CLIENT_GROUPS:
                 for fmt in FORMAT_CANDIDATES:
                     success = try_download(

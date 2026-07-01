@@ -10,7 +10,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
 HISTORY_FILE = "download_history.json"
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLBkuXLqNhqX5FsS2CEaSDlGTKAHIBPtLe"
-ALREADY_DOWNLOADED_STREAK_LIMIT = 10
+ALREADY_DOWNLOADED_STREAK_LIMIT = 30
 
 # Use Firefox instead of Chrome to avoid DPAPI issues on Windows
 BROWSER = ("firefox",)

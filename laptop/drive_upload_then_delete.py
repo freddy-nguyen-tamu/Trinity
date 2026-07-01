@@ -3,6 +3,8 @@ import datetime
 import json
 import mimetypes
 import os
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -64,6 +66,113 @@ def retry_file_operation(description, operation, attempts=8, initial_delay=0.75)
             delay = min(delay * 1.5, 5.0)
 
     raise last_error
+
+
+def send_file_to_recycle_bin(path):
+    path = Path(path).resolve()
+    if not path.exists():
+        return
+
+    send2trash_error = None
+    try:
+        from send2trash import send2trash
+    except ImportError:
+        send2trash = None
+
+    if send2trash is not None:
+        try:
+            send2trash(str(path))
+            return
+        except Exception as e:
+            send2trash_error = e
+
+    if os.name != "nt":
+        trash_errors = []
+
+        if sys.platform == "darwin" and shutil.which("osascript"):
+            escaped_path = str(path).replace("\\", "\\\\").replace('"', '\\"')
+            script = f'tell application "Finder" to delete POSIX file "{escaped_path}"'
+            try:
+                subprocess.run(
+                    ["osascript", "-e", script],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                return
+            except Exception as e:
+                trash_errors.append(f"osascript: {e}")
+
+        for command in (
+            ["gio", "trash", str(path)],
+            ["kioclient6", "move", str(path), "trash:/"],
+            ["kioclient5", "move", str(path), "trash:/"],
+            ["trash-put", str(path)],
+        ):
+            if not shutil.which(command[0]):
+                continue
+            try:
+                subprocess.run(
+                    command,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                return
+            except Exception as e:
+                trash_errors.append(f"{command[0]}: {e}")
+
+        details = "; ".join(trash_errors) if trash_errors else "no trash command found"
+        if send2trash_error:
+            raise RuntimeError(f"Could not move file to system trash: {path}; {details}") from send2trash_error
+        raise RuntimeError(f"No system trash backend is available for {path}; {details}")
+
+    import ctypes
+    from ctypes import wintypes
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("wFunc", wintypes.UINT),
+            ("pFrom", wintypes.LPCWSTR),
+            ("pTo", wintypes.LPCWSTR),
+            ("fFlags", wintypes.WORD),
+            ("fAnyOperationsAborted", wintypes.BOOL),
+            ("hNameMappings", wintypes.LPVOID),
+            ("lpszProgressTitle", wintypes.LPCWSTR),
+        ]
+
+    FO_DELETE = 0x0003
+    FOF_ALLOWUNDO = 0x0040
+    FOF_NOCONFIRMATION = 0x0010
+    FOF_NOERRORUI = 0x0400
+    FOF_SILENT = 0x0004
+
+    file_list = str(path) + "\0\0"
+    operation = SHFILEOPSTRUCTW()
+    operation.hwnd = None
+    operation.wFunc = FO_DELETE
+    operation.pFrom = file_list
+    operation.pTo = None
+    operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
+    operation.fAnyOperationsAborted = False
+    operation.hNameMappings = None
+    operation.lpszProgressTitle = None
+
+    result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(operation))
+    if result != 0:
+        raise OSError(result, f"Could not move file to Recycle Bin: {path}")
+    if operation.fAnyOperationsAborted:
+        raise OSError(f"Recycle Bin operation was aborted: {path}")
+
+
+def recycle_file_if_exists(path, description):
+    if not Path(path).exists():
+        return
+
+    retry_file_operation(description, lambda: send_file_to_recycle_bin(path))
 
 
 def load_manifest_files(manifest_path):
@@ -331,7 +440,7 @@ def is_service_account_quota_error(error):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Upload files to a shared Google Drive folder, then delete local files after successful upload."
+        description="Upload files to a shared Google Drive folder, then move local files to system trash after successful upload."
     )
     parser.add_argument(
         "--manifest",
@@ -367,7 +476,7 @@ def main():
         "--delete-after-upload",
         action="store_true",
         help=(
-            "Delete each local file only after that file uploads successfully "
+            "Move each local file to system trash only after that file uploads successfully "
             "and is recorded in the Android uploaded history."
         ),
     )
@@ -449,7 +558,7 @@ def main():
                     if history_key not in android_uploaded_history:
                         delete_failed_item = dict(success_item)
                         delete_failed_item["delete_error"] = (
-                            "Not deleted because this file is not recorded as uploaded to Android."
+                            "Not moved to trash because this file is not recorded as uploaded to Android."
                         )
                         summary["delete_failed"].append(delete_failed_item)
                         print(
@@ -460,17 +569,20 @@ def main():
 
                     try:
                         retry_file_operation(
-                            f"deleting uploaded local file {file_path}",
-                            lambda p=file_path: os.remove(p),
+                            f"moving uploaded local file to system trash {file_path}",
+                            lambda p=file_path: send_file_to_recycle_bin(p),
                         )
                         deleted_item = dict(success_item)
                         summary["deleted"].append(deleted_item)
-                        print(f"Deleted local file after Drive upload: {file_path}")
+                        print(f"Moved local file to system trash after Drive upload: {file_path}")
                     except Exception as delete_error:
                         delete_failed_item = dict(success_item)
                         delete_failed_item["delete_error"] = str(delete_error)
                         summary["delete_failed"].append(delete_failed_item)
-                        print(f"WARNING: Uploaded but could not delete {file_path}: {delete_error}")
+                        print(
+                            "WARNING: Uploaded but could not move local file to system trash "
+                            f"{file_path}: {delete_error}"
+                        )
 
             except Exception as upload_error:
                 failed_item = file_item(file_path)
@@ -504,9 +616,9 @@ def main():
     print("-" * 50)
     print(f"Attempted: {len(summary['attempted'])}")
     print(f"Uploaded: {len(summary['successful'])}")
-    print(f"Deleted locally: {len(summary['deleted'])}")
+    print(f"Moved to system trash locally: {len(summary['deleted'])}")
     print(f"Upload failed: {failed_count}")
-    print(f"Delete failed: {delete_failed_count}")
+    print(f"Trash move failed: {delete_failed_count}")
 
     if failed_count or delete_failed_count:
         sys.exit(1)

@@ -136,6 +136,112 @@ def remove_file_if_exists(path, description):
     retry_file_operation(description, lambda: os.remove(path))
 
 
+def send_file_to_recycle_bin(path):
+    if not os.path.exists(path):
+        return
+
+    send2trash_error = None
+    try:
+        from send2trash import send2trash
+    except ImportError:
+        send2trash = None
+
+    if send2trash is not None:
+        try:
+            send2trash(os.path.abspath(path))
+            return
+        except Exception as e:
+            send2trash_error = e
+
+    if os.name != "nt":
+        trash_errors = []
+
+        if sys.platform == "darwin" and shutil.which("osascript"):
+            escaped_path = os.path.abspath(path).replace("\\", "\\\\").replace('"', '\\"')
+            script = f'tell application "Finder" to delete POSIX file "{escaped_path}"'
+            try:
+                subprocess.run(
+                    ["osascript", "-e", script],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                return
+            except Exception as e:
+                trash_errors.append(f"osascript: {e}")
+
+        for command in (
+            ["gio", "trash", os.path.abspath(path)],
+            ["kioclient6", "move", os.path.abspath(path), "trash:/"],
+            ["kioclient5", "move", os.path.abspath(path), "trash:/"],
+            ["trash-put", os.path.abspath(path)],
+        ):
+            if not shutil.which(command[0]):
+                continue
+            try:
+                subprocess.run(
+                    command,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                return
+            except Exception as e:
+                trash_errors.append(f"{command[0]}: {e}")
+
+        details = "; ".join(trash_errors) if trash_errors else "no trash command found"
+        if send2trash_error:
+            raise RuntimeError(f"Could not move file to system trash: {path}; {details}") from send2trash_error
+        raise RuntimeError(f"No system trash backend is available for {path}; {details}")
+
+    import ctypes
+    from ctypes import wintypes
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("wFunc", wintypes.UINT),
+            ("pFrom", wintypes.LPCWSTR),
+            ("pTo", wintypes.LPCWSTR),
+            ("fFlags", wintypes.WORD),
+            ("fAnyOperationsAborted", wintypes.BOOL),
+            ("hNameMappings", wintypes.LPVOID),
+            ("lpszProgressTitle", wintypes.LPCWSTR),
+        ]
+
+    FO_DELETE = 0x0003
+    FOF_ALLOWUNDO = 0x0040
+    FOF_NOCONFIRMATION = 0x0010
+    FOF_NOERRORUI = 0x0400
+    FOF_SILENT = 0x0004
+
+    file_list = os.path.abspath(path) + "\0\0"
+    operation = SHFILEOPSTRUCTW()
+    operation.hwnd = None
+    operation.wFunc = FO_DELETE
+    operation.pFrom = file_list
+    operation.pTo = None
+    operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
+    operation.fAnyOperationsAborted = False
+    operation.hNameMappings = None
+    operation.lpszProgressTitle = None
+
+    result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(operation))
+    if result != 0:
+        raise OSError(result, f"Could not move file to Recycle Bin: {path}")
+    if operation.fAnyOperationsAborted:
+        raise OSError(f"Recycle Bin operation was aborted: {path}")
+
+
+def recycle_file_if_exists(path, description):
+    if not os.path.exists(path):
+        return
+
+    retry_file_operation(description, lambda: send_file_to_recycle_bin(path))
+
+
 def prepare_output_dirs():
     os.makedirs(WORKING_DOWNLOADS_DIR, exist_ok=True)
     os.makedirs(FINISHED_DIR, exist_ok=True)
@@ -893,10 +999,10 @@ def print_drive_upload_summary(summary):
     print_numbered_files("Drive upload successes:", successful)
     log(f"Failed Drive upload: {len(failed)} file(s)")
     print_numbered_files("Drive upload failures:", failed)
-    log(f"Deleted from finished/ after Drive upload: {len(deleted)} file(s)")
-    print_numbered_files("Deleted local files:", deleted)
-    log(f"Uploaded to Drive but failed local delete: {len(delete_failed)} file(s)")
-    print_numbered_files("Local delete failures:", delete_failed)
+    log(f"Moved to system trash from finished/ after Drive upload: {len(deleted)} file(s)")
+    print_numbered_files("Moved local files:", deleted)
+    log(f"Uploaded to Drive but failed local trash move: {len(delete_failed)} file(s)")
+    print_numbered_files("Local trash move failures:", delete_failed)
 
     if summary.get("error"):
         log(f"Drive upload/delete error: {summary['error']}")
@@ -909,7 +1015,7 @@ def delete_finished_files_already_uploaded_to_both(paths):
         return
 
     log("")
-    log("Deleting finished/ files already recorded as uploaded to both Android and Drive:")
+    log("Moving finished/ files already recorded as uploaded to both Android and Drive to system trash:")
     print_numbered_files("Already uploaded to both:", paths)
 
     deleted = []
@@ -921,12 +1027,12 @@ def delete_finished_files_already_uploaded_to_both(paths):
             continue
 
         try:
-            remove_file_if_exists(
+            recycle_file_if_exists(
                 safe_path,
-                f"deleting already uploaded finished file {safe_path}",
+                f"moving already uploaded finished file to system trash {safe_path}",
             )
             deleted.append(safe_path)
-            log(f"Deleted local file already uploaded to Android and Drive: {safe_path}")
+            log(f"Moved local file already uploaded to Android and Drive to system trash: {safe_path}")
         except Exception as e:
             failed.append(
                 {
@@ -936,14 +1042,14 @@ def delete_finished_files_already_uploaded_to_both(paths):
                 }
             )
             log(
-                "WARNING: Could not delete file already uploaded to Android and Drive: "
+                "WARNING: Could not move file already uploaded to Android and Drive to system trash: "
                 f"{safe_path} ({e})"
             )
 
-    log(f"Deleted already-uploaded local files: {len(deleted)}")
+    log(f"Moved already-uploaded local files to system trash: {len(deleted)}")
     if failed:
-        log(f"Failed to delete already-uploaded local files: {len(failed)}")
-        print_numbered_files("Already-uploaded delete failures:", failed)
+        log(f"Failed to move already-uploaded local files to system trash: {len(failed)}")
+        print_numbered_files("Already-uploaded trash move failures:", failed)
 
 
 def auto_drive_upload_then_delete(drive_candidates):
@@ -965,7 +1071,7 @@ def auto_drive_upload_then_delete(drive_candidates):
     log("")
     log(
         "Automatically uploading these Android-confirmed files to Google Drive, "
-        "then deleting each local finished/ file only after its Drive upload succeeds."
+        "then moving each local finished/ file to system trash only after its Drive upload succeeds."
     )
 
     files_to_upload = write_drive_upload_manifest(drive_candidates)
@@ -988,10 +1094,10 @@ def auto_drive_upload_then_delete(drive_candidates):
     log(f"This will upload {len(files_to_upload)} file(s) to Google Drive folder:")
     log(f"  {DRIVE_FOLDER_ID}")
     log("")
-    log("After each file uploads successfully to Drive, that same local file will be deleted from:")
+    log("After each file uploads successfully to Drive, that same local file will be moved to system trash from:")
     log(f"  {FINISHED_DIR}")
     log("")
-    log("Files that fail Drive upload will NOT be deleted.")
+    log("Files that fail Drive upload will NOT be moved to system trash.")
 
     remove_file_if_exists(DRIVE_UPLOAD_SUMMARY_FILE, "removing old Drive upload/delete summary")
 

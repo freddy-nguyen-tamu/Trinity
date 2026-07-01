@@ -6,7 +6,7 @@ from yt_dlp import YoutubeDL
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
 HISTORY_FILE = "download_history.json"
-ALREADY_DOWNLOADED_STREAK_LIMIT = 10
+ALREADY_DOWNLOADED_STREAK_LIMIT = 30
 
 # Use Firefox instead of Chrome to avoid DPAPI issues on Windows
 BROWSER = ("firefox",)
