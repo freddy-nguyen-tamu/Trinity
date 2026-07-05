@@ -1,179 +1,167 @@
-#!/usr/bin/env python3
 import argparse
-import math
-import os
+import copy
 import shutil
 import subprocess
-import sys
+from pathlib import Path
 
-"""
-python speed_mp3.py input.mp3 output_1_25x.mp3 1.25
-python speed_mp3.py input.mp3 output_2x.mp3 2.0
-python speed_mp3.py input.mp3 output_0_8x.mp3 0.8
-python speed_mp3.py input.mp3 output_3x.mp3 3.0 --method atempo
-python speed_mp3.py input.mp3 output_1_35x.mp3 1.35 --method rubberband
-"""
+from mutagen.id3 import ID3, ID3NoHeaderError, TLEN
+from mutagen.mp3 import MP3
 
-def split_speed_for_atempo(speed: float) -> list[float]:
+
+def build_atempo_chain(speed: float) -> str:
     """
-    Split a speed factor into multiple atempo stages so every stage stays
-    in FFmpeg's safer [0.5, 2.0] range.
+    FFmpeg atempo changes speed while preserving pitch.
+    For compatibility, split values so each atempo filter stays between 0.5 and 2.0.
     """
     if speed <= 0:
-        raise ValueError("speed must be greater than 0")
+        raise ValueError("Speed must be greater than 0.")
 
-    if 0.5 <= speed <= 2.0:
-        return [speed]
+    filters = []
 
-    if speed > 2.0:
-        stages = math.ceil(math.log2(speed))
-    else:
-        stages = math.ceil(math.log2(1.0 / speed))
+    while speed > 2.0:
+        filters.append("atempo=2.0")
+        speed /= 2.0
 
-    base = speed ** (1.0 / stages)
-    factors = [base] * (stages - 1)
+    while speed < 0.5:
+        filters.append("atempo=0.5")
+        speed /= 0.5
 
-    # Correct floating-point drift in the final stage so the exact product
-    # equals the requested speed.
-    remaining = speed / math.prod(factors) if factors else speed
-    factors.append(remaining)
-
-    if not all(0.5 <= f <= 2.0 for f in factors):
-        raise RuntimeError(
-            f"Could not split speed={speed} into valid atempo stages: {factors}"
-        )
-
-    return factors
+    filters.append(f"atempo={speed:.8f}")
+    return ",".join(filters)
 
 
-def ffmpeg_has_filter(ffmpeg_path: str, filter_name: str) -> bool:
+def format_speed_for_filename(speed: float) -> str:
+    text = str(speed).rstrip("0").rstrip(".")
+    return text.replace(".", "_")
+
+
+def copy_id3_tags(source_mp3: Path, output_mp3: Path) -> None:
+    """
+    Copy original ID3 tags exactly-ish from source to output.
+
+    This preserves common MP3 attributes like:
+    - title
+    - artist
+    - album
+    - year/date
+    - genre
+    - track number
+    - album art / cover image
+    - embedded lyrics
+    - custom ID3 frames
+    """
     try:
-        result = subprocess.run(
-            [ffmpeg_path, "-hide_banner", "-filters"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return False
+        original_tags = ID3(source_mp3)
+    except ID3NoHeaderError:
+        print("No ID3 metadata found in original file.")
+        return
 
-    output = (result.stdout + "\n" + result.stderr).lower()
-    return filter_name.lower() in output
+    copied_tags = copy.deepcopy(original_tags)
+
+    # If the original had a TLEN duration tag, update it to the new duration.
+    if "TLEN" in copied_tags:
+        try:
+            new_audio = MP3(output_mp3)
+            new_length_ms = int(new_audio.info.length * 1000)
+            copied_tags.delall("TLEN")
+            copied_tags.add(TLEN(encoding=3, text=str(new_length_ms)))
+        except Exception as exc:
+            print(f"Warning: could not update TLEN duration tag: {exc}")
+
+    # Remove whatever FFmpeg wrote, then write the copied original tags.
+    try:
+        existing_tags = ID3(output_mp3)
+        existing_tags.delete(output_mp3)
+    except ID3NoHeaderError:
+        pass
+
+    # Preserve original ID3v2.3 vs ID3v2.4 when possible.
+    # Clamp to supported versions (3 or 4) because v2.2 is not writable.
+    version_number = original_tags.version[1] if len(original_tags.version) > 1 else 4
+    if version_number not in (3, 4):
+        version_number = 4
+
+    copied_tags.save(output_mp3, v2_version=version_number)
+
+    print("Copied original MP3 metadata:")
+    print("- title / artist / album tags")
+    print("- cover art")
+    print("- lyrics")
+    print("- custom ID3 frames")
 
 
-def build_filter_expression(speed: float, method: str, ffmpeg_path: str) -> str:
-    chosen_method = method
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Speed up or slow down an MP3 while preserving pitch and metadata."
+    )
+    parser.add_argument("input", help="Input MP3 file")
+    parser.add_argument("speed", type=float, help="Speed factor, e.g. 2 for twice as fast")
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="Output filename (optional). The file will always be placed in the same directory as the input MP3.",
+    )
 
-    if method == "auto":
-        chosen_method = "rubberband" if ffmpeg_has_filter(ffmpeg_path, "rubberband") else "atempo"
+    args = parser.parse_args()
 
-    if chosen_method == "rubberband":
-        if not ffmpeg_has_filter(ffmpeg_path, "rubberband"):
-            raise RuntimeError(
-                "FFmpeg does not have the rubberband filter enabled. "
-                "Use --method atempo or install an FFmpeg build with librubberband."
-            )
-        # pitch=1 keeps pitch unchanged while tempo changes
-        return f"rubberband=tempo={speed:.12g}:pitch=1"
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg was not found. Install ffmpeg and make sure it is in PATH.")
 
-    factors = split_speed_for_atempo(speed)
-    return ",".join(f"atempo={factor:.12g}" for factor in factors)
+    input_path = Path(args.input)
 
-
-def speed_change_mp3(
-    input_path: str,
-    output_path: str,
-    speed: float,
-    bitrate: str = "192k",
-    method: str = "auto",
-    ffmpeg_path: str = "ffmpeg",
-) -> None:
-    if speed <= 0:
-        raise ValueError("speed must be greater than 0")
-
-    input_abs = os.path.abspath(os.path.expanduser(input_path))
-    output_abs = os.path.abspath(os.path.expanduser(output_path))
-
-    if input_abs == output_abs:
-        raise ValueError("input and output must be different files")
-
-    if not os.path.isfile(input_abs):
+    if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
-    if shutil.which(ffmpeg_path) is None:
-        raise FileNotFoundError(
-            f"Could not find FFmpeg executable: {ffmpeg_path}"
-        )
+    if input_path.suffix.lower() != ".mp3":
+        print("Warning: input file does not end with .mp3, but continuing anyway.")
 
-    filter_expr = build_filter_expression(speed, method, ffmpeg_path)
+    # Determine output path: always in the same directory as the input.
+    if args.output:
+        # Use only the filename part of the given output, discard any directory.
+        output_filename = Path(args.output).name
+        output_path = input_path.parent / output_filename
+    else:
+        speed_text = format_speed_for_filename(args.speed)
+        output_path = input_path.with_name(f"{input_path.stem}_{speed_text}x.mp3")
+
+    if input_path.resolve() == output_path.resolve():
+        raise ValueError("Output file cannot be the same as the input file.")
+
+    atempo_chain = build_atempo_chain(args.speed)
 
     cmd = [
-        ffmpeg_path,
+        "ffmpeg",
         "-y",
-        "-i", input_abs,
-        "-vn",                    # ignore album art / video streams
-        "-map_metadata", "0",     # keep metadata when possible
-        "-filter:a", filter_expr,
-        "-c:a", "libmp3lame",
-        "-b:a", bitrate,
-        output_abs,
+        "-hide_banner",
+        "-i",
+        str(input_path),
+        "-filter:a",
+        atempo_chain,
+        "-vn",
+        "-map_metadata",
+        "0",
+        "-map_chapters",
+        "0",
+        "-codec:a",
+        "libmp3lame",
+        "-q:a",
+        "2",
+        str(output_path),
     ]
 
-    print("Running:")
-    print(" ".join(f'"{part}"' if " " in part else part for part in cmd))
-    print(f"Audio filter: {filter_expr}")
+    print("Speed filter:")
+    print(atempo_chain)
+    print()
+    print("Running FFmpeg...")
+    subprocess.run(cmd, check=True)
 
-    result = subprocess.run(cmd, check=False)
+    print()
+    print("Restoring original metadata...")
+    copy_id3_tags(input_path, output_path)
 
-    if result.returncode != 0:
-        raise RuntimeError(f"FFmpeg failed with exit code {result.returncode}")
-
-    print(f"\nDone: {output_path}")
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Create a speed-changed MP3 while preserving pitch."
-    )
-    parser.add_argument("input", help="Input MP3 path")
-    parser.add_argument("output", help="Output MP3 path")
-    parser.add_argument("speed", type=float, help="Playback speed, e.g. 1.25, 0.8, 2.0")
-    parser.add_argument(
-        "--bitrate",
-        default="192k",
-        help="Output MP3 bitrate (default: 192k)",
-    )
-    parser.add_argument(
-        "--method",
-        choices=["auto", "atempo", "rubberband"],
-        default="auto",
-        help="Processing method (default: auto)",
-    )
-    parser.add_argument(
-        "--ffmpeg",
-        default="ffmpeg",
-        help="FFmpeg executable path/name (default: ffmpeg)",
-    )
-    return parser.parse_args()
-
-
-def main() -> int:
-    args = parse_args()
-
-    try:
-        speed_change_mp3(
-            input_path=args.input,
-            output_path=args.output,
-            speed=args.speed,
-            bitrate=args.bitrate,
-            method=args.method,
-            ffmpeg_path=args.ffmpeg,
-        )
-        return 0
-    except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+    print()
+    print(f"Done: {output_path}")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

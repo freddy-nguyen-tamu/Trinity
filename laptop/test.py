@@ -72,6 +72,10 @@ GROQ_MODEL = "llama-3.1-8b-instant"
 
 LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
 LRCLIB_GET_URL = "https://lrclib.net/api/get"
+
+GENIUS_API_URL = "https://api.genius.com"
+GENIUS_API_TOKEN = os.getenv("GENIUS_API_TOKEN")
+
 YOUTUBE_WATCH_URL = "https://www.youtube.com/watch?v={video_id}"
 SUBTITLE_INFO_CACHE = {}
 
@@ -829,6 +833,79 @@ def get_lyrics_from_lrclib(title: str, artist: str, duration=None, album=""):
     return None
 
 
+def get_lyrics_from_genius(title: str, artist: str):
+    if not title or not GENIUS_API_TOKEN:
+        return None
+
+    query = f"{artist} {title}".strip() if artist and artist != "Unknown" else title
+    headers = {"Authorization": f"Bearer {GENIUS_API_TOKEN}"}
+
+    try:
+        resp = requests.get(
+            f"{GENIUS_API_URL}/search",
+            params={"q": query},
+            headers=headers,
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        hits = data.get("response", {}).get("hits", [])
+        if not hits:
+            return None
+
+        best_hit = None
+        title_lower = title.lower()
+        artist_lower = artist.lower() if artist else ""
+
+        for hit in hits:
+            result = hit.get("result", {})
+            if not result:
+                continue
+            r_title = result.get("title", "").lower()
+            r_artist = (
+                result.get("primary_artist", {}).get("name", "") or ""
+            ).lower()
+
+            if r_title == title_lower and (
+                not artist_lower or r_artist == artist_lower or artist_lower == "unknown"
+            ):
+                best_hit = result
+                break
+
+        if not best_hit:
+            best_hit = hits[0].get("result", {})
+
+        song_url = best_hit.get("url")
+        if not song_url:
+            return None
+
+        page_resp = requests.get(song_url, timeout=20)
+        if page_resp.status_code != 200:
+            return None
+
+        html_text = page_resp.text
+        lyrics_parts = re.findall(
+            r'<div[^>]*data-lyrics-container="true"[^>]*>(.*?)</div>',
+            html_text,
+            re.DOTALL,
+        )
+        if not lyrics_parts:
+            return None
+
+        lyrics_lines = []
+        for part in lyrics_parts:
+            part = re.sub(r'<br\s*/?>', "\n", part)
+            part = re.sub(r"<[^>]+>", "", part)
+            part = html.unescape(part)
+            lyrics_lines.append(part.strip())
+
+        return "\n\n".join(lyrics_lines).strip()
+    except Exception:
+        return None
+
+
 def extract_youtube_id_from_name(file_name):
     base = os.path.splitext(os.path.basename(file_name))[0]
     matches = re.findall(r"\[([A-Za-z0-9_-]{11})\]", base)
@@ -1441,54 +1518,57 @@ def lyric_similarity(left, right):
     return max(sequence_ratio, overlap_ratio)
 
 
-def choose_low_similarity_lyrics(library_lyrics, subtitle_lyrics, subtitle_candidate):
+def choose_low_similarity_lyrics(library_lyrics, subtitle_lyrics, subtitle_candidate, library_source="lrclib"):
     source = subtitle_candidate.get("name") if subtitle_candidate else "YouTube subtitles"
+    library_source_label = "Genius" if library_source == "genius" else "LRCLIB"
     library_lyrics = clean_lyrics_for_tag(library_lyrics)
     subtitle_lyrics = clean_lyrics_for_tag(subtitle_lyrics)
 
     if subtitle_candidate and subtitle_candidate_kind(subtitle_candidate) == "manual_human":
         print(
             f"  Using human subtitle lyrics from {source} because Groq approved the language "
-            "match and LRCLIB/subtitle similarity is below 80%."
+            f"match and {library_source_label}/subtitle similarity is below 80%."
         )
         return subtitle_lyrics, "youtube_subtitles_manual_language_match"
 
     if subtitle_candidate and subtitle_candidate.get("automatic") and subtitle_candidate.get("language_match_approved"):
         print(
             f"  Using automatic subtitle lyrics from {source} because Groq approved the language "
-            "match and LRCLIB/subtitle similarity is below 80%."
+            f"match and {library_source_label}/subtitle similarity is below 80%."
         )
         return subtitle_lyrics, "youtube_subtitles_automatic_language_match"
 
     print(
-        f"  Using subtitle lyrics from {source} because LRCLIB did not match enough "
+        f"  Using subtitle lyrics from {source} because {library_source_label} did not match enough "
         "and the chosen subtitle is not a manual human track."
     )
     return subtitle_lyrics, "youtube_subtitles"
 
 
-def choose_best_lyrics(library_lyrics, subtitle_lyrics, subtitle_candidate, title="", artist=""):
+def choose_best_lyrics(library_lyrics, subtitle_lyrics, subtitle_candidate, library_source="lrclib", title="", artist=""):
+    library_source_label = "Genius" if library_source == "genius" else "LRCLIB"
     if library_lyrics and subtitle_lyrics:
         similarity = lyric_similarity(library_lyrics, subtitle_lyrics)
-        print(f"  LRCLIB/subtitle lyric similarity: {similarity:.2%}")
+        print(f"  {library_source_label}/subtitle lyric similarity: {similarity:.2%}")
         if similarity >= 0.80:
-            print("  Using LRCLIB lyrics because they match subtitles by at least 80%.")
-            return library_lyrics, "lrclib", similarity
+            print(f"  Using {library_source_label} lyrics because they match subtitles by at least 80%.")
+            return library_lyrics, library_source, similarity
 
         lyrics, source = choose_low_similarity_lyrics(
             library_lyrics=library_lyrics,
             subtitle_lyrics=subtitle_lyrics,
             subtitle_candidate=subtitle_candidate,
+            library_source=library_source,
         )
         return lyrics, source, similarity
 
     if library_lyrics:
-        print("  Using LRCLIB lyrics; no usable YouTube subtitle lyrics were found.")
-        return library_lyrics, "lrclib", None
+        print(f"  Using {library_source_label} lyrics; no usable YouTube subtitle lyrics were found.")
+        return library_lyrics, library_source, None
 
     if subtitle_lyrics:
         source = subtitle_candidate.get("name") if subtitle_candidate else "YouTube subtitles"
-        print(f"  Using subtitle lyrics from {source}; LRCLIB returned no lyrics.")
+        print(f"  Using subtitle lyrics from {source}; {library_source_label} returned no lyrics.")
         return subtitle_lyrics, "youtube_subtitles", None
 
     return None, None, None
@@ -1927,12 +2007,18 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
     else:
         try:
             duration = read_duration_seconds(file_path)
-            library_lyrics = get_lyrics_from_lrclib(
-                title=title,
-                artist=artist,
-                duration=duration,
-                album=existing_album
-            )
+            library_lyrics = get_lyrics_from_genius(title=title, artist=artist)
+            library_source = "genius"
+
+            if not library_lyrics:
+                library_lyrics = get_lyrics_from_lrclib(
+                    title=title,
+                    artist=artist,
+                    duration=duration,
+                    album=existing_album
+                )
+                if library_lyrics:
+                    library_source = "lrclib"
 
             subtitle_lyrics = None
             subtitle_candidate = None
@@ -1949,6 +2035,7 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
                 library_lyrics=library_lyrics,
                 subtitle_lyrics=subtitle_lyrics,
                 subtitle_candidate=subtitle_candidate,
+                library_source=library_source,
                 title=title,
                 artist=artist,
             )

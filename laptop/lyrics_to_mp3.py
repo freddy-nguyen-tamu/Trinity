@@ -3,6 +3,7 @@ import json
 import re
 import time
 import unicodedata
+import html
 import requests
 
 from mutagen.easyid3 import EasyID3
@@ -20,6 +21,10 @@ XAI_MODEL = "grok-3-mini"
 # LRCLIB
 LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
 LRCLIB_GET_URL = "https://lrclib.net/api/get"
+
+# Genius
+GENIUS_API_URL = "https://api.genius.com"
+GENIUS_API_TOKEN = os.getenv("GENIUS_API_TOKEN")
 
 if not XAI_API_KEY:
     raise SystemExit("XAI_API_KEY is not set in the environment.")
@@ -347,6 +352,79 @@ def get_lyrics_from_lrclib(title: str, artist: str, duration=None, album=""):
     return None
 
 
+def get_lyrics_from_genius(title: str, artist: str):
+    if not title or not GENIUS_API_TOKEN:
+        return None
+
+    query = f"{artist} {title}".strip() if artist and artist != "Unknown" else title
+    headers = {"Authorization": f"Bearer {GENIUS_API_TOKEN}"}
+
+    try:
+        resp = requests.get(
+            f"{GENIUS_API_URL}/search",
+            params={"q": query},
+            headers=headers,
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        hits = data.get("response", {}).get("hits", [])
+        if not hits:
+            return None
+
+        best_hit = None
+        title_lower = title.lower()
+        artist_lower = artist.lower() if artist else ""
+
+        for hit in hits:
+            result = hit.get("result", {})
+            if not result:
+                continue
+            r_title = result.get("title", "").lower()
+            r_artist = (
+                result.get("primary_artist", {}).get("name", "") or ""
+            ).lower()
+
+            if r_title == title_lower and (
+                not artist_lower or r_artist == artist_lower or artist_lower == "unknown"
+            ):
+                best_hit = result
+                break
+
+        if not best_hit:
+            best_hit = hits[0].get("result", {})
+
+        song_url = best_hit.get("url")
+        if not song_url:
+            return None
+
+        page_resp = requests.get(song_url, timeout=20)
+        if page_resp.status_code != 200:
+            return None
+
+        html_text = page_resp.text
+        lyrics_parts = re.findall(
+            r'<div[^>]*data-lyrics-container="true"[^>]*>(.*?)</div>',
+            html_text,
+            re.DOTALL,
+        )
+        if not lyrics_parts:
+            return None
+
+        lyrics_lines = []
+        for part in lyrics_parts:
+            part = re.sub(r'<br\s*/?>', "\n", part)
+            part = re.sub(r"<[^>]+>", "", part)
+            part = html.unescape(part)
+            lyrics_lines.append(part.strip())
+
+        return "\n\n".join(lyrics_lines).strip()
+    except Exception:
+        return None
+
+
 def write_tags(file_path: str, title: str, artist: str, album: str = ""):
     title = norm_text(title)
     artist = norm_text(artist)
@@ -484,7 +562,9 @@ for idx, original_file_name in enumerate(file_names, start=1):
     else:
         try:
             duration = read_duration_seconds(file_path)
-            lyrics = get_lyrics_from_lrclib(title=title, artist=artist, duration=duration, album=existing_album)
+            lyrics = get_lyrics_from_genius(title=title, artist=artist)
+            if not lyrics:
+                lyrics = get_lyrics_from_lrclib(title=title, artist=artist, duration=duration, album=existing_album)
             if lyrics:
                 write_lyrics(file_path, lyrics)
                 lyrics_found = True
