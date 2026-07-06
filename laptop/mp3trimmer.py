@@ -24,7 +24,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets, QtMultimedia
 # Try to import mutagen for metadata copying
 try:
     from mutagen.mp3 import MP3
-    from mutagen.id3 import ID3, TIT2, TPE1, USLT
+    from mutagen.id3 import ID3, TIT2, TPE1, USLT, APIC
     HAS_MUTAGEN = True
 except ImportError:
     HAS_MUTAGEN = False
@@ -876,7 +876,8 @@ class MP3Trimmer(QtWidgets.QMainWindow):
                     title = orig_tags.get('TIT2')
                     artist = orig_tags.get('TPE1')
                     lyrics = orig_tags.get('USLT')
-                    if title or artist or lyrics:
+                    apic = orig_tags.get('APIC')
+                    if title or artist or lyrics or apic:
                         out_audio = MP3(path, ID3=ID3)
                         if title:
                             out_audio.tags.add(title)
@@ -884,6 +885,8 @@ class MP3Trimmer(QtWidgets.QMainWindow):
                             out_audio.tags.add(artist)
                         if lyrics:
                             out_audio.tags.add(lyrics)
+                        if apic:
+                            out_audio.tags.add(apic)
                         out_audio.save()
                 except Exception as meta_err:
                     print(f"Could not copy metadata: {meta_err}")
