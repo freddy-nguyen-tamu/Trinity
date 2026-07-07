@@ -868,7 +868,18 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         if not preview:
             return
         try:
-            run_ffmpeg(['-i', preview, '-codec:a', 'libmp3lame', '-qscale:a', '2', path, '-y'])
+            ffmpeg_args = ['-i', preview]
+            if self.original_file.lower().endswith('.mp3'):
+                ffmpeg_args.extend(['-i', self.original_file])
+                ffmpeg_args.extend([
+                    '-map', '0:a',
+                    '-map', '1:v?',
+                    '-c:v', 'copy',
+                    '-disposition:v', 'attached_pic',
+                    '-id3v2_version', '3',
+                ])
+            ffmpeg_args.extend(['-codec:a', 'libmp3lame', '-qscale:a', '2', path, '-y'])
+            run_ffmpeg(ffmpeg_args)
 
             if HAS_MUTAGEN and self.original_file.lower().endswith('.mp3'):
                 try:
@@ -876,8 +887,7 @@ class MP3Trimmer(QtWidgets.QMainWindow):
                     title = orig_tags.get('TIT2')
                     artist = orig_tags.get('TPE1')
                     lyrics = orig_tags.get('USLT')
-                    apic = orig_tags.get('APIC')
-                    if title or artist or lyrics or apic:
+                    if title or artist or lyrics:
                         out_audio = MP3(path, ID3=ID3)
                         if out_audio.tags is None:
                             out_audio.tags = ID3()
@@ -887,8 +897,6 @@ class MP3Trimmer(QtWidgets.QMainWindow):
                             out_audio.tags.add(artist)
                         if lyrics:
                             out_audio.tags.add(lyrics)
-                        if apic:
-                            out_audio.tags.add(apic)
                         out_audio.save()
                 except Exception as meta_err:
                     print(f"Could not copy metadata: {meta_err}")
