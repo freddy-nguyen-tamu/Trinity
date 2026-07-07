@@ -1187,6 +1187,7 @@ def main():
                     moved_after_test,
                     mark_downloaded_as_test_processed=False,
                 )
+                run_auto_thumbnail(upload_candidates)
                 upload_summary, upload_return_code = run_upload_step(upload_candidates)
                 if upload_return_code != 0:
                     if is_nonfatal_upload_failure(upload_summary):
@@ -1208,6 +1209,7 @@ def main():
                     moved_after_test,
                     mark_downloaded_as_test_processed=True,
                 )
+                run_auto_thumbnail(upload_candidates)
                 upload_summary, upload_return_code = run_upload_step(upload_candidates)
                 if upload_return_code != 0:
                     if is_nonfatal_upload_failure(upload_summary):
@@ -1260,6 +1262,63 @@ def main():
 
     if exit_code:
         sys.exit(exit_code)
+
+
+FALLBACK_PYTHON_EXE = r"C:\Users\qacer\miniconda3\python.exe"
+
+
+def run_auto_thumbnail(upload_candidates):
+    files_to_check = list(upload_candidates) if upload_candidates else []
+    if not files_to_check:
+        for name in sorted(os.listdir(FINISHED_DIR)):
+            path = os.path.join(FINISHED_DIR, name)
+            if os.path.isfile(path) and is_supported_audio_file(path):
+                files_to_check.append(path)
+
+    if not files_to_check:
+        return
+
+    log("")
+    log(f"Running auto_thumbnail.py on {len(files_to_check)} file(s) to embed missing album art...")
+    manifest = {
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "files": sorted(os.path.abspath(p) for p in files_to_check),
+    }
+    manifest_path = os.path.join(SCRIPTS_DIR, "_auto_thumbnail_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+    script_path = os.path.join(SCRIPTS_DIR, "auto_thumbnail.py")
+    child_env = os.environ.copy()
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    child_env["PYTHONUNBUFFERED"] = "1"
+    args = ["--manifest", manifest_path]
+
+    for python_path in (PYTHON_EXE, FALLBACK_PYTHON_EXE):
+        log(f"  Trying: {python_path}")
+        process = subprocess.Popen(
+            [python_path, "-u", script_path, *args],
+            cwd=SCRIPTS_DIR,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=child_env,
+        )
+        if process.stdout:
+            for line in process.stdout:
+                write_log_raw(line)
+        return_code = process.wait()
+        if return_code == 0:
+            log(f"FINISHED: auto_thumbnail.py (using {python_path})")
+            break
+        log(f"  Failed with exit code {return_code}, trying fallback Python...")
+    else:
+        log("ERROR: auto_thumbnail.py failed with both Python interpreters.")
+
+    remove_file_if_exists(manifest_path, "removing auto_thumbnail manifest")
+    log("Auto-thumbnail check complete.")
 
 
 if __name__ == "__main__":

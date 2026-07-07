@@ -879,6 +879,8 @@ class MP3Trimmer(QtWidgets.QMainWindow):
                     apic = orig_tags.get('APIC')
                     if title or artist or lyrics or apic:
                         out_audio = MP3(path, ID3=ID3)
+                        if out_audio.tags is None:
+                            out_audio.tags = ID3()
                         if title:
                             out_audio.tags.add(title)
                         if artist:
