@@ -9,16 +9,26 @@ DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
 HISTORY_FILE = "download_history.json"
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLBkuXLqNhqX5FsS2CEaSDlGTKAHIBPtLe"
 ALREADY_DOWNLOADED_STREAK_LIMIT = 30
+if os.environ.get("TRINITY_SKIP_PLAYLIST_ON_30", "1") == "0":
+    ALREADY_DOWNLOADED_STREAK_LIMIT = float("inf")
 
 BROWSER = ("firefox",)
+COOKIES_FILE = os.path.join(BASE_DIR, "youtube_cookies.txt")
+
+
+def make_cookie_opts():
+    if os.path.exists(COOKIES_FILE):
+        return {"cookiefile": COOKIES_FILE}
+    return {"cookiesfrombrowser": BROWSER}
 
 CLIENT_GROUPS = [
-    ["android_vr"],
-    ["android_vr", "web_safari"],
-    ["android_vr", "web_safari", "web"],
+    ["web"],
+    ["web_safari"],
+    ["web", "web_safari"],
 ]
 
 FORMAT_CANDIDATES = [
+    "bestaudio[ext=m4a]/bestaudio/best[acodec!=none]/18/best",
     "140",
     "251",
     "250",
@@ -50,9 +60,9 @@ def save_history(history):
         print(f"Could not write {HISTORY_FILE}: {e}")
 
 
-def make_common_opts(use_cookies=False, player_clients=None):
+def make_common_opts(use_cookies=False, player_clients=None, video_download=False):
     if player_clients is None:
-        player_clients = ["android_vr"]
+        player_clients = ["web"]
 
     opts = {
         "extractor_args": {
@@ -60,10 +70,10 @@ def make_common_opts(use_cookies=False, player_clients=None):
                 "player_client": player_clients,
             }
         },
-        "retries": 5,
-        "fragment_retries": 5,
-        "extractor_retries": 5,
-        "socket_timeout": 20,
+        "retries": 10,
+        "fragment_retries": 10,
+        "extractor_retries": 10,
+        "socket_timeout": 30,
         "concurrent_fragment_downloads": 1,
         "ignoreerrors": True,
         "quiet": False,
@@ -71,7 +81,14 @@ def make_common_opts(use_cookies=False, player_clients=None):
     }
 
     if use_cookies:
-        opts["cookiesfrombrowser"] = BROWSER
+        opts.update(make_cookie_opts())
+
+    # Playlist extraction uses "web" only, and must NOT skip the webpage player
+    # (skipping webpage blocks pagination and fetches only ~100 items).
+    # Video downloads use web/web_safari clients with cookies for auth.
+    if video_download:
+        opts["sleep_interval"] = 5
+        opts["max_sleep_interval"] = 10
 
     return opts
 
@@ -99,9 +116,19 @@ def get_playlist_entries(playlist_url, use_cookies=False):
     ydl_opts = {
         "extract_flat": True,
         "skip_download": True,
-        "lazy_playlist": True,
-        **make_common_opts(use_cookies=use_cookies, player_clients=["android_vr"]),
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web"],
+            }
+        },
+        "retries": 10,
+        "extractor_retries": 10,
+        "socket_timeout": 30,
     }
+    if use_cookies:
+        ydl_opts.update(make_cookie_opts())
+    if os.environ.get("TRINITY_LAZY_PLAYLIST", "0") == "1":
+        ydl_opts["lazy_playlist"] = True
 
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(playlist_url, download=False)
@@ -139,7 +166,7 @@ def try_download(
             "EmbedThumbnail": ["-id3v2_version", "3"],
         },
         "overwrites": False,
-        **make_common_opts(use_cookies=use_cookies, player_clients=player_clients),
+        **make_common_opts(use_cookies=use_cookies, player_clients=player_clients, video_download=True),
     }
 
     for attempt in range(1, max_attempts + 1):
@@ -160,6 +187,12 @@ def try_download(
             msg = str(e)
             if "Video unavailable" in msg or "video has been removed" in msg:
                 print(f"Video unavailable (permanent), skipping: {title_hint or video_id}")
+                return None
+            if "Sign in to confirm" in msg or "not a bot" in msg:
+                print(f"YouTube auth/bot gate hit for {video_id}; skipping (no usable cookies).")
+                return None
+            if "Please sign in" in msg or "Private video" in msg:
+                print(f"YouTube auth/private video for {video_id}; skipping (no usable cookies).")
                 return None
             print(f"Attempt failed: {e}")
         except KeyboardInterrupt:

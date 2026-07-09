@@ -7,9 +7,18 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
 HISTORY_FILE = "download_history.json"
 ALREADY_DOWNLOADED_STREAK_LIMIT = 30
+if os.environ.get("TRINITY_SKIP_PLAYLIST_ON_30", "1") == "0":
+    ALREADY_DOWNLOADED_STREAK_LIMIT = float("inf")
 
 # Use Firefox instead of Chrome to avoid DPAPI issues on Windows
 BROWSER = ("firefox",)
+COOKIES_FILE = os.path.join(BASE_DIR, "youtube_cookies.txt")
+
+
+def make_cookie_opts():
+    if os.path.exists(COOKIES_FILE):
+        return {"cookiefile": COOKIES_FILE}
+    return {"cookiesfrombrowser": BROWSER}
 
 
 def load_history():
@@ -34,7 +43,16 @@ def download_playlist(playlist_url):
     ydl_opts_extract = {
         "extract_flat": True,
         "skip_download": True,
-        "cookiesfrombrowser": BROWSER,   # use browser cookies
+        **make_cookie_opts(),
+        "retries": 10,
+        "extractor_retries": 10,
+        "socket_timeout": 30,
+        "lazy_playlist": os.environ.get("TRINITY_LAZY_PLAYLIST", "0") == "1",
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web"],
+            },
+        },
     }
 
     with YoutubeDL(ydl_opts_extract) as ydl:
@@ -65,7 +83,7 @@ def download_playlist(playlist_url):
         print(f"⬇ Downloading: {video_title}")
 
         ydl_opts_dl = {
-            "format": "bestaudio/best",
+            "format": "bestaudio[ext=m4a]/bestaudio/best[acodec!=none]/18/best",
             "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
             "writethumbnail": True,
             "postprocessors": [
@@ -79,7 +97,7 @@ def download_playlist(playlist_url):
                 }
             ],
             "quiet": False,
-            "cookiesfrombrowser": BROWSER,  # use browser cookies during download
+            **make_cookie_opts(),
         }
 
         try:

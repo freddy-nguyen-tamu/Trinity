@@ -1168,6 +1168,20 @@ def main():
     log(f"Upload to Android and Drive: {'yes' if should_upload else 'no'}")
     log("")
 
+    log("Skip the rest of the playlist when 30 already-downloaded videos are detected in a row?")
+    skip_playlist_on_30 = input("Type yes / no (default: yes): ").strip().lower() in {"", "yes", "y"}
+    log(f"Skip playlist after 30 skips: {'yes' if skip_playlist_on_30 else 'no'}")
+    log("")
+
+    os.environ["TRINITY_SKIP_PLAYLIST_ON_30"] = "1" if skip_playlist_on_30 else "0"
+
+    log("Use lazy playlist fetching? (yes = ~200 items, no = all items)")
+    lazy_playlist = input("Type yes / no (default: no): ").strip().lower() in {"yes", "y"}
+    log(f"Lazy playlist fetching: {'yes' if lazy_playlist else 'no'}")
+    log("")
+
+    os.environ["TRINITY_LAZY_PLAYLIST"] = "1" if lazy_playlist else "0"
+
     exit_code = 0
     upload_summary = {"attempted": [], "successful": [], "failed": [], "error": None}
     downloaded_paths = []

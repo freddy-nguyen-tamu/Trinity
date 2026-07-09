@@ -12,25 +12,34 @@ DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
 HISTORY_FILE = "download_history.json"
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLBkuXLqNhqX5FsS2CEaSDlGTKAHIBPtLe"
 ALREADY_DOWNLOADED_STREAK_LIMIT = 30
+if os.environ.get("TRINITY_SKIP_PLAYLIST_ON_30", "1") == "0":
+    ALREADY_DOWNLOADED_STREAK_LIMIT = float("inf")
 
 # Use Firefox instead of Chrome to avoid DPAPI issues on Windows
 BROWSER = ("firefox",)
+COOKIES_FILE = os.path.join(BASE_DIR, "youtube_cookies.txt")
 
 # Default behavior:
 # try with cookies first, fall back to no cookies
 USE_COOKIES_FOR_PLAYLIST = True
 
 
-def make_common_ydl_opts(use_cookies=False):
+def make_cookie_opts():
+    if os.path.exists(COOKIES_FILE):
+        return {"cookiefile": COOKIES_FILE}
+    return {"cookiesfrombrowser": BROWSER}
+
+
+def make_common_ydl_opts(use_cookies=False, video_download=False):
     opts = {
         # Python API format (dict, not list)
         "js_runtimes": {"node": {}},
         "remote_components": ["ejs:github"],
 
-        # avoid mweb / try safer clients first
+        # web/web_safari first for cookie auth
         "extractor_args": {
             "youtube": {
-                "player_client": ["android_vr", "web", "web_safari", "tv"],
+                "player_client": ["web", "web_safari"],
             }
         },
 
@@ -42,7 +51,11 @@ def make_common_ydl_opts(use_cookies=False):
     }
 
     if use_cookies:
-        opts["cookiesfrombrowser"] = BROWSER
+        opts.update(make_cookie_opts())
+
+    if video_download:
+        opts["sleep_interval"] = 5
+        opts["max_sleep_interval"] = 10
 
     return opts
 
@@ -68,7 +81,13 @@ def extract_playlist_entries(playlist_url, use_cookies=False):
         "extract_flat": True,
         "skip_download": True,
         "quiet": False,
+        "lazy_playlist": os.environ.get("TRINITY_LAZY_PLAYLIST", "0") == "1",
         **make_common_ydl_opts(use_cookies=use_cookies),
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web"],
+            },
+        },
     }
 
     with YoutubeDL(ydl_opts_extract) as ydl:
@@ -80,7 +99,7 @@ def extract_playlist_entries(playlist_url, use_cookies=False):
 def try_download_video(video_id, max_attempts=3, use_cookies=False):
     """Try downloading one video with retries."""
     ydl_opts_dl = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[ext=m4a]/bestaudio/best[acodec!=none]/18/best",
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
         "postprocessors": [
             {
@@ -90,7 +109,7 @@ def try_download_video(video_id, max_attempts=3, use_cookies=False):
             }
         ],
         "quiet": False,
-        **make_common_ydl_opts(use_cookies=use_cookies),
+        **make_common_ydl_opts(use_cookies=use_cookies, video_download=True),
     }
 
     video_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -106,6 +125,12 @@ def try_download_video(video_id, max_attempts=3, use_cookies=False):
             msg = str(e)
             if "Video unavailable" in msg or "video has been removed" in msg:
                 print(f"Video unavailable (permanent), skipping: {video_id}")
+                return None
+            if "Sign in to confirm" in msg or "not a bot" in msg:
+                print(f"YouTube auth/bot gate hit for {video_id}; skipping (no usable cookies).")
+                return None
+            if "Please sign in" in msg or "Private video" in msg:
+                print(f"YouTube auth/private video for {video_id}; skipping (no usable cookies).")
                 return None
             mode = "with cookies" if use_cookies else "without cookies"
             print(f"Attempt {attempt}/{max_attempts} failed ({mode}): {e}")
