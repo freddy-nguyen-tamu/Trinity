@@ -1162,6 +1162,12 @@ def main():
     prepare_output_dirs()
     open_run_log()
 
+    log("")
+    log("Send downloaded files to Android and Google Drive after download?")
+    should_upload = input("Type yes / no (default: yes): ").strip().lower() in {"", "yes", "y"}
+    log(f"Upload to Android and Drive: {'yes' if should_upload else 'no'}")
+    log("")
+
     exit_code = 0
     upload_summary = {"attempted": [], "successful": [], "failed": [], "error": None}
     downloaded_paths = []
@@ -1188,16 +1194,19 @@ def main():
                     mark_downloaded_as_test_processed=False,
                 )
                 run_auto_thumbnail(upload_candidates)
-                upload_summary, upload_return_code = run_upload_step(upload_candidates)
-                if upload_return_code != 0:
-                    if is_nonfatal_upload_failure(upload_summary):
-                        log("")
-                        log(
-                            "No Android LAN upload URL was found. Downloaded files "
-                            "were already moved to finished/, so the program will exit normally."
-                        )
-                    else:
-                        exit_code = upload_return_code
+                if should_upload:
+                    upload_summary, upload_return_code = run_upload_step(upload_candidates)
+                    if upload_return_code != 0:
+                        if is_nonfatal_upload_failure(upload_summary):
+                            log("")
+                            log(
+                                "No Android LAN upload URL was found. Downloaded files "
+                                "were already moved to finished/, so the program will exit normally."
+                            )
+                        else:
+                            exit_code = upload_return_code
+                else:
+                    log("Skipping Android upload (user chose not to send files).")
                 continue
 
             run_script(script)
@@ -1210,16 +1219,19 @@ def main():
                     mark_downloaded_as_test_processed=True,
                 )
                 run_auto_thumbnail(upload_candidates)
-                upload_summary, upload_return_code = run_upload_step(upload_candidates)
-                if upload_return_code != 0:
-                    if is_nonfatal_upload_failure(upload_summary):
-                        log("")
-                        log(
-                            "No Android LAN upload URL was found. Downloaded files "
-                            "were already moved to finished/, so the program will exit normally."
-                        )
-                    else:
-                        exit_code = upload_return_code
+                if should_upload:
+                    upload_summary, upload_return_code = run_upload_step(upload_candidates)
+                    if upload_return_code != 0:
+                        if is_nonfatal_upload_failure(upload_summary):
+                            log("")
+                            log(
+                                "No Android LAN upload URL was found. Downloaded files "
+                                "were already moved to finished/, so the program will exit normally."
+                            )
+                        else:
+                            exit_code = upload_return_code
+                else:
+                    log("Skipping Android upload (user chose not to send files).")
 
     except KeyboardInterrupt:
         log("")
@@ -1252,12 +1264,15 @@ def main():
         log("")
         log(f"STOPPED WITH EXIT CODE {exit_code}")
 
-    try:
-        auto_drive_upload_then_delete(drive_candidates)
-        delete_finished_files_already_uploaded_to_both(
-            finished_files_uploaded_to_android_and_drive()
-        )
-    finally:
+    if should_upload:
+        try:
+            auto_drive_upload_then_delete(drive_candidates)
+            delete_finished_files_already_uploaded_to_both(
+                finished_files_uploaded_to_android_and_drive()
+            )
+        finally:
+            close_run_log()
+    else:
         close_run_log()
 
     if exit_code:

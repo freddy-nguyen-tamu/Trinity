@@ -2,6 +2,7 @@ import os
 import json
 import time
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
@@ -150,12 +151,17 @@ def try_download(
                 f"clients={player_clients} | format={format_selector}"
             )
 
-            with YoutubeDL(ydl_opts) as ydl:
-                error_code = ydl.download([url])
+            ydl_opts_no_ignore = {**ydl_opts, "ignoreerrors": False}
+            with YoutubeDL(ydl_opts_no_ignore) as ydl:
+                ydl.download([url])
+            return True
 
-            if error_code == 0:
-                return True
-
+        except DownloadError as e:
+            msg = str(e)
+            if "Video unavailable" in msg or "video has been removed" in msg:
+                print(f"Video unavailable (permanent), skipping: {title_hint or video_id}")
+                return None
+            print(f"Attempt failed: {e}")
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -176,11 +182,11 @@ def download_playlist(playlist_url):
 
     print("Fetching playlist information...")
     try:
-        entries = get_playlist_entries(playlist_url, use_cookies=False)
-    except Exception as e:
-        print(f"Playlist fetch failed without cookies: {e}")
-        print("Retrying playlist fetch with Firefox browser cookies...")
         entries = get_playlist_entries(playlist_url, use_cookies=True)
+    except Exception as e:
+        print(f"Playlist fetch failed with cookies: {e}")
+        print("Retrying playlist fetch without cookies...")
+        entries = get_playlist_entries(playlist_url, use_cookies=False)
 
     print(f"Playlist has {len(entries)} downloadable videos.")
 
@@ -222,32 +228,45 @@ def download_playlist(playlist_url):
                 success = try_download(
                     video_id=video_id,
                     title_hint=title,
-                    use_cookies=False,
+                    use_cookies=True,
                     player_clients=clients,
                     format_selector=fmt,
                     max_attempts=1,
                 )
                 if success:
                     break
+                if success is None:
+                    break
             if success:
                 break
+            if success is None:
+                break
 
-        if not success:
-            print("Retrying failed download with Firefox browser cookies...")
+        if success is None:
+            print(f"Video unavailable, giving up: {title}")
+        elif not success:
+            print("Retrying failed download without cookies...")
             for clients in CLIENT_GROUPS:
                 for fmt in FORMAT_CANDIDATES:
                     success = try_download(
                         video_id=video_id,
                         title_hint=title,
-                        use_cookies=True,
+                        use_cookies=False,
                         player_clients=clients,
                         format_selector=fmt,
                         max_attempts=1,
                     )
                     if success:
                         break
+                    if success is None:
+                        break
                 if success:
                     break
+                if success is None:
+                    break
+
+            if success is None:
+                print(f"Video unavailable, giving up: {title}")
 
         if success:
             history.add(video_id)

@@ -2,6 +2,7 @@ import os
 import json
 import time
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
 
 # ==================================================================
 # CONFIGURATION
@@ -16,9 +17,8 @@ ALREADY_DOWNLOADED_STREAK_LIMIT = 30
 BROWSER = ("firefox",)
 
 # Default behavior:
-# try without cookies first because current YouTube/yt-dlp breakage
-# often affects logged-in cookie sessions
-USE_COOKIES_FOR_PLAYLIST = False
+# try with cookies first, fall back to no cookies
+USE_COOKIES_FOR_PLAYLIST = True
 
 
 def make_common_ydl_opts(use_cookies=False):
@@ -97,9 +97,18 @@ def try_download_video(video_id, max_attempts=3, use_cookies=False):
 
     for attempt in range(1, max_attempts + 1):
         try:
-            with YoutubeDL(ydl_opts_dl) as ydl:
+            ydl_opts_no_ignore = {**ydl_opts_dl, "ignoreerrors": False}
+            with YoutubeDL(ydl_opts_no_ignore) as ydl:
                 ydl.download([video_url])
             return True
+
+        except DownloadError as e:
+            msg = str(e)
+            if "Video unavailable" in msg or "video has been removed" in msg:
+                print(f"Video unavailable (permanent), skipping: {video_id}")
+                return None
+            mode = "with cookies" if use_cookies else "without cookies"
+            print(f"Attempt {attempt}/{max_attempts} failed ({mode}): {e}")
 
         except KeyboardInterrupt:
             raise
@@ -108,10 +117,10 @@ def try_download_video(video_id, max_attempts=3, use_cookies=False):
             mode = "with cookies" if use_cookies else "without cookies"
             print(f"Attempt {attempt}/{max_attempts} failed ({mode}): {e}")
 
-            if attempt < max_attempts:
-                wait_seconds = min(2 ** attempt, 10)
-                print(f"Waiting {wait_seconds}s before retry...")
-                time.sleep(wait_seconds)
+        if attempt < max_attempts:
+            wait_seconds = min(2 ** attempt, 10)
+            print(f"Waiting {wait_seconds}s before retry...")
+            time.sleep(wait_seconds)
 
     return False
 
@@ -175,21 +184,27 @@ def download_playlist(playlist_url):
         already_downloaded_streak = 0
         print(f"[{index}/{len(video_entries)}] Downloading: {video_title}")
 
-        # First try without cookies
+        # First try with cookies
         success = try_download_video(
             video_id,
             max_attempts=3,
-            use_cookies=False,
+            use_cookies=True,
         )
 
-        # Fall back to cookies only if needed
-        if not success:
-            print("Retrying with browser cookies...")
+        # Fall back to no cookies only if needed (skip if video was removed permanently)
+        if success is None:
+            print(f"Video unavailable, giving up: {video_id}")
+            continue
+        elif not success:
+            print("Retrying without cookies...")
             success = try_download_video(
                 video_id,
                 max_attempts=2,
-                use_cookies=True,
+                use_cookies=False,
             )
+            if success is None:
+                print(f"Video unavailable, giving up: {video_id}")
+                continue
 
         if success:
             history.add(video_id)
