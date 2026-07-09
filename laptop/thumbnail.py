@@ -129,6 +129,7 @@ def get_playlist_entries(playlist_url, use_cookies=False):
         ydl_opts.update(make_cookie_opts())
     if os.environ.get("TRINITY_LAZY_PLAYLIST", "0") == "1":
         ydl_opts["lazy_playlist"] = True
+        ydl_opts["playlistend"] = 200
 
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(playlist_url, download=False)

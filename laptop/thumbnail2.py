@@ -40,6 +40,7 @@ def download_playlist(playlist_url):
 
     # Fetch playlist info
     print("Fetching playlist information...")
+    lazy = os.environ.get("TRINITY_LAZY_PLAYLIST", "0") == "1"
     ydl_opts_extract = {
         "extract_flat": True,
         "skip_download": True,
@@ -47,13 +48,15 @@ def download_playlist(playlist_url):
         "retries": 10,
         "extractor_retries": 10,
         "socket_timeout": 30,
-        "lazy_playlist": os.environ.get("TRINITY_LAZY_PLAYLIST", "0") == "1",
+        "lazy_playlist": lazy,
         "extractor_args": {
             "youtube": {
                 "player_client": ["web"],
             },
         },
     }
+    if lazy:
+        ydl_opts_extract["playlistend"] = 200
 
     with YoutubeDL(ydl_opts_extract) as ydl:
         info = ydl.extract_info(playlist_url, download=False)

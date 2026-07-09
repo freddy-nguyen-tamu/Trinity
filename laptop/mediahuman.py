@@ -77,11 +77,12 @@ def save_history(history):
 
 def extract_playlist_entries(playlist_url, use_cookies=False):
     """Fetch playlist metadata only."""
+    lazy = os.environ.get("TRINITY_LAZY_PLAYLIST", "0") == "1"
     ydl_opts_extract = {
         "extract_flat": True,
         "skip_download": True,
         "quiet": False,
-        "lazy_playlist": os.environ.get("TRINITY_LAZY_PLAYLIST", "0") == "1",
+        "lazy_playlist": lazy,
         **make_common_ydl_opts(use_cookies=use_cookies),
         "extractor_args": {
             "youtube": {
@@ -89,6 +90,8 @@ def extract_playlist_entries(playlist_url, use_cookies=False):
             },
         },
     }
+    if lazy:
+        ydl_opts_extract["playlistend"] = 200
 
     with YoutubeDL(ydl_opts_extract) as ydl:
         info = ydl.extract_info(playlist_url, download=False)
