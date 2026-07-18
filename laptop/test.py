@@ -541,7 +541,10 @@ def get_file_ext(file_path: str) -> str:
     return os.path.splitext(file_path)[1].lower()
 
 
-MP4_LYRICS_KEYS = ("\xa9lyr", "\xc2\xa9lyr")
+MP4_TITLE_KEYS = ("\xa9nam", "\xc2\xa9nam", "\ufffdnam")
+MP4_ARTIST_KEYS = ("\xa9ART", "\xc2\xa9ART", "\ufffdART")
+MP4_ALBUM_KEYS = ("\xa9alb", "\xc2\xa9alb", "\ufffdalb")
+MP4_LYRICS_KEYS = ("\xa9lyr", "\xc2\xa9lyr", "\ufffdlyr")
 
 
 def tag_value_has_text(value) -> bool:
@@ -573,103 +576,105 @@ def first_mp4_lyrics(tags):
     return None
 
 
-def has_lyrics(file_path: str) -> bool:
-    ext = get_file_ext(file_path)
+def first_tag_text_from_keys(tags, keys):
+    if not tags:
+        return ""
+
+    for key in keys:
+        text = first_tag_text(tags.get(key))
+        if text:
+            return norm_text(text)
+
+    return ""
+
+
+def first_id3_lyrics(tags):
+    if not tags:
+        return None
+
+    for frame in tags.getall("USLT"):
+        text = frame.text
+        if isinstance(text, list):
+            text = " ".join(str(x) for x in text)
+        if str(text).strip():
+            return str(text).strip()
+
+    return None
+
+
+def get_existing_audio_metadata(file_path: str):
+    title = ""
+    artist = ""
+    album = ""
+    lyrics = None
 
     try:
-        if ext == ".mp3":
-            tags = ID3(file_path)
-            for frame in tags.getall("USLT"):
-                text = frame.text
-                if isinstance(text, list):
-                    text = " ".join(str(x) for x in text)
-                if str(text).strip():
-                    return True
-            return False
-
         audio = get_audio_object(file_path)
-        if not audio or audio.tags is None:
-            return False
+        if not audio:
+            return {
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "lyrics": lyrics,
+                "has_lyrics": False,
+            }
 
         if isinstance(audio, MP4):
-            return first_mp4_lyrics(audio.tags) is not None
+            tags = audio.tags or {}
+            title = first_tag_text_from_keys(tags, MP4_TITLE_KEYS)
+            artist = first_tag_text_from_keys(tags, MP4_ARTIST_KEYS)
+            album = first_tag_text_from_keys(tags, MP4_ALBUM_KEYS)
+            lyrics = first_mp4_lyrics(tags)
 
-        if isinstance(audio, (FLAC, OggVorbis, OggOpus)):
+        elif isinstance(audio, (FLAC, OggVorbis, OggOpus)):
+            tags = audio.tags or {}
+            title = _first_tag_value(tags.get("title"))
+            artist = _first_tag_value(tags.get("artist"))
+            album = _first_tag_value(tags.get("album"))
             for key in ("lyrics", "unsyncedlyrics", "lyric"):
-                val = audio.tags.get(key)
-                if isinstance(val, list):
-                    if any(str(x).strip() for x in val):
-                        return True
-                elif val and str(val).strip():
-                    return True
-            return False
+                lyrics = first_tag_text(tags.get(key))
+                if lyrics:
+                    break
 
-        if isinstance(audio, (WAVE, AIFF)):
+        elif isinstance(audio, (MP3, WAVE, AIFF)):
             try:
                 tags = ID3(file_path)
-                for frame in tags.getall("USLT"):
-                    text = frame.text
-                    if isinstance(text, list):
-                        text = " ".join(str(x) for x in text)
-                    if str(text).strip():
-                        return True
             except Exception:
-                return False
+                tags = None
+
+            if tags:
+                if "TIT2" in tags:
+                    title = norm_text(str(tags["TIT2"]))
+                if "TPE1" in tags:
+                    artist = norm_text(str(tags["TPE1"]))
+                if "TALB" in tags:
+                    album = norm_text(str(tags["TALB"]))
+                lyrics = first_id3_lyrics(tags)
+
+        else:
+            tags = audio.tags or {}
+            title = _first_tag_value(tags.get("title"))
+            artist = _first_tag_value(tags.get("artist"))
+            album = _first_tag_value(tags.get("album"))
 
     except Exception:
         pass
 
-    return False
+    return {
+        "title": title,
+        "artist": artist,
+        "album": album,
+        "lyrics": lyrics,
+        "has_lyrics": bool(lyrics and str(lyrics).strip()),
+    }
+
+
+def has_lyrics(file_path: str) -> bool:
+    return get_existing_audio_metadata(file_path)["has_lyrics"]
 
 
 def read_existing_lyrics(file_path: str):
-    ext = get_file_ext(file_path)
-
-    try:
-        if ext == ".mp3":
-            tags = ID3(file_path)
-            for frame in tags.getall("USLT"):
-                text = frame.text
-                if isinstance(text, list):
-                    text = " ".join(str(x) for x in text)
-                if str(text).strip():
-                    return str(text).strip()
-            return None
-
-        audio = get_audio_object(file_path)
-        if not audio or audio.tags is None:
-            return None
-
-        if isinstance(audio, MP4):
-            return first_mp4_lyrics(audio.tags)
-
-        if isinstance(audio, (FLAC, OggVorbis, OggOpus)):
-            for key in ("lyrics", "unsyncedlyrics", "lyric"):
-                val = audio.tags.get(key)
-                if isinstance(val, list):
-                    for item in val:
-                        if str(item).strip():
-                            return str(item).strip()
-                elif val and str(val).strip():
-                    return str(val).strip()
-            return None
-
-        if isinstance(audio, (WAVE, AIFF)):
-            try:
-                tags = ID3(file_path)
-                for frame in tags.getall("USLT"):
-                    text = frame.text
-                    if isinstance(text, list):
-                        text = " ".join(str(x) for x in text)
-                    if str(text).strip():
-                        return str(text).strip()
-            except Exception:
-                return None
-
-    except Exception:
-        pass
-
-    return None
+    return get_existing_audio_metadata(file_path)["lyrics"]
 
 
 def _first_tag_value(val):
@@ -1910,74 +1915,81 @@ all_metadata = []
 lyrics_not_found_history = load_lyrics_not_found_history()
 
 for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
-    existing_title, existing_artist, existing_album = get_existing_basic_tags(file_path)
-    already_has_lyrics = has_lyrics(file_path)
+    existing_metadata = get_existing_audio_metadata(file_path)
+    existing_title = existing_metadata["title"]
+    existing_artist = existing_metadata["artist"]
+    existing_album = existing_metadata["album"]
+    already_has_lyrics = existing_metadata["has_lyrics"]
     skipped_tag_update_existing = has_usable_title_and_artist(existing_title, existing_artist)
     video_id = extract_youtube_id_from_name(original_file_name)
     tag_source = None
+    did_expensive_lookup = False
 
     cleaned_name_for_ai = clean_input_filename(original_file_name)
 
     print(f"[{idx}/{len(file_entries)}] Reading: {original_file_name}")
-    youtube_music_metadata = get_youtube_music_metadata(video_id)
 
-    if youtube_music_metadata:
-        title = youtube_music_metadata["title"]
-        artist = youtube_music_metadata["artist"]
-        if not existing_album and youtube_music_metadata.get("album"):
-            existing_album = youtube_music_metadata["album"]
-        tag_source = youtube_music_metadata["source"]
-        print(
-            "  Used YouTube music metadata "
-            f"({tag_source}) -> title='{title}' | artist='{artist}'"
-        )
-
-        try:
-            write_tags(file_path, title=title, artist=artist, album=existing_album)
-            print(f"  Updated tags -> title='{title}' | artist='{artist}'")
-        except Exception as e:
-            print(f"  Error updating tags: {e}")
-    elif skipped_tag_update_existing:
+    if skipped_tag_update_existing:
         title = existing_title
         artist = existing_artist
         tag_source = "existing"
         print(f"  Skipped tag update: existing title='{title}' | artist='{artist}'")
     else:
-        messages = [
-            {"role": "system", "content": "Return valid JSON only."},
-            {"role": "user", "content": build_single_prompt(idx, cleaned_name_for_ai)},
-        ]
+        did_expensive_lookup = True
+        youtube_music_metadata = get_youtube_music_metadata(video_id)
 
-        try:
-            one = call_and_parse(messages, max_tokens=220, json_mode=True)
-            title = norm_text(str(one.get("title") or ""))
-            artist = norm_text(str(one.get("artist") or "Unknown")) or "Unknown"
-            tag_source = "groq"
+        if youtube_music_metadata:
+            title = youtube_music_metadata["title"]
+            artist = youtube_music_metadata["artist"]
+            if not existing_album and youtube_music_metadata.get("album"):
+                existing_album = youtube_music_metadata["album"]
+            tag_source = youtube_music_metadata["source"]
+            print(
+                "  Used YouTube music metadata "
+                f"({tag_source}) -> title='{title}' | artist='{artist}'"
+            )
 
-            if looks_bad(title):
-                print(f"  Suspicious title detected, using filename fallback: {title}")
+            try:
+                write_tags(file_path, title=title, artist=artist, album=existing_album)
+                print(f"  Updated tags -> title='{title}' | artist='{artist}'")
+            except Exception as e:
+                print(f"  Error updating tags: {e}")
+        else:
+            messages = [
+                {"role": "system", "content": "Return valid JSON only."},
+                {"role": "user", "content": build_single_prompt(idx, cleaned_name_for_ai)},
+            ]
+
+            try:
+                one = call_and_parse(messages, max_tokens=220, json_mode=True)
+                title = norm_text(str(one.get("title") or ""))
+                artist = norm_text(str(one.get("artist") or "Unknown")) or "Unknown"
+                tag_source = "groq"
+
+                if looks_bad(title):
+                    print(f"  Suspicious title detected, using filename fallback: {title}")
+                    title = conservative_filename_title(original_file_name)
+                    tag_source = "filename_fallback"
+
+                if looks_bad(artist):
+                    print(f"  Suspicious artist detected, using Unknown: {artist}")
+                    artist = "Unknown"
+
+            except Exception as e:
+                print(f"  AI parse failed: {e}")
                 title = conservative_filename_title(original_file_name)
+                artist = existing_artist or "Unknown"
                 tag_source = "filename_fallback"
 
-            if looks_bad(artist):
-                print(f"  Suspicious artist detected, using Unknown: {artist}")
-                artist = "Unknown"
+            if not title:
+                title = conservative_filename_title(original_file_name)
+                tag_source = tag_source or "filename_fallback"
 
-        except Exception as e:
-            print(f"  AI parse failed: {e}")
-            title = conservative_filename_title(original_file_name)
-            artist = existing_artist or "Unknown"
-            tag_source = "filename_fallback"
-
-        if not title:
-            title = conservative_filename_title(original_file_name)
-            tag_source = tag_source or "filename_fallback"
-
-        try:
-            write_tags(file_path, title=title, artist=artist, album=existing_album)
-            print(f"  Updated tags -> title='{title}' | artist='{artist}'")
-        except Exception as e:
-            print(f"  Error updating tags: {e}")
+            try:
+                write_tags(file_path, title=title, artist=artist, album=existing_album)
+                print(f"  Updated tags -> title='{title}' | artist='{artist}'")
+            except Exception as e:
+                print(f"  Error updating tags: {e}")
 
     lyrics_found = already_has_lyrics
     lyrics_source = "existing" if already_has_lyrics else None
@@ -1985,80 +1997,84 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
     lyric_source_similarity = None
     existing_lyrics_cleaned_for_noise = False
     lyrics_lookup_skipped_not_found_cache = False
-    lyrics_not_found_signature = build_lyrics_not_found_signature(
-        file_path=file_path,
-        original_file_name=original_file_name,
-        title=title,
-        artist=artist,
-        album=existing_album,
-        video_id=video_id,
-    )
 
     if already_has_lyrics:
         forget_lyrics_not_found(lyrics_not_found_history, file_path)
         print("  Skipped lyrics: already present")
-    elif lyrics_not_found_cache_hit(lyrics_not_found_history, file_path, lyrics_not_found_signature):
-        lyrics_lookup_skipped_not_found_cache = True
-        lyrics_source = "lyrics_not_found_cache"
-        print(
-            "  Skipped lyrics lookup: previously attempted and not found "
-            "for this same title/artist/video id."
-        )
     else:
-        try:
-            duration = read_duration_seconds(file_path)
-            library_lyrics = get_lyrics_from_genius(title=title, artist=artist)
-            library_source = "genius"
+        lyrics_not_found_signature = build_lyrics_not_found_signature(
+            file_path=file_path,
+            original_file_name=original_file_name,
+            title=title,
+            artist=artist,
+            album=existing_album,
+            video_id=video_id,
+        )
 
-            if not library_lyrics:
-                library_lyrics = get_lyrics_from_lrclib(
+        if lyrics_not_found_cache_hit(lyrics_not_found_history, file_path, lyrics_not_found_signature):
+            lyrics_lookup_skipped_not_found_cache = True
+            lyrics_source = "lyrics_not_found_cache"
+            print(
+                "  Skipped lyrics lookup: previously attempted and not found "
+                "for this same title/artist/video id."
+            )
+        else:
+            did_expensive_lookup = True
+
+            try:
+                duration = read_duration_seconds(file_path)
+                library_lyrics = get_lyrics_from_genius(title=title, artist=artist)
+                library_source = "genius"
+
+                if not library_lyrics:
+                    library_lyrics = get_lyrics_from_lrclib(
+                        title=title,
+                        artist=artist,
+                        duration=duration,
+                        album=existing_album
+                    )
+                    if library_lyrics:
+                        library_source = "lrclib"
+
+                subtitle_lyrics = None
+                subtitle_candidate = None
+
+                if video_id:
+                    subtitle_lyrics, subtitle_candidate = get_lyrics_from_youtube_subtitles(
+                        video_id=video_id,
+                        video_title=cleaned_name_for_ai,
+                    )
+                else:
+                    print("  No YouTube video id found in filename; cannot look up subtitle lyrics.")
+
+                lyrics, selected_lyrics_source, lyric_source_similarity = choose_best_lyrics(
+                    library_lyrics=library_lyrics,
+                    subtitle_lyrics=subtitle_lyrics,
+                    subtitle_candidate=subtitle_candidate,
+                    library_source=library_source,
                     title=title,
                     artist=artist,
-                    duration=duration,
-                    album=existing_album
                 )
-                if library_lyrics:
-                    library_source = "lrclib"
 
-            subtitle_lyrics = None
-            subtitle_candidate = None
-
-            if video_id:
-                subtitle_lyrics, subtitle_candidate = get_lyrics_from_youtube_subtitles(
-                    video_id=video_id,
-                    video_title=cleaned_name_for_ai,
-                )
-            else:
-                print("  No YouTube video id found in filename; cannot look up subtitle lyrics.")
-
-            lyrics, selected_lyrics_source, lyric_source_similarity = choose_best_lyrics(
-                library_lyrics=library_lyrics,
-                subtitle_lyrics=subtitle_lyrics,
-                subtitle_candidate=subtitle_candidate,
-                library_source=library_source,
-                title=title,
-                artist=artist,
-            )
-
-            if lyrics:
-                cleaned_lyrics = clean_lyrics_for_tag(lyrics)
-                if cleaned_lyrics:
-                    write_lyrics(file_path, cleaned_lyrics, replace_existing=True)
-                    lyrics_found = True
-                    lyrics_source = selected_lyrics_source
-                    subtitle_track = subtitle_candidate.get("name") if subtitle_candidate else None
-                    print(f"  Wrote lyrics from {lyrics_source} ({len(cleaned_lyrics)} chars)")
+                if lyrics:
+                    cleaned_lyrics = clean_lyrics_for_tag(lyrics)
+                    if cleaned_lyrics:
+                        write_lyrics(file_path, cleaned_lyrics, replace_existing=True)
+                        lyrics_found = True
+                        lyrics_source = selected_lyrics_source
+                        subtitle_track = subtitle_candidate.get("name") if subtitle_candidate else None
+                        print(f"  Wrote lyrics from {lyrics_source} ({len(cleaned_lyrics)} chars)")
+                    else:
+                        print("  No lyrics found after square-bracket cleanup")
                 else:
-                    print("  No lyrics found after square-bracket cleanup")
-            else:
-                print("  No lyrics found")
+                    print("  No lyrics found")
 
-            if lyrics_found:
-                forget_lyrics_not_found(lyrics_not_found_history, file_path)
-            else:
-                remember_lyrics_not_found(lyrics_not_found_history, lyrics_not_found_signature)
-        except Exception as e:
-            print(f"  Lyrics error: {e}")
+                if lyrics_found:
+                    forget_lyrics_not_found(lyrics_not_found_history, file_path)
+                else:
+                    remember_lyrics_not_found(lyrics_not_found_history, lyrics_not_found_signature)
+            except Exception as e:
+                print(f"  Lyrics error: {e}")
 
     all_metadata.append({
         "file_name": original_file_name,
@@ -2076,7 +2092,8 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
         "lrclib_subtitle_similarity": lyric_source_similarity,
     })
 
-    time.sleep(0.4)
+    if did_expensive_lookup:
+        time.sleep(0.4)
 
 print("\nDone.")
 print(json.dumps(all_metadata, ensure_ascii=False, indent=2))
