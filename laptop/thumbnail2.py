@@ -1,6 +1,8 @@
 import os
 import json
+import time
 from yt_dlp import YoutubeDL
+from youtube_url_tag import tag_downloaded_mp3_with_youtube_url, youtube_watch_url
 
 # Config
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -104,8 +106,18 @@ def download_playlist(playlist_url):
         }
 
         try:
+            video_url = youtube_watch_url(video_id)
+            started_at = time.time()
             with YoutubeDL(ydl_opts_dl) as ydl:
-                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+                info = ydl.extract_info(video_url, download=True)
+                tag_downloaded_mp3_with_youtube_url(
+                    info=info,
+                    ydl=ydl,
+                    youtube_url=video_url,
+                    download_dir=DOWNLOAD_DIR,
+                    started_at=started_at,
+                    video_id=video_id,
+                )
             history.add(video_id)
             save_history(history)
         except Exception as e:

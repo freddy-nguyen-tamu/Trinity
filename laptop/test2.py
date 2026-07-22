@@ -46,15 +46,17 @@ SUPPORTED_EXTENSIONS = {
 }
 
 if not NVIDIA_API_KEY:
-    raise SystemExit("NVIDIA_API_KEY is not set.")
+    print("NVIDIA_API_KEY is not set. Existing-tag skips still work; AI-only tag filling will use fallbacks.")
 
 if not os.path.isdir(AUDIO_FOLDER):
     raise SystemExit(f"Folder not found: {AUDIO_FOLDER}")
 
-client = OpenAI(
-    base_url=NVIDIA_BASE_URL,
-    api_key=NVIDIA_API_KEY
-)
+client = None
+if NVIDIA_API_KEY:
+    client = OpenAI(
+        base_url=NVIDIA_BASE_URL,
+        api_key=NVIDIA_API_KEY
+    )
 
 file_names = sorted(
     f for f in os.listdir(AUDIO_FOLDER)
@@ -168,6 +170,9 @@ def ensure_dict(obj):
 
 
 def nvidia_chat(messages, max_tokens=220, temperature=1.0, timeout=60, max_retries=8, json_mode=True):
+    if client is None:
+        raise RuntimeError("NVIDIA_API_KEY is not set.")
+
     backoff = 1.0
 
     for attempt in range(1, max_retries + 1):
@@ -736,47 +741,56 @@ for idx, original_file_name in enumerate(file_names, start=1):
 
     existing_title, existing_artist, existing_album = get_existing_basic_tags(file_path)
     already_has_lyrics = has_lyrics(file_path)
+    skipped_tag_update_existing = bool(existing_title) and bool(existing_artist) and existing_artist.lower() != "unknown"
+    did_expensive_lookup = False
 
     cleaned_name_for_ai = clean_input_filename(original_file_name)
 
     print(f"[{idx}/{len(file_names)}] Reading: {original_file_name}")
 
-    messages = [
-        {"role": "system", "content": "Return valid JSON only."},
-        {"role": "user", "content": build_single_prompt(idx, cleaned_name_for_ai)},
-    ]
+    if skipped_tag_update_existing:
+        title = existing_title
+        artist = existing_artist
+        print(f"  Skipped tag update: existing title='{title}' | artist='{artist}'")
+    else:
+        did_expensive_lookup = True
+        messages = [
+            {"role": "system", "content": "Return valid JSON only."},
+            {"role": "user", "content": build_single_prompt(idx, cleaned_name_for_ai)},
+        ]
 
-    try:
-        one = call_and_parse(messages, max_tokens=220, json_mode=True)
-        title = norm_text(str(one.get("title") or ""))
-        artist = norm_text(str(one.get("artist") or "Unknown")) or "Unknown"
+        try:
+            one = call_and_parse(messages, max_tokens=220, json_mode=True)
+            title = norm_text(str(one.get("title") or ""))
+            artist = norm_text(str(one.get("artist") or "Unknown")) or "Unknown"
 
-        if looks_bad(title):
-            print(f"  Suspicious title detected, using filename fallback: {title}")
+            if looks_bad(title):
+                print(f"  Suspicious title detected, using filename fallback: {title}")
+                title = conservative_filename_title(original_file_name)
+
+            if looks_bad(artist):
+                print(f"  Suspicious artist detected, using Unknown: {artist}")
+                artist = "Unknown"
+
+        except Exception as e:
+            print(f"  AI parse failed: {e}")
+            title = conservative_filename_title(original_file_name)
+            artist = existing_artist or "Unknown"
+
+        if not title:
             title = conservative_filename_title(original_file_name)
 
-        if looks_bad(artist):
-            print(f"  Suspicious artist detected, using Unknown: {artist}")
-            artist = "Unknown"
-
-    except Exception as e:
-        print(f"  AI parse failed: {e}")
-        title = conservative_filename_title(original_file_name)
-        artist = existing_artist or "Unknown"
-
-    if not title:
-        title = conservative_filename_title(original_file_name)
-
-    try:
-        write_tags(file_path, title=title, artist=artist, album=existing_album)
-        print(f"  Updated tags -> title='{title}' | artist='{artist}'")
-    except Exception as e:
-        print(f"  Error updating tags: {e}")
+        try:
+            write_tags(file_path, title=title, artist=artist, album=existing_album)
+            print(f"  Updated tags -> title='{title}' | artist='{artist}'")
+        except Exception as e:
+            print(f"  Error updating tags: {e}")
 
     lyrics_found = already_has_lyrics
     if already_has_lyrics:
         print("  Skipped lyrics: already present")
     else:
+        did_expensive_lookup = True
         try:
             duration = read_duration_seconds(file_path)
             lyrics = get_lyrics_from_genius(title=title, artist=artist)
@@ -804,7 +818,8 @@ for idx, original_file_name in enumerate(file_names, start=1):
         "lyrics_skipped_existing": already_has_lyrics,
     })
 
-    time.sleep(0.4)
+    if did_expensive_lookup:
+        time.sleep(0.4)
 
 print("\nDone.")
 print(json.dumps(all_metadata, ensure_ascii=False, indent=2))

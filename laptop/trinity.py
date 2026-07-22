@@ -60,7 +60,9 @@ SUPPORTED_AUDIO_EXTENSIONS = {
     ".aif",
     ".aac",
 }
-MP4_LYRICS_KEYS = ("\xa9lyr", "\xc2\xa9lyr")
+MP4_LYRICS_KEYS = ("\xa9lyr", "\xc2\xa9lyr", "lyrics", "unsyncedlyrics", "syncedlyrics", "lyric")
+YOUTUBE_ID_IN_NAME_RE = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
+SIZE_SUFFIX_RE = re.compile(r"^(?P<name>.*)\|(?P<size>\d+)$")
 
 _LOG_HANDLE = None
 
@@ -345,6 +347,19 @@ def uploaded_history_key(path):
     return f"{name}|{size}"
 
 
+def strip_history_size_suffix(item):
+    match = SIZE_SUFFIX_RE.match(str(item))
+    if match:
+        return match.group("name")
+    return str(item)
+
+
+def stable_finished_name_key(name):
+    normalized = str(name).replace("\\", "/").strip()
+    normalized = os.path.normcase(normalized)
+    return f"finished-name:{normalized}"
+
+
 def history_key_from_item(item):
     path = safe_finished_path(item.get("path", ""))
     name = relative_finished_name(path) if path else item.get("name", "")
@@ -400,11 +415,19 @@ def save_drive_uploaded_history(history):
 
 
 def test_processed_history_key(path):
-    return uploaded_history_key(path)
+    return stable_finished_name_key(relative_finished_name(os.path.abspath(path)))
 
 
 def load_test_processed_history():
-    return load_history_file(TEST_PROCESSED_HISTORY_FILE, "test.py processed")
+    raw_history = load_history_file(TEST_PROCESSED_HISTORY_FILE, "test.py processed")
+    migrated = set(raw_history)
+
+    for item in raw_history:
+        if str(item).startswith("finished-name:"):
+            continue
+        migrated.add(stable_finished_name_key(strip_history_size_suffix(item)))
+
+    return migrated
 
 
 def save_test_processed_history(history):
@@ -437,17 +460,27 @@ def audio_missing_title_or_artist(path):
         log("Mutagen is not available in trinity.py; relying on test.py processed history only.")
         return False
 
+    title = ""
+    artist = ""
+
     try:
         audio = MutagenFile(path, easy=True)
     except Exception as e:
         log(f"Could not inspect audio tags, will reprocess with test.py: {path} ({e})")
         return True
 
-    if not audio or not audio.tags:
+    if audio and audio.tags:
+        title = first_tag_value(audio.tags.get("title"))
+        artist = first_tag_value(audio.tags.get("artist"))
+
+    if not title or not artist:
+        direct_title, direct_artist = direct_audio_title_artist(path)
+        title = title or direct_title
+        artist = artist or direct_artist
+
+    if not title and not artist:
         return True
 
-    title = first_tag_value(audio.tags.get("title"))
-    artist = first_tag_value(audio.tags.get("artist"))
     return not title or not artist or artist.lower() == "unknown"
 
 
@@ -455,6 +488,44 @@ def text_value_present(value):
     if isinstance(value, list):
         return any(str(item).strip() for item in value)
     return bool(value and str(value).strip())
+
+
+def lyrics_text_looks_usable(text):
+    text = str(text or "").strip()
+    if not text:
+        return False
+
+    letters = sum(1 for char in text if char.isalpha())
+    nonempty_lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+
+    if letters < 120:
+        return False
+    if len(nonempty_lines) < 5:
+        return False
+
+    folded = text.casefold()
+    obvious_non_lyrics = (
+        "subscribe to",
+        "http://",
+        "https://",
+        "www.",
+        "all rights reserved",
+    )
+    if any(marker in folded for marker in obvious_non_lyrics):
+        return False
+
+    return True
+
+
+def lyrics_value_has_usable_text(value):
+    return any(
+        lyrics_text_looks_usable(text)
+        for text in iter_tag_text_values(value)
+    )
 
 
 def iter_tag_text_values(value):
@@ -473,38 +544,98 @@ def text_has_square_bracket_content(text):
     return bool(re.search(r"\[[^\[\]\r\n]*\]", text or ""))
 
 
-def id3_has_lyrics(path):
+def direct_audio_title_artist(path):
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".mp3":
+        return id3_first_frame_text(path, "TIT2"), id3_first_frame_text(path, "TPE1")
+
+    try:
+        audio = MutagenFile(path)
+    except Exception:
+        return "", ""
+
+    if not audio or audio.tags is None:
+        return "", ""
+
+    if MP4 is not None and isinstance(audio, MP4):
+        title = first_tag_value(audio.tags.get("\xa9nam")) or first_tag_value(audio.tags.get("\xc2\xa9nam"))
+        artist = first_tag_value(audio.tags.get("\xa9ART")) or first_tag_value(audio.tags.get("\xc2\xa9ART"))
+        return title, artist
+
+    return "", ""
+
+
+def id3_first_frame_text(path, frame_id):
     if ID3 is None:
-        return False
+        return ""
 
     try:
         tags = ID3(path)
     except Exception:
-        return False
+        return ""
+
+    for frame in tags.getall(frame_id):
+        text = id3_frame_text(frame)
+        if text:
+            return text
+
+    return ""
+
+
+def id3_frame_text(frame):
+    text = getattr(frame, "text", "")
+    if isinstance(text, list):
+        text = " ".join(str(item) for item in text)
+    return str(text).strip()
+
+
+def id3_lyrics_texts(path):
+    if ID3 is None:
+        return
+
+    try:
+        tags = ID3(path)
+    except Exception:
+        return
 
     for frame in tags.getall("USLT"):
-        text = frame.text
-        if isinstance(text, list):
-            text = " ".join(str(item) for item in text)
-        if str(text).strip():
-            return True
+        text = id3_frame_text(frame)
+        if text:
+            yield text
 
-    return False
+    for frame in tags.getall("SYLT"):
+        text = id3_frame_text(frame)
+        if text:
+            yield text
+
+    for frame in tags.getall("TXXX"):
+        desc = str(getattr(frame, "desc", "") or "").casefold()
+        if "lyric" in desc:
+            text = id3_frame_text(frame)
+            if text:
+                yield text
+
+    for frame in tags.getall("COMM"):
+        desc = str(getattr(frame, "desc", "") or "").casefold()
+        if "lyric" in desc:
+            text = id3_frame_text(frame)
+            if text:
+                yield text
+
+
+def id3_has_lyrics(path):
+    return any(
+        lyrics_text_looks_usable(text)
+        for text in id3_lyrics_texts(path)
+    )
 
 
 def id3_lyrics_need_square_bracket_cleanup(path):
     if ID3 is None:
         return False
 
-    try:
-        tags = ID3(path)
-    except Exception:
-        return False
-
-    for frame in tags.getall("USLT"):
-        text = frame.text
-        if isinstance(text, list):
-            text = " ".join(str(item) for item in text)
+    for text in id3_lyrics_texts(path):
         if text_has_square_bracket_content(str(text)):
             return True
 
@@ -530,15 +661,20 @@ def audio_has_lyrics(path):
         return False
 
     if MP4 is not None and isinstance(audio, MP4):
-        return any(text_value_present(audio.tags.get(key)) for key in MP4_LYRICS_KEYS)
+        for key, value in audio.tags.items():
+            key_text = str(key).casefold()
+            if key in MP4_LYRICS_KEYS or ("lyric" in key_text and "lyricist" not in key_text):
+                if lyrics_value_has_usable_text(value):
+                    return True
+        return False
 
     if (
         (FLAC is not None and isinstance(audio, FLAC))
         or (OggVorbis is not None and isinstance(audio, OggVorbis))
         or (OggOpus is not None and isinstance(audio, OggOpus))
     ):
-        for key in ("lyrics", "unsyncedlyrics", "lyric"):
-            if text_value_present(audio.tags.get(key)):
+        for key in ("lyrics", "unsyncedlyrics", "syncedlyrics", "lyric"):
+            if lyrics_value_has_usable_text(audio.tags.get(key)):
                 return True
         return False
 
@@ -548,10 +684,12 @@ def audio_has_lyrics(path):
     ):
         return id3_has_lyrics(path)
 
-    for key in ("lyrics", "unsyncedlyrics", "lyric", *MP4_LYRICS_KEYS):
+    for key, value in audio.tags.items():
         try:
-            if text_value_present(audio.tags.get(key)):
-                return True
+            key_text = str(key).casefold()
+            if key in MP4_LYRICS_KEYS or ("lyric" in key_text and "lyricist" not in key_text):
+                if lyrics_value_has_usable_text(value):
+                    return True
         except Exception:
             pass
 
@@ -575,10 +713,12 @@ def audio_lyrics_need_square_bracket_cleanup(path):
         return False
 
     if MP4 is not None and isinstance(audio, MP4):
-        for key in MP4_LYRICS_KEYS:
-            for text in iter_tag_text_values(audio.tags.get(key)):
-                if text_has_square_bracket_content(text):
-                    return True
+        for key, value in audio.tags.items():
+            key_text = str(key).casefold()
+            if key in MP4_LYRICS_KEYS or ("lyric" in key_text and "lyricist" not in key_text):
+                for text in iter_tag_text_values(value):
+                    if text_has_square_bracket_content(text):
+                        return True
         return False
 
     if (
@@ -586,7 +726,7 @@ def audio_lyrics_need_square_bracket_cleanup(path):
         or (OggVorbis is not None and isinstance(audio, OggVorbis))
         or (OggOpus is not None and isinstance(audio, OggOpus))
     ):
-        for key in ("lyrics", "unsyncedlyrics", "lyric"):
+        for key in ("lyrics", "unsyncedlyrics", "syncedlyrics", "lyric"):
             for text in iter_tag_text_values(audio.tags.get(key)):
                 if text_has_square_bracket_content(text):
                     return True
@@ -598,11 +738,13 @@ def audio_lyrics_need_square_bracket_cleanup(path):
     ):
         return id3_lyrics_need_square_bracket_cleanup(path)
 
-    for key in ("lyrics", "unsyncedlyrics", "lyric", *MP4_LYRICS_KEYS):
+    for key, value in audio.tags.items():
         try:
-            for text in iter_tag_text_values(audio.tags.get(key)):
-                if text_has_square_bracket_content(text):
-                    return True
+            key_text = str(key).casefold()
+            if key in MP4_LYRICS_KEYS or ("lyric" in key_text and "lyricist" not in key_text):
+                for text in iter_tag_text_values(value):
+                    if text_has_square_bracket_content(text):
+                        return True
         except Exception:
             pass
 
@@ -610,11 +752,42 @@ def audio_lyrics_need_square_bracket_cleanup(path):
 
 
 def pending_finished_test_files():
-    return [
-        path
-        for path in sorted(snapshot_finished_files())
-        if is_supported_audio_file(path)
-    ]
+    processed_history = load_test_processed_history()
+    pending = []
+    skipped_complete = 0
+    skipped_previously_attempted_no_lyrics = 0
+
+    for path in sorted(snapshot_finished_files()):
+        if not is_supported_audio_file(path):
+            continue
+
+        missing_title_or_artist = audio_missing_title_or_artist(path)
+        has_lyrics = audio_has_lyrics(path)
+        needs_lyrics_cleanup = audio_lyrics_need_square_bracket_cleanup(path) if has_lyrics else False
+        processed_key = test_processed_history_key(path)
+
+        if missing_title_or_artist or needs_lyrics_cleanup:
+            pending.append(path)
+            continue
+
+        if not has_lyrics:
+            if processed_key in processed_history:
+                skipped_previously_attempted_no_lyrics += 1
+            else:
+                pending.append(path)
+            continue
+
+        skipped_complete += 1
+
+    if skipped_complete or skipped_previously_attempted_no_lyrics:
+        log("")
+        log(
+            "Finished/ pre-scan skipped "
+            f"{skipped_complete} complete file(s) and "
+            f"{skipped_previously_attempted_no_lyrics} previously attempted no-lyrics file(s)."
+        )
+
+    return pending
 
 
 def pending_finished_drive_upload_files():

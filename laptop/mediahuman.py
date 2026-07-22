@@ -3,6 +3,7 @@ import json
 import time
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
+from youtube_url_tag import tag_downloaded_mp3_with_youtube_url, youtube_watch_url
 
 # ==================================================================
 # CONFIGURATION
@@ -115,13 +116,22 @@ def try_download_video(video_id, max_attempts=3, use_cookies=False):
         **make_common_ydl_opts(use_cookies=use_cookies, video_download=True),
     }
 
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    video_url = youtube_watch_url(video_id)
 
     for attempt in range(1, max_attempts + 1):
         try:
+            started_at = time.time()
             ydl_opts_no_ignore = {**ydl_opts_dl, "ignoreerrors": False}
             with YoutubeDL(ydl_opts_no_ignore) as ydl:
-                ydl.download([video_url])
+                info = ydl.extract_info(video_url, download=True)
+                tag_downloaded_mp3_with_youtube_url(
+                    info=info,
+                    ydl=ydl,
+                    youtube_url=video_url,
+                    download_dir=DOWNLOAD_DIR,
+                    started_at=started_at,
+                    video_id=video_id,
+                )
             return True
 
         except DownloadError as e:

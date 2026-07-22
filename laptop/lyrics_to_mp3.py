@@ -27,7 +27,7 @@ GENIUS_API_URL = "https://api.genius.com"
 GENIUS_API_TOKEN = os.getenv("GENIUS_API_TOKEN")
 
 if not XAI_API_KEY:
-    raise SystemExit("XAI_API_KEY is not set in the environment.")
+    print("XAI_API_KEY is not set. Existing-tag skips still work; AI-only tag filling will use fallbacks.")
 
 if not os.path.isdir(MP3_FOLDER):
     raise SystemExit(f"Folder not found: {MP3_FOLDER}")
@@ -143,6 +143,9 @@ def parse_retry_after_seconds(resp: requests.Response) -> float:
 
 
 def xai_chat(messages, max_tokens=220, temperature=0, timeout=60, max_retries=8):
+    if not XAI_API_KEY:
+        raise RuntimeError("XAI_API_KEY is not set in the environment.")
+
     payload = {
         "model": XAI_MODEL,
         "messages": messages,
@@ -507,9 +510,13 @@ for idx, original_file_name in enumerate(file_names, start=1):
     title = existing_title
     artist = existing_artist or "Unknown"
     parsed_by_ai = False
+    did_expensive_lookup = False
+    tags_need_update = False
 
     # Only use AI to fill missing basic tags
     if not title or not existing_artist:
+        did_expensive_lookup = True
+        tags_need_update = True
         cleaned_name_for_ai = clean_input_filename(original_file_name)
         filename_fallback_title = clean_filename_fallback_title(original_file_name)
 
@@ -545,21 +552,21 @@ for idx, original_file_name in enumerate(file_names, start=1):
             if not artist:
                 artist = "Unknown"
 
-    # Write tags if we have something useful
-    try:
-        write_tags(file_path, title=title, artist=artist, album=existing_album)
-        if parsed_by_ai:
+    if tags_need_update:
+        try:
+            write_tags(file_path, title=title, artist=artist, album=existing_album)
             print(f"  Updated tags -> title='{title}' | artist='{artist}'")
-        else:
-            print(f"  Kept existing tags -> title='{title}' | artist='{artist}'")
-    except Exception as e:
-        print(f"  Error updating tags: {e}")
+        except Exception as e:
+            print(f"  Error updating tags: {e}")
+    else:
+        print(f"  Skipped tag update: existing title='{title}' | artist='{artist}'")
 
     # Skip lyrics if already present
     lyrics_found = already_has_lyrics
     if already_has_lyrics:
         print("  Skipped lyrics: already present")
     else:
+        did_expensive_lookup = True
         try:
             duration = read_duration_seconds(file_path)
             lyrics = get_lyrics_from_genius(title=title, artist=artist)
@@ -582,7 +589,8 @@ for idx, original_file_name in enumerate(file_names, start=1):
         "lyrics_skipped_existing": already_has_lyrics,
     })
 
-    time.sleep(0.4)
+    if did_expensive_lookup:
+        time.sleep(0.4)
 
 print("\nDone.")
 print(json.dumps(all_metadata, ensure_ascii=False, indent=2))

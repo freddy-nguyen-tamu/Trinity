@@ -11,6 +11,7 @@ from xml.etree import ElementTree
 from urllib.parse import parse_qs, urlparse
 
 from yt_dlp import YoutubeDL
+from yt_dlp.networking import Request as YtDlpRequest
 
 from mutagen import File
 from mutagen.mp3 import MP3
@@ -22,10 +23,17 @@ from mutagen.aiff import AIFF
 from mutagen.oggvorbis import OggVorbis
 from mutagen.oggopus import OggOpus
 
+from lyrics_language import (
+    detect_text_language,
+    infer_expected_language,
+    normalize_language_code,
+    validate_subtitle_language,
+)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_AUDIO_FOLDER = os.path.join(BASE_DIR, "_working_downloads")
 LYRICS_NOT_FOUND_HISTORY_PATH = os.path.join(BASE_DIR, "_lyrics_not_found_history.json")
-LYRICS_NOT_FOUND_HISTORY_VERSION = 1
+LYRICS_NOT_FOUND_HISTORY_VERSION = 2
 
 
 def parse_args():
@@ -48,6 +56,27 @@ def parse_args():
         "--retry-missing-lyrics",
         action="store_true",
         help="Ignore the not-found lyrics cache and try LRCLIB/subtitles again.",
+    )
+    parser.add_argument(
+        "--preferred-language",
+        default="",
+        help=(
+            "Optional ISO 639-1 lyrics language override, for example vi, en, "
+            "ko, ja, zh, or th."
+        ),
+    )
+    parser.add_argument(
+        "--disable-youtube-subtitles",
+        action="store_true",
+        help="Use LRCLIB/Genius only and never request YouTube subtitles.",
+    )
+    parser.add_argument(
+        "--recheck-existing-lyrics",
+        action="store_true",
+        help=(
+            "Resolve lyrics again even when a lyrics tag already exists. "
+            "Existing lyrics are left unchanged when no safer replacement is found."
+        ),
     )
     return parser.parse_args()
 
@@ -78,6 +107,7 @@ GENIUS_API_TOKEN = os.getenv("GENIUS_API_TOKEN")
 
 YOUTUBE_WATCH_URL = "https://www.youtube.com/watch?v={video_id}"
 SUBTITLE_INFO_CACHE = {}
+YOUTUBE_SUBTITLES_DISABLED_FOR_RUN = False
 
 SUPPORTED_EXTENSIONS = {
     ".mp3",
@@ -93,13 +123,10 @@ SUPPORTED_EXTENSIONS = {
     ".aac",
 }
 
-if not GROQ_API_KEYS:
-    raise SystemExit(
-        "No Groq API keys found. Set GROQ_API_KEY and optionally "
-        "GROQ_API_KEY1 through GROQ_API_KEY9 in the environment."
-    )
-
-print(f"Loaded {len(GROQ_API_KEYS)} Groq API key(s): " + ", ".join(name for name, _ in GROQ_API_KEYS))
+if GROQ_API_KEYS:
+    print(f"Loaded {len(GROQ_API_KEYS)} Groq API key(s): " + ", ".join(name for name, _ in GROQ_API_KEYS))
+else:
+    print("No Groq API keys found. Existing-tag skips still work; Groq-only steps will use fallbacks.")
 
 
 def is_supported_audio_path(path):
@@ -276,7 +303,11 @@ def extract_json_object(text: str):
             pass
 
     repaired = t
-    repaired = repaired.replace("“", '"').replace("”", '"').replace("’", "'")
+    repaired = (
+        repaired.replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2019", "'")
+    )
     repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
 
     start_obj = repaired.find("{")
@@ -337,6 +368,11 @@ def parse_retry_after_seconds(resp: requests.Response) -> float:
 
 
 def groq_chat(messages, max_tokens=220, temperature=0, timeout=60, max_retries=8, json_mode=True):
+    if not GROQ_API_KEYS:
+        raise RuntimeError(
+            "No Groq API keys are available. Set GROQ_API_KEY or GROQ_API_KEY1 through GROQ_API_KEY9."
+        )
+
     payload = {
         "model": GROQ_MODEL,
         "messages": messages,
@@ -480,8 +516,20 @@ def call_and_parse(messages, max_tokens=220, json_mode=True, temperature=0):
 def looks_bad(text: str) -> bool:
     if not text:
         return True
-    bad_markers = ["�", "CÑA", "TÙN", "\\u", "???"]
-    return any(x in text for x in bad_markers)
+    bad_markers = ["\ufffd", "\\u", "???"]
+    return any(marker in text for marker in bad_markers)
+
+
+YOUTUBE_ID_ONLY_RE = re.compile(r"^\[?[A-Za-z0-9_-]{11}\]?$")
+
+
+def artist_is_invalid(artist):
+    artist = norm_text(artist)
+    if not artist or artist.casefold() == "unknown":
+        return True
+    if YOUTUBE_ID_ONLY_RE.fullmatch(artist):
+        return True
+    return looks_bad(artist)
 
 
 def is_file_busy_error(error):
@@ -556,12 +604,72 @@ def tag_value_has_text(value) -> bool:
 def first_tag_text(value):
     if isinstance(value, list):
         for item in value:
-            if str(item).strip():
-                return str(item).strip()
+            text = tag_item_text(item)
+            if text:
+                return text
         return None
-    if value and str(value).strip():
-        return str(value).strip()
+    text = tag_item_text(value)
+    if text:
+        return text
     return None
+
+
+def tag_item_text(item):
+    if item is None:
+        return ""
+
+    if isinstance(item, bytes):
+        for encoding in ("utf-8-sig", "utf-16", "latin-1"):
+            try:
+                text = item.decode(encoding).strip("\ufeff\x00").strip()
+            except Exception:
+                continue
+            if text:
+                return text
+        return ""
+
+    data = getattr(item, "data", None)
+    if isinstance(data, bytes):
+        return tag_item_text(data)
+
+    text = str(item).strip()
+    return text
+
+
+def tag_key_looks_like_lyrics(key):
+    lowered = str(key).casefold()
+    return "lyric" in lowered and "lyricist" not in lowered
+
+
+def lyrics_text_looks_usable(text):
+    text = str(text or "").strip()
+    if not text:
+        return False
+
+    letters = sum(1 for char in text if char.isalpha())
+    nonempty_lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+
+    if letters < 120:
+        return False
+    if len(nonempty_lines) < 5:
+        return False
+
+    folded = text.casefold()
+    obvious_non_lyrics = (
+        "subscribe to",
+        "http://",
+        "https://",
+        "www.",
+        "all rights reserved",
+    )
+    if any(marker in folded for marker in obvious_non_lyrics):
+        return False
+
+    return True
 
 
 def first_mp4_lyrics(tags):
@@ -572,6 +680,12 @@ def first_mp4_lyrics(tags):
         text = first_tag_text(tags.get(key))
         if text:
             return text
+
+    for key, value in tags.items():
+        if tag_key_looks_like_lyrics(key):
+            text = first_tag_text(value)
+            if text:
+                return text
 
     return None
 
@@ -593,13 +707,43 @@ def first_id3_lyrics(tags):
         return None
 
     for frame in tags.getall("USLT"):
-        text = frame.text
-        if isinstance(text, list):
-            text = " ".join(str(x) for x in text)
-        if str(text).strip():
-            return str(text).strip()
+        text = first_id3_frame_text(frame)
+        if text:
+            return text
+
+    for frame in tags.getall("SYLT"):
+        text = first_id3_frame_text(frame)
+        if text:
+            return text
+
+    for frame in tags.getall("TXXX"):
+        if tag_key_looks_like_lyrics(getattr(frame, "desc", "")):
+            text = first_id3_frame_text(frame)
+            if text:
+                return text
+
+    for frame in tags.getall("COMM"):
+        if tag_key_looks_like_lyrics(getattr(frame, "desc", "")):
+            text = first_id3_frame_text(frame)
+            if text:
+                return text
 
     return None
+
+
+def first_id3_frame_text(frame):
+    value = getattr(frame, "text", None)
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, tuple):
+                item = item[0] if item else ""
+            text = tag_item_text(item)
+            if text:
+                parts.append(text)
+        return " ".join(parts).strip()
+
+    return tag_item_text(value)
 
 
 def get_existing_audio_metadata(file_path: str):
@@ -631,10 +775,16 @@ def get_existing_audio_metadata(file_path: str):
             title = _first_tag_value(tags.get("title"))
             artist = _first_tag_value(tags.get("artist"))
             album = _first_tag_value(tags.get("album"))
-            for key in ("lyrics", "unsyncedlyrics", "lyric"):
+            for key in ("lyrics", "unsyncedlyrics", "syncedlyrics", "lyric"):
                 lyrics = first_tag_text(tags.get(key))
                 if lyrics:
                     break
+            if not lyrics:
+                for key, value in tags.items():
+                    if tag_key_looks_like_lyrics(key):
+                        lyrics = first_tag_text(value)
+                        if lyrics:
+                            break
 
         elif isinstance(audio, (MP3, WAVE, AIFF)):
             try:
@@ -656,6 +806,16 @@ def get_existing_audio_metadata(file_path: str):
             title = _first_tag_value(tags.get("title"))
             artist = _first_tag_value(tags.get("artist"))
             album = _first_tag_value(tags.get("album"))
+            for key in ("lyrics", "unsyncedlyrics", "syncedlyrics", "lyric"):
+                lyrics = first_tag_text(tags.get(key))
+                if lyrics:
+                    break
+            if not lyrics:
+                for key, value in tags.items():
+                    if tag_key_looks_like_lyrics(key):
+                        lyrics = first_tag_text(value)
+                        if lyrics:
+                            break
 
     except Exception:
         pass
@@ -665,7 +825,7 @@ def get_existing_audio_metadata(file_path: str):
         "artist": artist,
         "album": album,
         "lyrics": lyrics,
-        "has_lyrics": bool(lyrics and str(lyrics).strip()),
+        "has_lyrics": lyrics_text_looks_usable(lyrics),
     }
 
 
@@ -696,9 +856,9 @@ def get_existing_basic_tags(file_path: str):
             return title, artist, album
 
         if isinstance(audio, MP4):
-            title = _first_tag_value(audio.tags.get("©nam") if audio.tags else "")
-            artist = _first_tag_value(audio.tags.get("©ART") if audio.tags else "")
-            album = _first_tag_value(audio.tags.get("©alb") if audio.tags else "")
+            title = _first_tag_value(audio.tags.get("\xa9nam") if audio.tags else "")
+            artist = _first_tag_value(audio.tags.get("\xa9ART") if audio.tags else "")
+            album = _first_tag_value(audio.tags.get("\xa9alb") if audio.tags else "")
 
         elif isinstance(audio, (FLAC, OggVorbis, OggOpus)):
             title = _first_tag_value(audio.tags.get("title") if audio.tags else "")
@@ -739,7 +899,175 @@ def _extract_lyrics_from_item(item):
     return None
 
 
-def _lrclib_get(title: str, artist: str = "", duration=None, album: str = ""):
+VERSION_NOISE_RE = re.compile(
+    r"\b("
+    r"official|video|audio|lyrics?|visualizer|mv|hd|4k|"
+    r"remix|cover|live|acoustic|sped\s*up|slowed|nightcore|"
+    r"prod(?:uced)?\.?\s*by"
+    r")\b",
+    flags=re.IGNORECASE,
+)
+
+
+def fold_match_text(value):
+    value = unicodedata.normalize("NFKD", norm_text(value).casefold())
+    value = "".join(
+        char
+        for char in value
+        if unicodedata.category(char) != "Mn"
+    )
+    value = VERSION_NOISE_RE.sub(" ", value)
+    value = re.sub(r"\b(feat|ft|featuring)\b", " ", value)
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def text_match_ratio(left, right):
+    left = fold_match_text(left)
+    right = fold_match_text(right)
+    if not left or not right:
+        return 0.0
+    return difflib.SequenceMatcher(None, left, right).ratio()
+
+
+def expected_title_token_overlap(expected, actual):
+    expected_tokens = set(fold_match_text(expected).split())
+    actual_tokens = set(fold_match_text(actual).split())
+    if not expected_tokens or not actual_tokens:
+        return 0.0
+    return len(expected_tokens & actual_tokens) / len(expected_tokens)
+
+
+def artist_token_overlap(expected, actual):
+    expected_tokens = set(fold_match_text(expected).split())
+    actual_tokens = set(fold_match_text(actual).split())
+    if not expected_tokens or not actual_tokens:
+        return 0.0
+    return len(expected_tokens & actual_tokens) / len(expected_tokens)
+
+
+def genius_highlight_properties(hit):
+    properties = []
+    for highlight in hit.get("highlights") or []:
+        if not isinstance(highlight, dict):
+            continue
+        for key in ("property", "field", "path"):
+            value = str(highlight.get(key) or "").strip().casefold()
+            if value:
+                properties.append(value)
+    return properties
+
+
+def genius_hit_is_lyrics_only_match(hit):
+    properties = genius_highlight_properties(hit)
+    if not properties:
+        return False
+
+    has_title_match = any(
+        "title" in value
+        or value == "name"
+        or value.endswith(".name")
+        for value in properties
+    )
+    has_lyric_match = any(
+        "lyric" in value
+        or "body" in value
+        for value in properties
+    )
+    return has_lyric_match and not has_title_match
+
+
+def genius_title_match_score(expected_title, result):
+    title_values = [
+        result.get("title"),
+        result.get("title_with_featured"),
+        result.get("full_title"),
+        result.get("name"),
+    ]
+    best_score = 0.0
+    best_overlap = 0.0
+    best_value = ""
+
+    for value in title_values:
+        value = norm_text(value or "")
+        if not value:
+            continue
+
+        score = text_match_ratio(expected_title, value)
+        overlap = expected_title_token_overlap(expected_title, value)
+        if (score, overlap) > (best_score, best_overlap):
+            best_score = score
+            best_overlap = overlap
+            best_value = value
+
+    return best_score, best_overlap, best_value
+
+
+def score_lrclib_item(
+    item,
+    expected_title,
+    expected_artist,
+    expected_duration=None,
+    expected_album="",
+):
+    item_title = item.get("trackName") or ""
+    item_artist = item.get("artistName") or ""
+    item_album = item.get("albumName") or ""
+
+    title_score = text_match_ratio(expected_title, item_title)
+    artist_score = artist_token_overlap(expected_artist, item_artist)
+    album_score = (
+        text_match_ratio(expected_album, item_album)
+        if expected_album and item_album
+        else 0.5
+    )
+
+    if title_score < 0.82:
+        return None
+
+    if (
+        expected_artist
+        and expected_artist.casefold() != "unknown"
+        and artist_score < 0.50
+    ):
+        return None
+
+    duration_score = 0.5
+    item_duration = item.get("duration")
+
+    if expected_duration and item_duration:
+        try:
+            duration_difference = abs(
+                float(expected_duration) - float(item_duration)
+            )
+        except (TypeError, ValueError):
+            duration_difference = None
+
+        if duration_difference is not None:
+            if duration_difference > 20:
+                return None
+            duration_score = max(
+                0.0,
+                1.0 - duration_difference / 20.0,
+            )
+
+    total = (
+        0.55 * title_score
+        + 0.25 * artist_score
+        + 0.15 * duration_score
+        + 0.05 * album_score
+    )
+
+    return {
+        "total": total,
+        "title": title_score,
+        "artist": artist_score,
+        "duration": duration_score,
+        "album": album_score,
+    }
+
+
+def _lrclib_get(title, artist="", duration=None, album=""):
     params = {"track_name": title}
 
     if artist and artist != "Unknown":
@@ -750,57 +1078,114 @@ def _lrclib_get(title: str, artist: str = "", duration=None, album: str = ""):
         params["album_name"] = album
 
     try:
-        resp = requests.get(LRCLIB_GET_URL, params=params, headers=lyrics_headers, timeout=20)
-        if resp.status_code == 200:
-            return _extract_lyrics_from_item(resp.json())
-    except Exception:
-        pass
+        response = requests.get(
+            LRCLIB_GET_URL,
+            params=params,
+            headers=lyrics_headers,
+            timeout=20,
+        )
+        if response.status_code != 200:
+            return None
+
+        item = response.json()
+        score = score_lrclib_item(
+            item=item,
+            expected_title=title,
+            expected_artist=artist,
+            expected_duration=duration,
+            expected_album=album,
+        )
+        if not score or score["total"] < 0.78:
+            print("  LRCLIB exact response failed identity validation.")
+            return None
+
+        lyrics = _extract_lyrics_from_item(item)
+        if lyrics:
+            print(
+                "  LRCLIB exact match accepted: "
+                f"score={score['total']:.3f}, "
+                f"title={score['title']:.3f}, "
+                f"artist={score['artist']:.3f}"
+            )
+            return lyrics
+
+    except Exception as error:
+        print(f"  LRCLIB exact lookup error: {error}")
 
     return None
 
 
-def _lrclib_search(query: str, expected_title: str = "", expected_artist: str = ""):
+def _lrclib_search(
+    query,
+    expected_title="",
+    expected_artist="",
+    expected_duration=None,
+    expected_album="",
+):
     try:
-        resp = requests.get(LRCLIB_SEARCH_URL, params={"q": query}, headers=lyrics_headers, timeout=20)
-        if resp.status_code != 200:
+        response = requests.get(
+            LRCLIB_SEARCH_URL,
+            params={"q": query},
+            headers=lyrics_headers,
+            timeout=20,
+        )
+        if response.status_code != 200:
             return None
 
-        data = resp.json()
+        data = response.json()
         if not isinstance(data, list) or not data:
             return None
 
-        normalized_title = norm_text(expected_title).lower()
-        normalized_artist = norm_text(expected_artist).lower()
-
-        if normalized_title and normalized_artist and normalized_artist != "unknown":
-            for item in data:
-                item_title = norm_text(item.get("trackName", "")).lower()
-                item_artist = norm_text(item.get("artistName", "")).lower()
-                if item_title == normalized_title and item_artist == normalized_artist:
-                    lyrics = _extract_lyrics_from_item(item)
-                    if lyrics:
-                        return lyrics
-
-        if normalized_title:
-            for item in data:
-                item_title = norm_text(item.get("trackName", "")).lower()
-                if item_title == normalized_title:
-                    lyrics = _extract_lyrics_from_item(item)
-                    if lyrics:
-                        return lyrics
-
+        ranked = []
         for item in data:
             lyrics = _extract_lyrics_from_item(item)
-            if lyrics:
-                return lyrics
+            if not lyrics:
+                continue
 
-    except Exception:
-        pass
+            score = score_lrclib_item(
+                item=item,
+                expected_title=expected_title,
+                expected_artist=expected_artist,
+                expected_duration=expected_duration,
+                expected_album=expected_album,
+            )
+            if not score:
+                continue
+
+            ranked.append((score["total"], score, item, lyrics))
+
+        ranked.sort(key=lambda row: row[0], reverse=True)
+
+        if not ranked:
+            return None
+
+        best_total, best_score, best_item, best_lyrics = ranked[0]
+        second_total = ranked[1][0] if len(ranked) > 1 else 0.0
+
+        if best_total < 0.78:
+            print(f"  LRCLIB search best score too low: {best_total:.3f}")
+            return None
+
+        if len(ranked) > 1 and best_total - second_total < 0.06:
+            print("  LRCLIB search is ambiguous; top candidates are too close.")
+            return None
+
+        print(
+            "  LRCLIB search match accepted: "
+            f"title='{best_item.get('trackName')}', "
+            f"artist='{best_item.get('artistName')}', "
+            f"score={best_total:.3f}"
+        )
+        return best_lyrics
+
+    except Exception as error:
+        print(f"  LRCLIB search error: {error}")
+        return None
 
     return None
 
 
-def get_lyrics_from_lrclib(title: str, artist: str, duration=None, album=""):
+def get_lyrics_from_lrclib(title, artist, duration=None, album=""):
     if not title:
         return None
 
@@ -813,36 +1198,38 @@ def get_lyrics_from_lrclib(title: str, artist: str, duration=None, album=""):
         if lyrics:
             return lyrics
 
-    lyrics = _lrclib_get(title=title, artist="", duration=duration, album=album)
-    if lyrics:
-        return lyrics
-
-    if artist and artist != "Unknown":
-        combined_query = f"{artist} {title}".strip()
-        lyrics = _lrclib_search(
-            query=combined_query,
-            expected_title=title,
-            expected_artist=artist,
-        )
-        if lyrics:
-            return lyrics
-
-    lyrics = _lrclib_search(
-        query=title,
-        expected_title=title,
-        expected_artist="",
+    query = (
+        f"{artist} {title}".strip()
+        if artist and artist != "Unknown"
+        else title
     )
-    if lyrics:
-        return lyrics
+    if artist and artist != "Unknown":
+        expected_artist = artist
+    else:
+        expected_artist = ""
 
-    return None
+    return _lrclib_search(
+        query=query,
+        expected_title=title,
+        expected_artist=expected_artist,
+        expected_duration=duration,
+        expected_album=album,
+    )
 
 
-def get_lyrics_from_genius(title: str, artist: str):
+def get_lyrics_from_genius(title: str, artist: str, require_artist=True):
     if not title or not GENIUS_API_TOKEN:
         return None
 
-    query = f"{artist} {title}".strip() if artist and artist != "Unknown" else title
+    title = norm_text(title)
+    artist = norm_text(artist)
+    require_artist = bool(
+        require_artist
+        and artist
+        and artist.casefold() != "unknown"
+    )
+    query = f"{artist} {title}".strip() if require_artist else title
+    search_label = "title+artist" if require_artist else "title-only"
     headers = {"Authorization": f"Bearer {GENIUS_API_TOKEN}"}
 
     try:
@@ -860,27 +1247,83 @@ def get_lyrics_from_genius(title: str, artist: str):
         if not hits:
             return None
 
-        best_hit = None
-        title_lower = title.lower()
-        artist_lower = artist.lower() if artist else ""
-
+        ranked_hits = []
         for hit in hits:
-            result = hit.get("result", {})
+            result = hit.get("result") or {}
             if not result:
                 continue
-            r_title = result.get("title", "").lower()
-            r_artist = (
-                result.get("primary_artist", {}).get("name", "") or ""
-            ).lower()
 
-            if r_title == title_lower and (
-                not artist_lower or r_artist == artist_lower or artist_lower == "unknown"
-            ):
-                best_hit = result
-                break
+            if genius_hit_is_lyrics_only_match(hit):
+                result_title = result.get("title") or result.get("full_title") or ""
+                print(
+                    "  Genius hit rejected because the search matched lyrics, "
+                    f"not the song title: {result_title}"
+                )
+                continue
 
-        if not best_hit:
-            best_hit = hits[0].get("result", {})
+            result_artist = (
+                result.get("artist_names")
+                or result.get("primary_artist", {}).get("name")
+                or ""
+            )
+
+            title_score, title_overlap, matched_title = genius_title_match_score(
+                title,
+                result,
+            )
+            artist_score = (
+                artist_token_overlap(artist, result_artist)
+                if require_artist
+                else 0.0
+            )
+
+            minimum_title_score = 0.84 if require_artist else 0.90
+            if title_score < minimum_title_score:
+                continue
+            if title_overlap < 0.80:
+                print(
+                    "  Genius hit rejected because the title/name field did "
+                    f"not contain the expected song title: {matched_title}"
+                )
+                continue
+
+            if require_artist and artist_score < 0.45:
+                continue
+
+            total = (
+                0.70 * title_score + 0.30 * artist_score
+                if require_artist
+                else title_score
+            )
+            ranked_hits.append((total, result))
+
+        ranked_hits.sort(key=lambda row: row[0], reverse=True)
+
+        if not ranked_hits:
+            print(f"  Genius returned no identity-safe {search_label} hit.")
+            return None
+
+        best_total, best_hit = ranked_hits[0]
+
+        minimum_total_score = 0.78 if require_artist else 0.90
+        if best_total < minimum_total_score:
+            print(
+                f"  Genius {search_label} best match score too low: "
+                f"{best_total:.3f}"
+            )
+            return None
+
+        if (
+            len(ranked_hits) > 1
+            and best_total - ranked_hits[1][0] < 0.06
+        ):
+            print(f"  Genius {search_label} results are ambiguous; refusing to choose.")
+            return None
+
+        print(
+            f"  Genius {search_label} match accepted "
+            f"with score={best_total:.3f}"
+        )
 
         song_url = best_hit.get("url")
         if not song_url:
@@ -987,7 +1430,7 @@ def parse_youtube_art_track_description(description):
 
     for raw_line in description.splitlines():
         line = norm_text(raw_line)
-        if not line or " · " not in line:
+        if not line or " ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· " not in line:
             continue
 
         lowered = line.lower()
@@ -995,10 +1438,10 @@ def parse_youtube_art_track_description(description):
             continue
         if lowered.startswith(("composer", "lyricist", "vocalist", "producer", "writer")):
             continue
-        if line.startswith(("℗", "©")):
+        if line.startswith(("ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â", "ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©")):
             continue
 
-        title_part, artist_part = line.split(" · ", 1)
+        title_part, artist_part = line.split(" ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· ", 1)
         title = norm_text(title_part)
         artist = clean_topic_artist_name(artist_part)
         if title and artist:
@@ -1105,21 +1548,36 @@ def iter_subtitle_candidates(info, automatic=False):
         chosen = choose_subtitle_format(formats)
         if not chosen:
             continue
+
         display_name = subtitle_track_display_name(language_code, chosen)
         if is_live_chat_subtitle(language_code, display_name):
             continue
 
         source_language, translated_to = subtitle_url_hints(chosen.get("url"))
+        if translated_to:
+            continue
+
+        normalized_track_language = normalize_language_code(
+            source_language or language_code
+        )
+        if not normalized_track_language:
+            continue
 
         yield {
             "language_code": language_code,
+            "normalized_language_code": normalized_track_language,
             "name": display_name,
             "url": chosen.get("url"),
             "ext": str(chosen.get("ext", "")).lower(),
             "automatic": automatic,
             "source_language_code": source_language,
             "translated_to_language_code": translated_to,
-            "is_translated": bool(translated_to),
+            "is_translated": False,
+            "http_headers": dict(
+                chosen.get("http_headers")
+                or info.get("http_headers")
+                or {}
+            ),
         }
 
 
@@ -1132,7 +1590,7 @@ def clean_subtitle_lines(lines):
         line = re.sub(r"<[^>]+>", " ", line)
         line = re.sub(r"\{\\.*?\}", " ", line)
         line = remove_square_bracket_content(line)
-        line = re.sub(r"♪", " ", line)
+        line = re.sub(r"[\u266a\u266b]", " ", line)
         line = norm_text(line)
 
         if not line:
@@ -1215,284 +1673,203 @@ def parse_subtitle_text(text, ext):
 
 
 def download_subtitle_text(candidate):
+    global YOUTUBE_SUBTITLES_DISABLED_FOR_RUN
+
     candidate.pop("download_error_status", None)
-    try:
-        response = requests.get(candidate["url"], timeout=30)
-        response.raise_for_status()
-    except requests.HTTPError as e:
-        status = e.response.status_code if e.response is not None else None
-        candidate["download_error_status"] = status
-        print(f"  Could not download subtitle {candidate.get('name')}: {e}")
-        return None
-    except Exception as e:
-        candidate["download_error_status"] = None
-        print(f"  Could not download subtitle {candidate.get('name')}: {e}")
+
+    if YOUTUBE_SUBTITLES_DISABLED_FOR_RUN:
+        print("  YouTube subtitles are disabled for the rest of this run.")
         return None
 
-    parsed = parse_subtitle_text(response.text, candidate.get("ext"))
-    if not parsed:
-        print(f"  Subtitle {candidate.get('name')} was empty after parsing.")
+    url = candidate.get("url")
+    if not url:
         return None
 
-    return parsed
+    headers = dict(candidate.get("http_headers") or {})
+    last_error = None
 
+    for use_cookies in (False, True):
+        try:
+            opts = youtube_extract_opts(use_cookies=use_cookies)
+            opts["sleep_interval_requests"] = 1
+            opts["sleep_interval_subtitles"] = 1
 
-def groq_same_language(video_title, subtitle_text, candidate):
-    sample = subtitle_text[:2500]
-    prompt = {
-        "video_title": video_title,
-        "subtitle_language_code": candidate.get("language_code"),
-        "subtitle_track_name": candidate.get("name"),
-        "subtitle_sample": sample,
-    }
+            with YoutubeDL(opts) as ydl:
+                request = YtDlpRequest(url, headers=headers)
+                response = ydl.urlopen(request)
+                try:
+                    raw = response.read()
+                finally:
+                    close_response = getattr(response, "close", None)
+                    if close_response:
+                        close_response()
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You detect language match. Return JSON only. "
-                "same_language must be true only when the YouTube video title and "
-                "subtitle sample are primarily the same human language."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                "Are the video title and subtitle sample primarily the same language?\n\n"
-                f"{json.dumps(prompt, ensure_ascii=False)}\n\n"
-                "Return exactly this JSON object:\n"
-                '{ "same_language": true, "title_language": "language", '
-                '"subtitle_language": "language", "confidence": 0.0, "reason": "short reason" }'
-            ),
-        },
-    ]
+            text = raw.decode("utf-8-sig", errors="replace")
+            parsed = parse_subtitle_text(text, candidate.get("ext"))
 
-    try:
-        result = call_and_parse(messages, max_tokens=180, json_mode=True)
-    except Exception as e:
-        print(f"  Groq subtitle language check failed for {candidate.get('name')}: {e}")
-        return False
+            if not parsed:
+                print(f"  Subtitle {candidate.get('name')} was empty after parsing.")
+                return None
 
-    same_language = bool(result.get("same_language"))
-    title_language = result.get("title_language") or "unknown"
-    subtitle_language = result.get("subtitle_language") or "unknown"
-    confidence = result.get("confidence")
+            return parsed
+
+        except Exception as error:
+            last_error = error
+            error_text = str(error)
+            status = getattr(error, "status", None)
+
+            if status is None:
+                response = getattr(error, "response", None)
+                status = getattr(response, "status", None)
+                if status is None:
+                    status = getattr(response, "status_code", None)
+
+            if status == 429 or "429" in error_text:
+                candidate["download_error_status"] = 429
+                YOUTUBE_SUBTITLES_DISABLED_FOR_RUN = True
+                print(
+                    "  YouTube subtitle request returned 429. "
+                    "YouTube subtitles are disabled for the rest of this run; "
+                    "the resolver will use LRCLIB/Genius or leave lyrics blank."
+                )
+                return None
+
+            if status == 403 or "403" in error_text:
+                candidate["download_error_status"] = 403
+            else:
+                candidate["download_error_status"] = status
+
     print(
-        "  Subtitle language check: "
-        f"title={title_language}, subtitle={subtitle_language}, "
-        f"same={same_language}, confidence={confidence}"
+        f"  Could not download subtitle {candidate.get('name')} "
+        f"through yt-dlp: {last_error}"
     )
-    return same_language
+    return None
 
 
-def subtitle_candidate_kind(candidate):
-    if not candidate.get("automatic"):
-        return "manual_human"
-    if candidate.get("is_translated"):
-        return "automatic_translated"
-    return "automatic_original"
 
+def get_lyrics_from_youtube_subtitles(
+    video_id,
+    video_title,
+    title="",
+    artist="",
+    library_lyrics=None,
+    explicit_language="",
+):
+    if ARGS.disable_youtube_subtitles:
+        print("  YouTube subtitle lookup disabled by command-line option.")
+        return None, None
 
-def automatic_original_language_from_metadata(candidate):
-    if subtitle_candidate_kind(candidate) != "automatic_original":
-        return False
+    if YOUTUBE_SUBTITLES_DISABLED_FOR_RUN:
+        print("  YouTube subtitle lookup disabled after an earlier 429.")
+        return None, None
 
-    source_language = subtitle_language_root(candidate.get("source_language_code"))
-    track_language = subtitle_language_root(candidate.get("language_code"))
-
-    if not source_language:
-        return False
-    if not track_language:
-        return True
-    return source_language == track_language
-
-
-def default_subtitle_candidate_order(manual_candidates, automatic_candidates):
-    automatic_order = sorted(
-        automatic_candidates,
-        key=lambda item: (
-            bool(item.get("is_translated")),
-            not automatic_original_language_from_metadata(item),
-            subtitle_language_root(item.get("source_language_code")),
-            subtitle_language_root(item.get("translated_to_language_code")),
-            item.get("language_code") or "",
-            item.get("name") or "",
-        ),
-    )
-    return manual_candidates + automatic_order
-
-
-def truncate_prompt_text(text, max_chars):
-    text = norm_text(str(text or ""))
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars].rstrip()
-
-
-def subtitle_candidate_prompt_line(candidate):
-    fields = [
-        candidate.get("rank_id"),
-        subtitle_candidate_kind(candidate),
-        f"code={candidate.get('language_code') or ''}",
-        f"src={candidate.get('source_language_code') or ''}",
-        f"to={candidate.get('translated_to_language_code') or ''}",
-        f"name={truncate_prompt_text(candidate.get('name'), 42)}",
-    ]
-    return "|".join(str(field or "") for field in fields)
-
-
-def rank_subtitle_candidates_with_groq(video_title, candidates, info):
-    if not candidates:
-        return []
-
-    for index, candidate in enumerate(candidates, start=1):
-        prefix = "auto" if candidate.get("automatic") else "manual"
-        candidate["rank_id"] = f"{prefix}-{index}"
-
-    candidate_lines = "\n".join(subtitle_candidate_prompt_line(candidate) for candidate in candidates)
-
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Rank subtitle tracks for lyric extraction. Return JSON only. "
-                "Prefer title-language matches. Prefer manual_human when it matches. "
-                "Prefer automatic_original over translated tracks when no manual match exists. "
-                "Avoid unrelated translations. Use exact ids."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"title={truncate_prompt_text(video_title, 120)}\n"
-                f"track={truncate_prompt_text(info.get('track'), 120)}\n"
-                f"artist={truncate_prompt_text(info.get('artist') or info.get('artists'), 120)}\n"
-                "candidate format: id|kind|code|src|to|name\n"
-                f"{candidate_lines}\n\n"
-                "Return JSON:\n"
-                '{ "detected_title_language": "language", '
-                '"priority_ids": ["candidate-id-1", "candidate-id-2"], '
-                '"reason": "short reason" }'
-            ),
-        },
-    ]
-
-    try:
-        result = call_and_parse(messages, max_tokens=420, json_mode=True)
-    except Exception as e:
-        print(f"  Groq subtitle priority ranking failed; using safe fallback order: {e}")
-        return candidates
-
-    priority_ids = result.get("priority_ids") or []
-    if isinstance(priority_ids, str):
-        priority_ids = re.split(r"[\s,]+", priority_ids)
-
-    id_map = {candidate["rank_id"]: candidate for candidate in candidates}
-    ranked = []
-    seen = set()
-
-    for candidate_id in priority_ids:
-        candidate_id = str(candidate_id).strip()
-        candidate = id_map.get(candidate_id)
-        if candidate and candidate_id not in seen:
-            ranked.append(candidate)
-            seen.add(candidate_id)
-
-    for candidate in candidates:
-        candidate_id = candidate["rank_id"]
-        if candidate_id not in seen:
-            ranked.append(candidate)
-            seen.add(candidate_id)
-
-    detected = result.get("detected_title_language") or "unknown"
-    preview = ", ".join(candidate.get("name") or candidate.get("rank_id") for candidate in ranked[:8])
-    print(f"  Groq subtitle priority language={detected}; first choices: {preview}")
-    return ranked
-
-
-def get_lyrics_from_youtube_subtitles(video_id, video_title):
     info = get_youtube_info(video_id)
     if not info:
         return None, None
 
-    title_for_language_check = info.get("track") or info.get("title") or video_title or video_id
+    expected_language, expected_source = infer_expected_language(
+        title=title,
+        artist=artist,
+        library_lyrics=library_lyrics or "",
+        explicit_language=explicit_language,
+    )
+
     manual_candidates = list(iter_subtitle_candidates(info, automatic=False))
     automatic_candidates = list(iter_subtitle_candidates(info, automatic=True))
 
     print(
-        f"  YouTube subtitles: {len(manual_candidates)} manual track(s), "
-        f"{len(automatic_candidates)} automatic/translated track(s)."
+        "  Original YouTube subtitles after translation filtering: "
+        f"{len(manual_candidates)} manual, "
+        f"{len(automatic_candidates)} automatic."
     )
 
-    ranked_manual_candidates = rank_subtitle_candidates_with_groq(
-        video_title=title_for_language_check,
-        candidates=manual_candidates,
-        info=info,
-    )
-
-    for index, candidate in enumerate(ranked_manual_candidates, start=1):
-        print(f"  Checking manual subtitle #{index}/{len(ranked_manual_candidates)}: {candidate['name']}")
-        text = download_subtitle_text(candidate)
-        if not text:
-            blocked_status = candidate.get("download_error_status")
-            if blocked_status in {403, 429}:
-                print(
-                    f"  YouTube timedtext returned {blocked_status}; "
-                    "stopping subtitle downloads for this video."
-                )
-                return None, None
-            continue
-        if groq_same_language(title_for_language_check, text, candidate):
-            candidate = dict(candidate)
-            candidate["language_match_approved"] = True
-            return text, candidate
-
-        print(f"  Manual subtitle language did not match title: {candidate['name']}")
-
-    if manual_candidates:
-        print("  No manual subtitle matched the title language; trying automatic subtitles.")
-    else:
-        print("  No manual subtitles available; trying automatic subtitles.")
-
-    ranked_automatic_candidates = default_subtitle_candidate_order([], automatic_candidates)
-    if ranked_automatic_candidates:
+    if expected_language:
         print(
-            "  Automatic subtitle order uses YouTube metadata: original captions first, "
-            "translated tracks later."
+            f"  Expected lyrics language={expected_language} "
+            f"from {expected_source}."
+        )
+        candidates = [
+            candidate
+            for candidate in manual_candidates + automatic_candidates
+            if candidate.get("normalized_language_code") == expected_language
+        ]
+    else:
+        if len(manual_candidates) == 1:
+            candidates = manual_candidates
+            print(
+                "  Expected language is unknown, but exactly one original "
+                "manual subtitle exists; validating its actual text."
+            )
+        elif len(manual_candidates) > 1:
+            print(
+                "  Expected language is unknown and multiple original manual "
+                "subtitle languages exist. Refusing to guess."
+            )
+            return None, None
+        elif len(automatic_candidates) == 1:
+            candidates = automatic_candidates
+            print(
+                "  Expected language is unknown, but exactly one original "
+                "automatic subtitle exists; validating its actual text."
+            )
+        else:
+            print(
+                "  Expected language is unknown and the original subtitle "
+                "choice is ambiguous. Refusing to guess."
+            )
+            return None, None
+
+    candidates.sort(
+        key=lambda candidate: (
+            bool(candidate.get("automatic")),
+            candidate.get("name") or "",
+        )
+    )
+
+    if not candidates:
+        print("  No original subtitle track matches the expected lyrics language.")
+        return None, None
+
+    for index, candidate in enumerate(candidates[:3], start=1):
+        kind = "automatic" if candidate.get("automatic") else "manual"
+        print(
+            f"  Validating {kind} subtitle #{index}: "
+            f"{candidate.get('name')}"
         )
 
-    for index, candidate in enumerate(ranked_automatic_candidates, start=1):
-        kind = subtitle_candidate_kind(candidate).replace("_", " ")
-        print(f"  Checking automatic subtitle #{index}/{len(ranked_automatic_candidates)} ({kind}): {candidate['name']}")
         text = download_subtitle_text(candidate)
         if not text:
-            blocked_status = candidate.get("download_error_status")
-            if blocked_status in {403, 429}:
-                print(
-                    f"  YouTube timedtext returned {blocked_status}; "
-                    "stopping automatic subtitle downloads for this video."
-                )
+            if YOUTUBE_SUBTITLES_DISABLED_FOR_RUN:
                 break
             continue
-        if automatic_original_language_from_metadata(candidate):
-            candidate = dict(candidate)
-            candidate["language_match_approved"] = True
-            candidate["language_match_source"] = "youtube_timedtext_original"
-            source_language = candidate.get("source_language_code") or candidate.get("language_code")
-            print(
-                f"  YouTube marks {candidate['name']} as original automatic captions "
-                f"(source={source_language}); accepting it before translated tracks."
-            )
-            return text, candidate
-        if groq_same_language(title_for_language_check, text, candidate):
-            candidate = dict(candidate)
-            candidate["language_match_approved"] = True
-            return text, candidate
 
-        print(f"  Automatic subtitle language did not match title: {candidate['name']}")
+        validation = validate_subtitle_language(
+            candidate=candidate,
+            subtitle_text=text,
+            expected_language=expected_language,
+        )
 
-    print("  No subtitle track was approved as the same language as the YouTube title.")
+        detected = validation.get("detected") or {}
+        print(
+            "  Local subtitle language validation: "
+            f"approved={validation.get('approved')}, "
+            f"track={candidate.get('normalized_language_code')}, "
+            f"detected={detected.get('code')}, "
+            f"confidence={detected.get('confidence', 0.0):.3f}, "
+            f"margin={detected.get('margin', 0.0):.3f}, "
+            f"reason={validation.get('reason')}"
+        )
 
+        if not validation.get("approved"):
+            continue
+
+        approved_candidate = dict(candidate)
+        approved_candidate["language_validation"] = validation
+        approved_candidate["language_match_approved"] = True
+        approved_candidate["language_match_source"] = "local_lingua_full_text"
+        return text, approved_candidate
+
+    print("  No YouTube subtitle passed deterministic language validation.")
     return None, None
 
 
@@ -1523,58 +1900,88 @@ def lyric_similarity(left, right):
     return max(sequence_ratio, overlap_ratio)
 
 
-def choose_low_similarity_lyrics(library_lyrics, subtitle_lyrics, subtitle_candidate, library_source="lrclib"):
-    source = subtitle_candidate.get("name") if subtitle_candidate else "YouTube subtitles"
-    library_source_label = "Genius" if library_source == "genius" else "LRCLIB"
-    library_lyrics = clean_lyrics_for_tag(library_lyrics)
-    subtitle_lyrics = clean_lyrics_for_tag(subtitle_lyrics)
-
-    if subtitle_candidate and subtitle_candidate_kind(subtitle_candidate) == "manual_human":
-        print(
-            f"  Using human subtitle lyrics from {source} because Groq approved the language "
-            f"match and {library_source_label}/subtitle similarity is below 80%."
-        )
-        return subtitle_lyrics, "youtube_subtitles_manual_language_match"
-
-    if subtitle_candidate and subtitle_candidate.get("automatic") and subtitle_candidate.get("language_match_approved"):
-        print(
-            f"  Using automatic subtitle lyrics from {source} because Groq approved the language "
-            f"match and {library_source_label}/subtitle similarity is below 80%."
-        )
-        return subtitle_lyrics, "youtube_subtitles_automatic_language_match"
-
-    print(
-        f"  Using subtitle lyrics from {source} because {library_source_label} did not match enough "
-        "and the chosen subtitle is not a manual human track."
+def choose_best_lyrics(
+    library_lyrics,
+    subtitle_lyrics,
+    subtitle_candidate,
+    library_source="lrclib",
+    title="",
+    artist="",
+):
+    library_source_label = (
+        "Genius" if library_source == "genius" else "LRCLIB"
     )
-    return subtitle_lyrics, "youtube_subtitles"
+    library_lyrics = clean_lyrics_for_tag(library_lyrics or "")
+    subtitle_lyrics = clean_lyrics_for_tag(subtitle_lyrics or "")
 
+    subtitle_validation = (
+        subtitle_candidate.get("language_validation")
+        if subtitle_candidate
+        else None
+    )
+    subtitle_is_approved = bool(
+        subtitle_validation
+        and subtitle_validation.get("approved")
+    )
 
-def choose_best_lyrics(library_lyrics, subtitle_lyrics, subtitle_candidate, library_source="lrclib", title="", artist=""):
-    library_source_label = "Genius" if library_source == "genius" else "LRCLIB"
     if library_lyrics and subtitle_lyrics:
         similarity = lyric_similarity(library_lyrics, subtitle_lyrics)
-        print(f"  {library_source_label}/subtitle lyric similarity: {similarity:.2%}")
-        if similarity >= 0.80:
-            print(f"  Using {library_source_label} lyrics because they match subtitles by at least 80%.")
+        print(
+            f"  {library_source_label}/subtitle lyric similarity: "
+            f"{similarity:.2%}"
+        )
+
+        if not subtitle_is_approved:
+            print(
+                f"  Rejecting subtitle; using verified "
+                f"{library_source_label} result."
+            )
             return library_lyrics, library_source, similarity
 
-        lyrics, source = choose_low_similarity_lyrics(
-            library_lyrics=library_lyrics,
-            subtitle_lyrics=subtitle_lyrics,
-            subtitle_candidate=subtitle_candidate,
-            library_source=library_source,
-        )
-        return lyrics, source, similarity
+        library_language = detect_text_language(library_lyrics)
+        subtitle_language = subtitle_validation.get("detected") or {}
+
+        if (
+            library_language.get("approved")
+            and subtitle_language.get("approved")
+            and library_language.get("code") != subtitle_language.get("code")
+        ):
+            print(
+                "  Library/subtitle languages conflict. "
+                "Rejecting subtitle and using the strict library result."
+            )
+            return library_lyrics, library_source, similarity
+
+        if similarity >= 0.30:
+            print(
+                f"  Sources agree sufficiently; using "
+                f"{library_source_label} lyrics."
+            )
+        else:
+            print(
+                "  Sources have low text similarity. This is a conflict, "
+                "not a reason to prefer the subtitle. Using the strict "
+                "library result."
+            )
+
+        return library_lyrics, library_source, similarity
 
     if library_lyrics:
-        print(f"  Using {library_source_label} lyrics; no usable YouTube subtitle lyrics were found.")
+        print(
+            f"  Using strict {library_source_label} lyrics; "
+            "no approved YouTube subtitle was found."
+        )
         return library_lyrics, library_source, None
 
-    if subtitle_lyrics:
-        source = subtitle_candidate.get("name") if subtitle_candidate else "YouTube subtitles"
-        print(f"  Using subtitle lyrics from {source}; {library_source_label} returned no lyrics.")
-        return subtitle_lyrics, "youtube_subtitles", None
+    if subtitle_lyrics and subtitle_is_approved:
+        print(
+            "  Using YouTube subtitle only because it passed track-code, "
+            "full-text language, expected-language, and length gates."
+        )
+        return subtitle_lyrics, "youtube_subtitles_validated", None
+
+    if subtitle_lyrics and not subtitle_is_approved:
+        print("  Subtitle text exists but failed validation; not writing it.")
 
     return None, None, None
 
@@ -1586,7 +1993,7 @@ def write_tags(file_path: str, title: str, artist: str, album: str = ""):
 
     if looks_bad(title):
         title = ""
-    if looks_bad(artist):
+    if artist_is_invalid(artist):
         artist = "Unknown"
 
     audio = get_audio_object(file_path)
@@ -1598,11 +2005,11 @@ def write_tags(file_path: str, title: str, artist: str, album: str = ""):
             if audio.tags is None:
                 audio.add_tags()
             if title:
-                audio["©nam"] = [title]
+                audio["\xa9nam"] = [title]
             if artist:
-                audio["©ART"] = [artist]
+                audio["\xa9ART"] = [artist]
             if album:
-                audio["©alb"] = [album]
+                audio["\xa9alb"] = [album]
             retry_file_operation(
                 f"saving MP4 title/artist tags for {file_path}",
                 audio.save,
@@ -1806,7 +2213,7 @@ def clear_lyrics(file_path: str):
 def has_usable_title_and_artist(title, artist):
     title = norm_text(title)
     artist = norm_text(artist)
-    return bool(title) and bool(artist) and artist.lower() != "unknown"
+    return bool(title) and not artist_is_invalid(artist)
 
 
 def current_timestamp():
@@ -1878,7 +2285,10 @@ def lyrics_not_found_signature_matches(record, signature):
     if not isinstance(record, dict):
         return False
 
-    for field in ("title", "artist", "album", "video_id", "file_size"):
+    # File size and album can change when tags or thumbnails are written later.
+    # They are kept in history for debugging, but not used to invalidate the
+    # no-lyrics cache.
+    for field in ("title", "artist", "video_id"):
         if record.get(field) != signature.get(field):
             return False
 
@@ -1919,7 +2329,11 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
     existing_title = existing_metadata["title"]
     existing_artist = existing_metadata["artist"]
     existing_album = existing_metadata["album"]
-    already_has_lyrics = existing_metadata["has_lyrics"]
+    existing_lyrics_before = existing_metadata.get("lyrics") or ""
+    already_has_lyrics = (
+        existing_metadata["has_lyrics"]
+        and not ARGS.recheck_existing_lyrics
+    )
     skipped_tag_update_existing = has_usable_title_and_artist(existing_title, existing_artist)
     video_id = extract_youtube_id_from_name(original_file_name)
     tag_source = None
@@ -1971,7 +2385,7 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
                     title = conservative_filename_title(original_file_name)
                     tag_source = "filename_fallback"
 
-                if looks_bad(artist):
+                if artist_is_invalid(artist):
                     print(f"  Suspicious artist detected, using Unknown: {artist}")
                     artist = "Unknown"
 
@@ -2022,39 +2436,61 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
             did_expensive_lookup = True
 
             try:
-                duration = read_duration_seconds(file_path)
-                library_lyrics = get_lyrics_from_genius(title=title, artist=artist)
-                library_source = "genius"
+                lyrics = None
+                selected_lyrics_source = None
+                library_lyrics = None
+                library_source = "lrclib"
+                subtitle_lyrics = None
+                subtitle_candidate = None
 
-                if not library_lyrics:
+                genius_lyrics = None
+                if has_usable_title_and_artist(title, artist):
+                    genius_lyrics = get_lyrics_from_genius(
+                        title=title,
+                        artist=artist,
+                        require_artist=True,
+                    )
+
+                if not genius_lyrics:
+                    genius_lyrics = get_lyrics_from_genius(
+                        title=title,
+                        artist="",
+                        require_artist=False,
+                    )
+
+                if genius_lyrics:
+                    lyrics = genius_lyrics
+                    selected_lyrics_source = "genius"
+                    print("  Genius lyrics found; skipping LRCLIB and YouTube subtitles.")
+                else:
+                    duration = read_duration_seconds(file_path)
                     library_lyrics = get_lyrics_from_lrclib(
                         title=title,
                         artist=artist,
                         duration=duration,
-                        album=existing_album
+                        album=existing_album,
                     )
-                    if library_lyrics:
-                        library_source = "lrclib"
 
-                subtitle_lyrics = None
-                subtitle_candidate = None
+                    if video_id:
+                        subtitle_lyrics, subtitle_candidate = get_lyrics_from_youtube_subtitles(
+                            video_id=video_id,
+                            video_title=cleaned_name_for_ai,
+                            title=title,
+                            artist=artist,
+                            library_lyrics=library_lyrics,
+                            explicit_language=ARGS.preferred_language,
+                        )
+                    else:
+                        print("  No YouTube video id found in filename; cannot look up subtitle lyrics.")
 
-                if video_id:
-                    subtitle_lyrics, subtitle_candidate = get_lyrics_from_youtube_subtitles(
-                        video_id=video_id,
-                        video_title=cleaned_name_for_ai,
+                    lyrics, selected_lyrics_source, lyric_source_similarity = choose_best_lyrics(
+                        library_lyrics=library_lyrics,
+                        subtitle_lyrics=subtitle_lyrics,
+                        subtitle_candidate=subtitle_candidate,
+                        library_source=library_source,
+                        title=title,
+                        artist=artist,
                     )
-                else:
-                    print("  No YouTube video id found in filename; cannot look up subtitle lyrics.")
-
-                lyrics, selected_lyrics_source, lyric_source_similarity = choose_best_lyrics(
-                    library_lyrics=library_lyrics,
-                    subtitle_lyrics=subtitle_lyrics,
-                    subtitle_candidate=subtitle_candidate,
-                    library_source=library_source,
-                    title=title,
-                    artist=artist,
-                )
 
                 if lyrics:
                     cleaned_lyrics = clean_lyrics_for_tag(lyrics)
@@ -2083,8 +2519,11 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
         "tag_update_skipped_existing": skipped_tag_update_existing,
         "tag_source": tag_source,
         "lyrics_found": lyrics_found,
-        "lyrics_had_existing_before": already_has_lyrics,
-        "lyrics_skipped_existing": already_has_lyrics,
+        "lyrics_had_existing_before": bool(existing_lyrics_before.strip()),
+        "lyrics_skipped_existing": (
+            bool(existing_lyrics_before.strip())
+            and not ARGS.recheck_existing_lyrics
+        ),
         "lyrics_lookup_skipped_not_found_cache": lyrics_lookup_skipped_not_found_cache,
         "lyrics_existing_cleaned": existing_lyrics_cleaned_for_noise,
         "lyrics_source": lyrics_source,
