@@ -151,7 +151,7 @@ def try_download(
 
     ydl_opts = {
         "format": format_selector,
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s [%(id)s].%(ext)s"),
+        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
         "noplaylist": True,
         "writethumbnail": True,
         "postprocessors": [

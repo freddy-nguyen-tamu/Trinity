@@ -1,7 +1,10 @@
 import os
 
 from mutagen.mp3 import MP3
-from mutagen.id3 import WOAS
+from mutagen.id3 import COMM, WOAS
+
+
+YOUTUBE_ID_COMMENT_PREFIX = "YouTube ID:"
 
 
 def youtube_watch_url(video_id):
@@ -57,27 +60,49 @@ def candidate_mp3_paths(info, ydl=None):
     return result
 
 
-def write_youtube_url_tag(mp3_path, youtube_url):
-    if not youtube_url or not mp3_path or not os.path.isfile(mp3_path):
+def write_youtube_metadata_tags(mp3_path, youtube_url, video_id=""):
+    if not mp3_path or not os.path.isfile(mp3_path):
         return False
 
     audio = MP3(mp3_path)
     if audio.tags is None:
         audio.add_tags()
 
+    changed = False
     tags = audio.tags
-    existing_urls = [
-        str(frame.url or "").strip()
-        for frame in tags.getall("WOAS")
-        if str(frame.url or "").strip()
-    ]
-    if existing_urls:
-        return False
 
-    tags.delall("WOAS")
-    tags.add(WOAS(url=youtube_url))
-    audio.save(v2_version=3)
-    return True
+    if youtube_url:
+        existing_urls = [
+            str(frame.url or "").strip()
+            for frame in tags.getall("WOAS")
+            if str(frame.url or "").strip()
+        ]
+        if not existing_urls:
+            tags.delall("WOAS")
+            tags.add(WOAS(url=youtube_url))
+            changed = True
+
+    video_id = str(video_id or "").strip()
+    if video_id:
+        comment_text = f"{YOUTUBE_ID_COMMENT_PREFIX} {video_id}"
+        existing_comments = tags.getall("COMM")
+        has_youtube_id_comment = any(
+            video_id in " ".join(str(item) for item in getattr(frame, "text", []) or [])
+            for frame in existing_comments
+        )
+        if not has_youtube_id_comment:
+            # Windows Explorer's Details tab reads normal COMM frames as Comments.
+            tags.add(COMM(encoding=3, lang="eng", desc="", text=comment_text))
+            changed = True
+
+    if changed:
+        audio.save(v2_version=3)
+
+    return changed
+
+
+def write_youtube_url_tag(mp3_path, youtube_url):
+    return write_youtube_metadata_tags(mp3_path, youtube_url)
 
 
 def tag_downloaded_mp3_with_youtube_url(
@@ -122,15 +147,15 @@ def tag_downloaded_mp3_with_youtube_url(
             continue
 
         try:
-            changed = write_youtube_url_tag(path, youtube_url)
+            changed = write_youtube_metadata_tags(path, youtube_url, video_id=video_id)
         except Exception as error:
-            print(f"Could not embed YouTube URL in {path}: {error}")
+            print(f"Could not embed YouTube metadata in {path}: {error}")
             continue
 
         if changed:
-            print(f"Embedded YouTube URL in MP3: {os.path.basename(path)}")
+            print(f"Embedded YouTube metadata in MP3: {os.path.basename(path)}")
         else:
-            print(f"MP3 already has a source URL tag: {os.path.basename(path)}")
+            print(f"MP3 already has YouTube metadata tags: {os.path.basename(path)}")
         return path
 
     print(f"Could not find final MP3 to tag with YouTube URL: {youtube_url}")

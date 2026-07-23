@@ -34,6 +34,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_AUDIO_FOLDER = os.path.join(BASE_DIR, "_working_downloads")
 LYRICS_NOT_FOUND_HISTORY_PATH = os.path.join(BASE_DIR, "_lyrics_not_found_history.json")
 LYRICS_NOT_FOUND_HISTORY_VERSION = 2
+LYRICS_NOT_FOUND_RESOLVER_VERSION = 3
 
 
 def parse_args():
@@ -256,6 +257,7 @@ def clean_lyrics_for_tag(lyrics: str) -> str:
 
 def clean_input_filename(name: str) -> str:
     base, _ = os.path.splitext(name)
+    base = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", " ", base)
     base = base.replace("_", " ")
     base = norm_text(base)
     return base
@@ -909,6 +911,30 @@ VERSION_NOISE_RE = re.compile(
 )
 
 
+TITLE_FEATURE_CLAUSE_RE = re.compile(
+    r"[\(\[\{]\s*(?:feat(?:uring)?|ft\.?|with)\b.*?[\)\]\}]",
+    flags=re.IGNORECASE,
+)
+TRAILING_FEATURE_RE = re.compile(
+    r"\b(?:feat(?:uring)?|ft\.?|with)\b.+$",
+    flags=re.IGNORECASE,
+)
+
+
+def strip_title_feature_clauses(value):
+    value = TITLE_FEATURE_CLAUSE_RE.sub(" ", norm_text(value))
+    value = TRAILING_FEATURE_RE.sub(" ", value)
+    return norm_text(value)
+
+
+def title_identity_variants(value):
+    variants = []
+    for candidate in (norm_text(value), strip_title_feature_clauses(value)):
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+    return variants
+
+
 def fold_match_text(value):
     value = unicodedata.normalize("NFKD", norm_text(value).casefold())
     value = "".join(
@@ -978,6 +1004,7 @@ def genius_hit_is_lyrics_only_match(hit):
 
 
 def genius_title_match_score(expected_title, result):
+    expected_variants = title_identity_variants(expected_title)
     title_values = [
         result.get("title"),
         result.get("title_with_featured"),
@@ -988,17 +1015,18 @@ def genius_title_match_score(expected_title, result):
     best_overlap = 0.0
     best_value = ""
 
-    for value in title_values:
-        value = norm_text(value or "")
-        if not value:
-            continue
+    for expected_variant in expected_variants:
+        for value in title_values:
+            value = norm_text(value or "")
+            if not value:
+                continue
 
-        score = text_match_ratio(expected_title, value)
-        overlap = expected_title_token_overlap(expected_title, value)
-        if (score, overlap) > (best_score, best_overlap):
-            best_score = score
-            best_overlap = overlap
-            best_value = value
+            score = text_match_ratio(expected_variant, value)
+            overlap = expected_title_token_overlap(expected_variant, value)
+            if (score, overlap) > (best_score, best_overlap):
+                best_score = score
+                best_overlap = overlap
+                best_value = value
 
     return best_score, best_overlap, best_value
 
@@ -1352,6 +1380,98 @@ def get_lyrics_from_genius(title: str, artist: str, require_artist=True):
         return "\n\n".join(lyrics_lines).strip()
     except Exception:
         return None
+
+
+YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def extract_youtube_id_from_url(value):
+    value = norm_text(value)
+    if not value:
+        return None
+
+    try:
+        parsed = urlparse(value)
+    except Exception:
+        return None
+
+    query = parse_qs(parsed.query)
+    for key in ("v", "vi"):
+        for candidate in query.get(key, []):
+            if YOUTUBE_VIDEO_ID_RE.fullmatch(candidate):
+                return candidate
+
+    host = parsed.netloc.casefold()
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if host.endswith("youtu.be") and path_parts and YOUTUBE_VIDEO_ID_RE.fullmatch(path_parts[0]):
+        return path_parts[0]
+
+    for marker in ("shorts", "embed", "live", "v"):
+        if marker in path_parts:
+            index = path_parts.index(marker)
+            if index + 1 < len(path_parts) and YOUTUBE_VIDEO_ID_RE.fullmatch(path_parts[index + 1]):
+                return path_parts[index + 1]
+
+    return None
+
+
+def extract_youtube_id_from_comment_text(value):
+    value = norm_text(value)
+    if not value:
+        return None
+
+    match = re.search(
+        r"\bYouTube\s*(?:video\s*)?ID\s*[:=]\s*([A-Za-z0-9_-]{11})\b",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return match.group(1)
+
+    return extract_youtube_id_from_url(value)
+
+
+def extract_youtube_id_from_audio(file_path):
+    try:
+        tags = ID3(file_path)
+    except Exception:
+        tags = None
+
+    if tags:
+        for frame_id in ("WOAS", "WXXX"):
+            for frame in tags.getall(frame_id):
+                youtube_id = extract_youtube_id_from_url(getattr(frame, "url", ""))
+                if youtube_id:
+                    return youtube_id
+
+        for frame_id in ("COMM", "TXXX"):
+            for frame in tags.getall(frame_id):
+                desc = str(getattr(frame, "desc", "") or "")
+                text = first_id3_frame_text(frame)
+                if "youtube" in desc.casefold() or "youtube" in text.casefold():
+                    youtube_id = extract_youtube_id_from_comment_text(text)
+                    if youtube_id:
+                        return youtube_id
+
+    try:
+        audio = File(file_path)
+    except Exception:
+        audio = None
+
+    if audio and audio.tags:
+        for key, value in audio.tags.items():
+            key_text = str(key).casefold()
+            if "youtube" not in key_text and "comment" not in key_text and "url" not in key_text:
+                continue
+            text = first_tag_text(value)
+            youtube_id = (
+                extract_youtube_id_from_comment_text(text)
+                or extract_youtube_id_from_url(text)
+            )
+            if youtube_id:
+                return youtube_id
+
+    return None
 
 
 def extract_youtube_id_from_name(file_name):
@@ -2278,6 +2398,7 @@ def build_lyrics_not_found_signature(file_path, original_file_name, title, artis
         "album": norm_text(album).casefold(),
         "video_id": video_id or "",
         "file_size": file_size,
+        "resolver_version": LYRICS_NOT_FOUND_RESOLVER_VERSION,
     }
 
 
@@ -2288,7 +2409,7 @@ def lyrics_not_found_signature_matches(record, signature):
     # File size and album can change when tags or thumbnails are written later.
     # They are kept in history for debugging, but not used to invalidate the
     # no-lyrics cache.
-    for field in ("title", "artist", "video_id"):
+    for field in ("title", "artist", "video_id", "resolver_version"):
         if record.get(field) != signature.get(field):
             return False
 
@@ -2335,7 +2456,10 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
         and not ARGS.recheck_existing_lyrics
     )
     skipped_tag_update_existing = has_usable_title_and_artist(existing_title, existing_artist)
-    video_id = extract_youtube_id_from_name(original_file_name)
+    video_id = (
+        extract_youtube_id_from_audio(file_path)
+        or extract_youtube_id_from_name(original_file_name)
+    )
     tag_source = None
     did_expensive_lookup = False
 

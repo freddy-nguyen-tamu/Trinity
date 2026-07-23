@@ -112,7 +112,24 @@ def item_matches_ids(item, ids):
     if not isinstance(item, str):
         return False
 
-    return any(youtube_id in item for youtube_id in ids)
+    item_folded = item.casefold()
+    return any(youtube_id.casefold() in item_folded for youtube_id in ids)
+
+
+def value_matches_ids(value, ids):
+    if isinstance(value, str):
+        return item_matches_ids(value, ids)
+
+    if isinstance(value, list):
+        return any(value_matches_ids(item, ids) for item in value)
+
+    if isinstance(value, dict):
+        return any(
+            item_matches_ids(str(key), ids) or value_matches_ids(item, ids)
+            for key, item in value.items()
+        )
+
+    return False
 
 
 def filter_history_data(data, ids):
@@ -121,7 +138,7 @@ def filter_history_data(data, ids):
     if isinstance(data, list):
         kept = []
         for item in data:
-            if item_matches_ids(item, ids):
+            if value_matches_ids(item, ids):
                 removed.append(str(item))
             else:
                 kept.append(item)
@@ -131,12 +148,28 @@ def filter_history_data(data, ids):
         changed = False
         filtered = {}
         for key, value in data.items():
-            if isinstance(value, list):
+            if item_matches_ids(str(key), ids):
+                changed = True
+                removed.append(str(key))
+                continue
+
+            if isinstance(value, dict) and not any(
+                isinstance(item, (list, dict)) for item in value.values()
+            ):
+                if value_matches_ids(value, ids):
+                    changed = True
+                    removed.append(str(key))
+                else:
+                    filtered[key] = value
+            elif isinstance(value, (list, dict)):
                 new_value, nested_removed = filter_history_data(value, ids)
                 filtered[key] = new_value
                 if nested_removed:
                     changed = True
                     removed.extend(f"{key}: {item}" for item in nested_removed)
+            elif value_matches_ids(value, ids):
+                changed = True
+                removed.append(f"{key}: {value}")
             else:
                 filtered[key] = value
         return filtered if changed else data, removed
