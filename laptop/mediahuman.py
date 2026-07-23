@@ -1,6 +1,10 @@
 import os
+if os.environ.get("TRINITY_ENABLE_YTDLP_POT_PLUGIN", "").strip().lower() not in {"1", "true", "yes", "on"}:
+    os.environ.setdefault("YTDLP_NO_PLUGINS", "1")
+
 import json
 import time
+from itertools import islice
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 from youtube_url_tag import tag_downloaded_mp3_with_youtube_url, youtube_watch_url
@@ -13,6 +17,7 @@ DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
 HISTORY_FILE = "download_history.json"
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLBkuXLqNhqX5FsS2CEaSDlGTKAHIBPtLe"
 ALREADY_DOWNLOADED_STREAK_LIMIT = 30
+LAZY_PLAYLIST_LIMIT = 200
 if os.environ.get("TRINITY_SKIP_PLAYLIST_ON_30", "1") == "0":
     ALREADY_DOWNLOADED_STREAK_LIMIT = float("inf")
 
@@ -23,6 +28,32 @@ COOKIES_FILE = os.path.join(BASE_DIR, "youtube_cookies.txt")
 # Default behavior:
 # try with cookies first, fall back to no cookies
 USE_COOKIES_FOR_PLAYLIST = True
+COOKIE_CLIENT_GROUPS = [
+    None,
+    ["tv"],
+    ["web_safari"],
+    ["web"],
+    ["web", "web_safari"],
+]
+
+NO_COOKIE_CLIENT_GROUPS = [
+    None,
+    ["android_vr"],
+    ["tv"],
+    ["android_vr", "tv"],
+    ["web_safari"],
+    ["web"],
+    ["web", "web_safari"],
+]
+
+FORMAT_CANDIDATES = [
+    "bestaudio/best",
+    "bestaudio[ext=m4a]/bestaudio/best[acodec!=none]/18/best",
+    "140",
+    "251",
+    "250",
+    "249",
+]
 
 
 def make_cookie_opts():
@@ -31,18 +62,11 @@ def make_cookie_opts():
     return {"cookiesfrombrowser": BROWSER}
 
 
-def make_common_ydl_opts(use_cookies=False, video_download=False):
+def make_common_ydl_opts(use_cookies=False, video_download=False, player_clients=None):
     opts = {
         # Python API format (dict, not list)
         "js_runtimes": {"node": {}},
         "remote_components": ["ejs:github"],
-
-        # web/web_safari first for cookie auth
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["web", "web_safari"],
-            }
-        },
 
         # retry/network hardening
         "retries": 10,
@@ -50,6 +74,15 @@ def make_common_ydl_opts(use_cookies=False, video_download=False):
         "extractor_retries": 10,
         "socket_timeout": 30,
     }
+
+    if player_clients:
+        safe_clients = [client for client in player_clients if not (use_cookies and client == "android_vr")]
+        if safe_clients:
+            opts["extractor_args"] = {
+                "youtube": {
+                    "player_client": safe_clients,
+                }
+            }
 
     if use_cookies:
         opts.update(make_cookie_opts())
@@ -92,18 +125,25 @@ def extract_playlist_entries(playlist_url, use_cookies=False):
         },
     }
     if lazy:
-        ydl_opts_extract["playlistend"] = 200
+        ydl_opts_extract["playlistend"] = LAZY_PLAYLIST_LIMIT
 
     with YoutubeDL(ydl_opts_extract) as ydl:
         info = ydl.extract_info(playlist_url, download=False)
 
-    return info.get("entries", [])
+    raw_entries = info.get("entries") or []
+    return list(islice(raw_entries, LAZY_PLAYLIST_LIMIT)) if lazy else list(raw_entries)
 
 
-def try_download_video(video_id, max_attempts=3, use_cookies=False):
+def try_download_video(
+    video_id,
+    max_attempts=1,
+    use_cookies=False,
+    player_clients=None,
+    format_selector="bestaudio/best",
+):
     """Try downloading one video with retries."""
     ydl_opts_dl = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best[acodec!=none]/18/best",
+        "format": format_selector,
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
         "postprocessors": [
             {
@@ -113,13 +153,22 @@ def try_download_video(video_id, max_attempts=3, use_cookies=False):
             }
         ],
         "quiet": False,
-        **make_common_ydl_opts(use_cookies=use_cookies, video_download=True),
+        **make_common_ydl_opts(
+            use_cookies=use_cookies,
+            video_download=True,
+            player_clients=player_clients,
+        ),
     }
 
     video_url = youtube_watch_url(video_id)
 
     for attempt in range(1, max_attempts + 1):
         try:
+            mode = "with cookies" if use_cookies else "without cookies"
+            print(
+                f"Downloading {video_id} | attempt {attempt}/{max_attempts} | "
+                f"{mode} | clients={player_clients or 'default'} | format={format_selector}"
+            )
             started_at = time.time()
             ydl_opts_no_ignore = {**ydl_opts_dl, "ignoreerrors": False}
             with YoutubeDL(ydl_opts_no_ignore) as ydl:
@@ -222,12 +271,25 @@ def download_playlist(playlist_url):
         already_downloaded_streak = 0
         print(f"[{index}/{len(video_entries)}] Downloading: {video_title}")
 
-        # First try with cookies
-        success = try_download_video(
-            video_id,
-            max_attempts=3,
-            use_cookies=True,
-        )
+        success = False
+
+        for clients in COOKIE_CLIENT_GROUPS:
+            for fmt in FORMAT_CANDIDATES:
+                success = try_download_video(
+                    video_id,
+                    max_attempts=1,
+                    use_cookies=True,
+                    player_clients=clients,
+                    format_selector=fmt,
+                )
+                if success:
+                    break
+                if success is None:
+                    break
+            if success:
+                break
+            if success is None:
+                break
 
         # Fall back to no cookies only if needed (skip if video was removed permanently)
         if success is None:
@@ -235,11 +297,24 @@ def download_playlist(playlist_url):
             continue
         elif not success:
             print("Retrying without cookies...")
-            success = try_download_video(
-                video_id,
-                max_attempts=2,
-                use_cookies=False,
-            )
+            for clients in NO_COOKIE_CLIENT_GROUPS:
+                for fmt in FORMAT_CANDIDATES:
+                    success = try_download_video(
+                        video_id,
+                        max_attempts=1,
+                        use_cookies=False,
+                        player_clients=clients,
+                        format_selector=fmt,
+                    )
+                    if success:
+                        break
+                    if success is None:
+                        break
+                if success:
+                    break
+                if success is None:
+                    break
+
             if success is None:
                 print(f"Video unavailable, giving up: {video_id}")
                 continue

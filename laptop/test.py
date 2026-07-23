@@ -2,6 +2,9 @@ import argparse
 import difflib
 import html
 import os
+if os.environ.get("TRINITY_ENABLE_YTDLP_POT_PLUGIN", "").strip().lower() not in {"1", "true", "yes", "on"}:
+    os.environ.setdefault("YTDLP_NO_PLUGINS", "1")
+
 import json
 import re
 import time
@@ -1498,11 +1501,6 @@ def youtube_extract_opts(use_cookies=False):
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android_vr", "web_safari", "web", "tv"],
-            }
-        },
         "retries": 5,
         "extractor_retries": 5,
         "socket_timeout": 20,
@@ -1510,6 +1508,12 @@ def youtube_extract_opts(use_cookies=False):
 
     if use_cookies:
         opts["cookiesfrombrowser"] = ("firefox",)
+    else:
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["android_vr", "web_safari", "web", "tv"],
+            }
+        }
 
     return opts
 

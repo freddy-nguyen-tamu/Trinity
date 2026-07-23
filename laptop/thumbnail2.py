@@ -1,6 +1,10 @@
 import os
+if os.environ.get("TRINITY_ENABLE_YTDLP_POT_PLUGIN", "").strip().lower() not in {"1", "true", "yes", "on"}:
+    os.environ.setdefault("YTDLP_NO_PLUGINS", "1")
+
 import json
 import time
+from itertools import islice
 from yt_dlp import YoutubeDL
 from youtube_url_tag import tag_downloaded_mp3_with_youtube_url, youtube_watch_url
 
@@ -9,6 +13,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
 HISTORY_FILE = "download_history.json"
 ALREADY_DOWNLOADED_STREAK_LIMIT = 30
+LAZY_PLAYLIST_LIMIT = 200
 if os.environ.get("TRINITY_SKIP_PLAYLIST_ON_30", "1") == "0":
     ALREADY_DOWNLOADED_STREAK_LIMIT = float("inf")
 
@@ -58,12 +63,13 @@ def download_playlist(playlist_url):
         },
     }
     if lazy:
-        ydl_opts_extract["playlistend"] = 200
+        ydl_opts_extract["playlistend"] = LAZY_PLAYLIST_LIMIT
 
     with YoutubeDL(ydl_opts_extract) as ydl:
         info = ydl.extract_info(playlist_url, download=False)
 
-    video_entries = info.get("entries", [])
+    raw_entries = info.get("entries") or []
+    video_entries = list(islice(raw_entries, LAZY_PLAYLIST_LIMIT)) if lazy else list(raw_entries)
     print(f"Playlist has {len(video_entries)} videos.")
 
     # Download each video
@@ -88,7 +94,7 @@ def download_playlist(playlist_url):
         print(f"⬇ Downloading: {video_title}")
 
         ydl_opts_dl = {
-            "format": "bestaudio[ext=m4a]/bestaudio/best[acodec!=none]/18/best",
+            "format": "bestaudio/best",
             "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
             "writethumbnail": True,
             "postprocessors": [

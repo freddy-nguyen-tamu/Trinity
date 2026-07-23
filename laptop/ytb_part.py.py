@@ -17,13 +17,17 @@ def download_first_four_seconds(youtube_url, output_filename="first_4_seconds.mp
         "--download-sections", "*00:00:00-00:00:04",
         "--force-keyframes-at-cuts",
         "-f", "best[ext=mp4]",
+        "--extractor-args", "youtube:player_client=android_vr,tv,web_safari,web",
         "-o", output_filename,
         youtube_url
     ]
+    env = os.environ.copy()
+    if env.get("TRINITY_ENABLE_YTDLP_POT_PLUGIN", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        env.setdefault("YTDLP_NO_PLUGINS", "1")
 
     try:
         print(f"Downloading first 4 seconds from {youtube_url} ...")
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, env=env)
         print(f"Success! Video saved as {output_filename}")
     except subprocess.CalledProcessError as e:
         print(f"Error during download: {e}", file=sys.stderr)

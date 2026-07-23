@@ -1,6 +1,10 @@
 import os
+if os.environ.get("TRINITY_ENABLE_YTDLP_POT_PLUGIN", "").strip().lower() not in {"1", "true", "yes", "on"}:
+    os.environ.setdefault("YTDLP_NO_PLUGINS", "1")
+
 import json
 import time
+from itertools import islice
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 from youtube_url_tag import tag_downloaded_mp3_with_youtube_url, youtube_watch_url
@@ -10,6 +14,7 @@ DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
 HISTORY_FILE = "download_history.json"
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLBkuXLqNhqX5FsS2CEaSDlGTKAHIBPtLe"
 ALREADY_DOWNLOADED_STREAK_LIMIT = 30
+LAZY_PLAYLIST_LIMIT = 200
 if os.environ.get("TRINITY_SKIP_PLAYLIST_ON_30", "1") == "0":
     ALREADY_DOWNLOADED_STREAK_LIMIT = float("inf")
 
@@ -22,19 +27,31 @@ def make_cookie_opts():
         return {"cookiefile": COOKIES_FILE}
     return {"cookiesfrombrowser": BROWSER}
 
-CLIENT_GROUPS = [
-    ["web"],
+COOKIE_CLIENT_GROUPS = [
+    None,
+    ["tv"],
     ["web_safari"],
+    ["web"],
+    ["web", "web_safari"],
+]
+
+NO_COOKIE_CLIENT_GROUPS = [
+    None,
+    ["android_vr"],
+    ["tv"],
+    ["android_vr", "tv"],
+    ["web_safari"],
+    ["web"],
     ["web", "web_safari"],
 ]
 
 FORMAT_CANDIDATES = [
+    "bestaudio/best",
     "bestaudio[ext=m4a]/bestaudio/best[acodec!=none]/18/best",
     "140",
     "251",
     "250",
     "249",
-    "bestaudio/best",
 ]
 
 
@@ -62,15 +79,7 @@ def save_history(history):
 
 
 def make_common_opts(use_cookies=False, player_clients=None, video_download=False):
-    if player_clients is None:
-        player_clients = ["web"]
-
     opts = {
-        "extractor_args": {
-            "youtube": {
-                "player_client": player_clients,
-            }
-        },
         "retries": 10,
         "fragment_retries": 10,
         "extractor_retries": 10,
@@ -80,6 +89,15 @@ def make_common_opts(use_cookies=False, player_clients=None, video_download=Fals
         "quiet": False,
         "verbose": False,
     }
+
+    if player_clients:
+        safe_clients = [client for client in player_clients if not (use_cookies and client == "android_vr")]
+        if safe_clients:
+            opts["extractor_args"] = {
+                "youtube": {
+                    "player_client": safe_clients,
+                }
+            }
 
     if use_cookies:
         opts.update(make_cookie_opts())
@@ -114,6 +132,7 @@ def is_private_or_unavailable(entry):
 
 
 def get_playlist_entries(playlist_url, use_cookies=False):
+    lazy = os.environ.get("TRINITY_LAZY_PLAYLIST", "0") == "1"
     ydl_opts = {
         "extract_flat": True,
         "skip_download": True,
@@ -128,14 +147,15 @@ def get_playlist_entries(playlist_url, use_cookies=False):
     }
     if use_cookies:
         ydl_opts.update(make_cookie_opts())
-    if os.environ.get("TRINITY_LAZY_PLAYLIST", "0") == "1":
+    if lazy:
         ydl_opts["lazy_playlist"] = True
-        ydl_opts["playlistend"] = 200
+        ydl_opts["playlistend"] = LAZY_PLAYLIST_LIMIT
 
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(playlist_url, download=False)
 
-    entries = list(info.get("entries") or [])
+    raw_entries = info.get("entries") or []
+    entries = list(islice(raw_entries, LAZY_PLAYLIST_LIMIT)) if lazy else list(raw_entries)
     return [entry for entry in entries if not is_private_or_unavailable(entry)]
 
 
@@ -177,7 +197,7 @@ def try_download(
                 f"Downloading {title_hint or video_id} | "
                 f"attempt {attempt}/{max_attempts} | "
                 f"{'cookies' if use_cookies else 'no cookies'} | "
-                f"clients={player_clients} | format={format_selector}"
+                f"clients={player_clients or 'default'} | format={format_selector}"
             )
 
             started_at = time.time()
@@ -267,7 +287,7 @@ def download_playlist(playlist_url):
 
         success = False
 
-        for clients in CLIENT_GROUPS:
+        for clients in COOKIE_CLIENT_GROUPS:
             for fmt in FORMAT_CANDIDATES:
                 success = try_download(
                     video_id=video_id,
@@ -290,7 +310,7 @@ def download_playlist(playlist_url):
             print(f"Video unavailable, giving up: {title}")
         elif not success:
             print("Retrying failed download without cookies...")
-            for clients in CLIENT_GROUPS:
+            for clients in NO_COOKIE_CLIENT_GROUPS:
                 for fmt in FORMAT_CANDIDATES:
                     success = try_download(
                         video_id=video_id,
