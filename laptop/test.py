@@ -393,6 +393,7 @@ def groq_chat(messages, max_tokens=220, temperature=0, timeout=60, max_retries=8
     for attempt in range(1, max_retries + 1):
         rate_limit_waits = []
         network_errors = []
+        api_errors = []
 
         for key_name, api_key in GROQ_API_KEYS:
             try:
@@ -447,14 +448,28 @@ def groq_chat(messages, max_tokens=220, temperature=0, timeout=60, max_retries=8
                         json_mode=False,
                     )
 
-            raise SystemExit(f"Groq API error using {key_name}: {resp.status_code} {resp.text}")
+            api_errors.append((key_name, resp.status_code, resp.text[:300]))
+            print(
+                f"[{resp.status_code}] Groq API error using {key_name}. "
+                f"Trying next key. Attempt {attempt}/{max_retries}"
+            )
+            continue
+
+        if api_errors and not rate_limit_waits and not network_errors:
+            summary = "; ".join(
+                f"{key_name}:{status}" for key_name, status, _ in api_errors
+            )
+            raise RuntimeError(
+                "All loaded Groq API keys failed for this request "
+                f"({summary})."
+            )
 
         if attempt == max_retries:
             if network_errors and not rate_limit_waits:
                 last_key, last_error = network_errors[-1]
-                raise SystemExit(f"Network error calling Groq using {last_key}: {last_error}")
+                raise RuntimeError(f"Network error calling Groq using {last_key}: {last_error}")
 
-            raise SystemExit("Groq API error: too many retries across all API keys.")
+            raise RuntimeError("Groq API error: too many retries across all API keys.")
 
         if rate_limit_waits:
             wait_s = max(rate_limit_waits)
@@ -470,7 +485,7 @@ def groq_chat(messages, max_tokens=220, temperature=0, timeout=60, max_retries=8
         time.sleep(wait_s)
         backoff = min(backoff * 1.6, 20.0)
 
-    raise SystemExit("Groq API error: too many retries across all API keys.")
+    raise RuntimeError("Groq API error: too many retries across all API keys.")
 
 
 def build_single_prompt(item_id, file_name):
@@ -672,6 +687,24 @@ def lyrics_text_looks_usable(text):
         "all rights reserved",
     )
     if any(marker in folded for marker in obvious_non_lyrics):
+        return False
+
+    return True
+
+
+def genius_lyrics_text_looks_usable(text, title=""):
+    cleaned = clean_lyrics_for_tag(text)
+    if not lyrics_text_looks_usable(cleaned):
+        return False
+
+    compact = re.sub(r"\s+", " ", cleaned).strip(" \"'").casefold()
+    if re.fullmatch(r"(lyrics\s*)?(\d+\s+)?contributors?.{0,120}\blyrics\b", compact):
+        return False
+    if (
+        "contributor" in compact
+        and compact.endswith("lyrics")
+        and len([line for line in cleaned.splitlines() if line.strip()]) <= 3
+    ):
         return False
 
     return True
@@ -1380,7 +1413,16 @@ def get_lyrics_from_genius(title: str, artist: str, require_artist=True):
             part = html.unescape(part)
             lyrics_lines.append(part.strip())
 
-        return "\n\n".join(lyrics_lines).strip()
+        lyrics = "\n\n".join(lyrics_lines).strip()
+        lyrics = clean_lyrics_for_tag(lyrics)
+        if not genius_lyrics_text_looks_usable(lyrics, title=title):
+            print(
+                "  Genius lyrics rejected because the extracted page text "
+                "looked like metadata/header text, not a lyrics body."
+            )
+            return None
+
+        return lyrics
     except Exception:
         return None
 
@@ -2062,33 +2104,28 @@ def choose_best_lyrics(
             )
             return library_lyrics, library_source, similarity
 
-        library_language = detect_text_language(library_lyrics)
-        subtitle_language = subtitle_validation.get("detected") or {}
-
-        if (
-            library_language.get("approved")
-            and subtitle_language.get("approved")
-            and library_language.get("code") != subtitle_language.get("code")
-        ):
-            print(
-                "  Library/subtitle languages conflict. "
-                "Rejecting subtitle and using the strict library result."
-            )
-            return library_lyrics, library_source, similarity
-
-        if similarity >= 0.30:
+        if similarity >= 0.80:
             print(
                 f"  Sources agree sufficiently; using "
                 f"{library_source_label} lyrics."
             )
+            return library_lyrics, library_source, similarity
+
+        subtitle_kind = (
+            "automatic" if subtitle_candidate.get("automatic") else "manual"
+        )
+        if subtitle_kind == "manual":
+            print(
+                "  Approved manual YouTube subtitle disagrees with "
+                f"{library_source_label} below 80%; using the manual subtitle."
+            )
         else:
             print(
-                "  Sources have low text similarity. This is a conflict, "
-                "not a reason to prefer the subtitle. Using the strict "
-                "library result."
+                "  No approved manual subtitle won, and approved automatic "
+                f"YouTube subtitles disagree with {library_source_label} "
+                "below 80%; using the automatic subtitle."
             )
-
-        return library_lyrics, library_source, similarity
+        return subtitle_lyrics, "youtube_subtitles_validated", similarity
 
     if library_lyrics:
         print(
@@ -2519,7 +2556,11 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
 
             except Exception as e:
                 print(f"  AI parse failed: {e}")
-                title = conservative_filename_title(original_file_name)
+                title = (
+                    existing_title
+                    if existing_title and not looks_bad(existing_title)
+                    else conservative_filename_title(original_file_name)
+                )
                 artist = existing_artist or "Unknown"
                 tag_source = "filename_fallback"
 
