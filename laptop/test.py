@@ -27,6 +27,7 @@ from mutagen.oggvorbis import OggVorbis
 from mutagen.oggopus import OggOpus
 
 from lyrics_language import (
+    LANGUAGE_BY_CODE,
     detect_text_language,
     infer_expected_language,
     normalize_language_code,
@@ -37,7 +38,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_AUDIO_FOLDER = os.path.join(BASE_DIR, "_working_downloads")
 LYRICS_NOT_FOUND_HISTORY_PATH = os.path.join(BASE_DIR, "_lyrics_not_found_history.json")
 LYRICS_NOT_FOUND_HISTORY_VERSION = 2
-LYRICS_NOT_FOUND_RESOLVER_VERSION = 3
+LYRICS_NOT_FOUND_RESOLVER_VERSION = 4
+MIN_LYRIC_SOURCE_AGREEMENT = 0.80
 
 
 def parse_args():
@@ -125,6 +127,27 @@ SUPPORTED_EXTENSIONS = {
     ".aiff",
     ".aif",
     ".aac",
+}
+
+ID3_LANGUAGE_BY_CODE = {
+    "en": "eng",
+    "vi": "vie",
+    "ko": "kor",
+    "ja": "jpn",
+    "zh": "zho",
+    "th": "tha",
+    "id": "ind",
+    "ms": "msa",
+    "tl": "tgl",
+    "fr": "fra",
+    "es": "spa",
+    "pt": "por",
+    "de": "deu",
+    "it": "ita",
+    "ru": "rus",
+    "uk": "ukr",
+    "ar": "ara",
+    "hi": "hin",
 }
 
 if GROQ_API_KEYS:
@@ -692,22 +715,78 @@ def lyrics_text_looks_usable(text):
     return True
 
 
-def genius_lyrics_text_looks_usable(text, title=""):
+def lyrics_body_looks_legit(text, source="lyrics", title=""):
     cleaned = clean_lyrics_for_tag(text)
     if not lyrics_text_looks_usable(cleaned):
         return False
 
+    nonempty_lines = [
+        line.strip()
+        for line in cleaned.splitlines()
+        if line.strip()
+    ]
     compact = re.sub(r"\s+", " ", cleaned).strip(" \"'").casefold()
-    if re.fullmatch(r"(lyrics\s*)?(\d+\s+)?contributors?.{0,120}\blyrics\b", compact):
+
+    placeholder_patterns = (
+        r"(lyrics\s*)?(\d+\s+)?contributors?.{0,160}\blyrics\b",
+        r"\d+\s+contributor[s]?\s+.+\s+lyrics",
+        r".+\s+lyrics\s+you might also like",
+        r"you might also like\s+.+",
+    )
+    if any(re.fullmatch(pattern, compact) for pattern in placeholder_patterns):
         return False
+
     if (
         "contributor" in compact
         and compact.endswith("lyrics")
-        and len([line for line in cleaned.splitlines() if line.strip()]) <= 3
+        and len(nonempty_lines) <= 4
     ):
+        return False
+    if "you might also like" in compact and len(nonempty_lines) <= 8:
+        return False
+    if compact in {"lyrics", "instrumental", "no lyrics"}:
+        return False
+
+    word_tokens = re.findall(r"[^\W\d_]+", compact, flags=re.UNICODE)
+    unique_words = set(word_tokens)
+    if len(word_tokens) < 25 or len(unique_words) < 10:
         return False
 
     return True
+
+
+def genius_lyrics_text_looks_usable(text, title=""):
+    return lyrics_body_looks_legit(text, source="Genius", title=title)
+
+
+def clean_legit_lyrics_candidate(text, source="lyrics", title=""):
+    cleaned = clean_lyrics_for_tag(text or "")
+    if not cleaned:
+        return ""
+
+    if lyrics_body_looks_legit(cleaned, source=source, title=title):
+        return cleaned
+
+    preview = re.sub(r"\s+", " ", cleaned).strip()
+    if len(preview) > 120:
+        preview = preview[:117] + "..."
+    print(
+        f"  {source} lyrics rejected because the text did not look "
+        f"like a complete lyrics body: {preview!r}"
+    )
+    return ""
+
+
+def id3_lyrics_language(language_code=""):
+    normalized = normalize_language_code(language_code)
+    return ID3_LANGUAGE_BY_CODE.get(normalized, "eng")
+
+
+def detect_lyrics_language_code(lyrics):
+    detected = detect_text_language(lyrics or "")
+    if detected.get("approved"):
+        return normalize_language_code(detected.get("code"))
+    return ""
 
 
 def first_mp4_lyrics(tags):
@@ -863,7 +942,7 @@ def get_existing_audio_metadata(file_path: str):
         "artist": artist,
         "album": album,
         "lyrics": lyrics,
-        "has_lyrics": lyrics_text_looks_usable(lyrics),
+        "has_lyrics": lyrics_body_looks_legit(lyrics, source="existing"),
     }
 
 
@@ -1912,6 +1991,129 @@ def download_subtitle_text(candidate):
     return None
 
 
+def compact_subtitle_sample(text, max_chars=1800):
+    lines = [
+        line.strip()
+        for line in (text or "").splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        return ""
+
+    if len("\n".join(lines)) <= max_chars:
+        return "\n".join(lines)
+
+    head = lines[:18]
+    middle_start = max(0, len(lines) // 2 - 6)
+    middle = lines[middle_start:middle_start + 12]
+    tail = lines[-18:]
+    sample = "\n".join(head + ["..."] + middle + ["..."] + tail)
+    return sample[:max_chars]
+
+
+def groq_confirm_subtitle_language(
+    candidate,
+    subtitle_text,
+    expected_language="",
+    video_title="",
+    title="",
+    artist="",
+):
+    if not GROQ_API_KEYS:
+        return None
+
+    payload = {
+        "video_title": video_title,
+        "song_title": title,
+        "artist": artist,
+        "expected_language": normalize_language_code(expected_language),
+        "track_language": candidate.get("normalized_language_code") or "",
+        "track_name": candidate.get("name") or "",
+        "track_type": "automatic" if candidate.get("automatic") else "manual",
+        "subtitle_sample": compact_subtitle_sample(subtitle_text),
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Return JSON only. Decide whether the subtitle text is the "
+                "right lyrics language for this YouTube music video. Use the "
+                "expected_language when present. Return exactly: "
+                '{"approved": true/false, "language": "iso-639-1", "reason": "short reason"}.'
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(payload, ensure_ascii=False),
+        },
+    ]
+
+    try:
+        result = call_and_parse(
+            messages,
+            max_tokens=120,
+            json_mode=True,
+            temperature=0,
+        )
+    except Exception as error:
+        print(f"  Groq subtitle language validation unavailable: {error}")
+        return None
+
+    approved = bool(result.get("approved"))
+    detected_language = normalize_language_code(result.get("language"))
+    expected = normalize_language_code(expected_language)
+
+    if expected and approved and detected_language and detected_language != expected:
+        approved = False
+
+    return {
+        "approved": approved,
+        "reason": norm_text(result.get("reason") or "groq_response"),
+        "detected": {
+            "approved": approved,
+            "code": detected_language,
+            "confidence": 1.0 if approved else 0.0,
+            "margin": 1.0 if approved else 0.0,
+            "letters": sum(1 for char in subtitle_text if char.isalpha()),
+            "reason": "groq_confirmed" if approved else "groq_rejected",
+        },
+        "source": "groq",
+    }
+
+
+def validate_subtitle_candidate_language(
+    candidate,
+    subtitle_text,
+    expected_language="",
+    video_title="",
+    title="",
+    artist="",
+):
+    local_validation = validate_subtitle_language(
+        candidate=candidate,
+        subtitle_text=subtitle_text,
+        expected_language=expected_language,
+    )
+
+    if not local_validation.get("approved"):
+        local_validation["source"] = "local_lingua_full_text"
+        return local_validation
+
+    groq_validation = groq_confirm_subtitle_language(
+        candidate=candidate,
+        subtitle_text=subtitle_text,
+        expected_language=expected_language,
+        video_title=video_title,
+        title=title,
+        artist=artist,
+    )
+    if groq_validation is not None:
+        return groq_validation
+
+    local_validation["source"] = "local_lingua_full_text_groq_unavailable"
+    return local_validation
+
+
 
 def get_lyrics_from_youtube_subtitles(
     video_id,
@@ -1942,6 +2144,19 @@ def get_lyrics_from_youtube_subtitles(
 
     manual_candidates = list(iter_subtitle_candidates(info, automatic=False))
     automatic_candidates = list(iter_subtitle_candidates(info, automatic=True))
+    all_candidates = manual_candidates + automatic_candidates
+
+    if not expected_language:
+        video_language = normalize_language_code(info.get("language"))
+        if (
+            video_language in LANGUAGE_BY_CODE
+            and any(
+                candidate.get("normalized_language_code") == video_language
+                for candidate in all_candidates
+            )
+        ):
+            expected_language = video_language
+            expected_source = "youtube_video_language"
 
     print(
         "  Original YouTube subtitles after translation filtering: "
@@ -1949,6 +2164,7 @@ def get_lyrics_from_youtube_subtitles(
         f"{len(automatic_candidates)} automatic."
     )
 
+    selection_mode = "first_approved"
     if expected_language:
         print(
             f"  Expected lyrics language={expected_language} "
@@ -1956,7 +2172,7 @@ def get_lyrics_from_youtube_subtitles(
         )
         candidates = [
             candidate
-            for candidate in manual_candidates + automatic_candidates
+            for candidate in all_candidates
             if candidate.get("normalized_language_code") == expected_language
         ]
     else:
@@ -1967,11 +2183,13 @@ def get_lyrics_from_youtube_subtitles(
                 "manual subtitle exists; validating its actual text."
             )
         elif len(manual_candidates) > 1:
+            candidates = manual_candidates
+            selection_mode = "unknown_multiple_manual"
             print(
                 "  Expected language is unknown and multiple original manual "
-                "subtitle languages exist. Refusing to guess."
+                "subtitle languages exist. Validating all manual tracks and "
+                "preferring a single approved non-English track if unambiguous."
             )
-            return None, None
         elif len(automatic_candidates) == 1:
             candidates = automatic_candidates
             print(
@@ -1996,7 +2214,10 @@ def get_lyrics_from_youtube_subtitles(
         print("  No original subtitle track matches the expected lyrics language.")
         return None, None
 
-    for index, candidate in enumerate(candidates[:3], start=1):
+    approved_subtitles = []
+    candidate_limit = len(candidates) if selection_mode == "unknown_multiple_manual" else 3
+
+    for index, candidate in enumerate(candidates[:candidate_limit], start=1):
         kind = "automatic" if candidate.get("automatic") else "manual"
         print(
             f"  Validating {kind} subtitle #{index}: "
@@ -2009,15 +2230,18 @@ def get_lyrics_from_youtube_subtitles(
                 break
             continue
 
-        validation = validate_subtitle_language(
+        validation = validate_subtitle_candidate_language(
             candidate=candidate,
             subtitle_text=text,
             expected_language=expected_language,
+            video_title=video_title,
+            title=title,
+            artist=artist,
         )
 
         detected = validation.get("detected") or {}
         print(
-            "  Local subtitle language validation: "
+            f"  Subtitle language validation ({validation.get('source') or 'local'}): "
             f"approved={validation.get('approved')}, "
             f"track={candidate.get('normalized_language_code')}, "
             f"detected={detected.get('code')}, "
@@ -2032,8 +2256,32 @@ def get_lyrics_from_youtube_subtitles(
         approved_candidate = dict(candidate)
         approved_candidate["language_validation"] = validation
         approved_candidate["language_match_approved"] = True
-        approved_candidate["language_match_source"] = "local_lingua_full_text"
+        approved_candidate["language_match_source"] = (
+            validation.get("source") or "language_validation"
+        )
+        if selection_mode == "unknown_multiple_manual":
+            approved_subtitles.append((text, approved_candidate))
+            continue
         return text, approved_candidate
+
+    if selection_mode == "unknown_multiple_manual" and approved_subtitles:
+        non_english = [
+            item for item in approved_subtitles
+            if item[1].get("normalized_language_code") != "en"
+        ]
+        if len(non_english) == 1:
+            print(
+                "  Multiple manual subtitles validated; using the single "
+                f"approved non-English manual track: {non_english[0][1].get('name')}"
+            )
+            return non_english[0]
+        if len(approved_subtitles) == 1:
+            return approved_subtitles[0]
+        print(
+            "  Multiple manual subtitle tracks passed validation and the "
+            "original language is still ambiguous; not writing subtitles."
+        )
+        return None, None
 
     print("  No YouTube subtitle passed deterministic language validation.")
     return None, None
@@ -2066,83 +2314,142 @@ def lyric_similarity(left, right):
     return max(sequence_ratio, overlap_ratio)
 
 
-def choose_best_lyrics(
-    library_lyrics,
-    subtitle_lyrics,
-    subtitle_candidate,
-    library_source="lrclib",
-    title="",
-    artist="",
-):
-    library_source_label = (
-        "Genius" if library_source == "genius" else "LRCLIB"
-    )
-    library_lyrics = clean_lyrics_for_tag(library_lyrics or "")
-    subtitle_lyrics = clean_lyrics_for_tag(subtitle_lyrics or "")
-
+def subtitle_candidate_is_approved(subtitle_candidate):
     subtitle_validation = (
         subtitle_candidate.get("language_validation")
         if subtitle_candidate
         else None
     )
-    subtitle_is_approved = bool(
+    return bool(
         subtitle_validation
         and subtitle_validation.get("approved")
     )
 
-    if library_lyrics and subtitle_lyrics:
-        similarity = lyric_similarity(library_lyrics, subtitle_lyrics)
-        print(
-            f"  {library_source_label}/subtitle lyric similarity: "
-            f"{similarity:.2%}"
+
+def youtube_subtitle_source_name(subtitle_candidate):
+    if subtitle_candidate and subtitle_candidate.get("automatic"):
+        return "youtube_auto_subtitles_validated"
+    return "youtube_manual_subtitles_validated"
+
+
+def best_source_agreement(source_name, source_lyrics, other_sources):
+    best_similarity = 0.0
+    best_name = None
+
+    for other_name, other_lyrics in other_sources:
+        if not other_lyrics:
+            continue
+        similarity = lyric_similarity(source_lyrics, other_lyrics)
+        print(f"  {source_name}/{other_name} lyric similarity: {similarity:.2%}")
+        if similarity > best_similarity:
+            best_similarity = similarity
+            best_name = other_name
+
+    return best_similarity, best_name
+
+
+def subtitle_language_code(subtitle_candidate):
+    if not subtitle_candidate:
+        return ""
+    return normalize_language_code(
+        subtitle_candidate.get("normalized_language_code")
+        or subtitle_candidate.get("source_language_code")
+        or subtitle_candidate.get("language_code")
+    )
+
+
+def choose_ranked_lyrics(
+    genius_lyrics=None,
+    lrclib_lyrics=None,
+    subtitle_lyrics=None,
+    subtitle_candidate=None,
+    title="",
+    artist="",
+):
+    genius_lyrics = clean_legit_lyrics_candidate(
+        genius_lyrics,
+        source="Genius",
+        title=title,
+    )
+    lrclib_lyrics = clean_legit_lyrics_candidate(
+        lrclib_lyrics,
+        source="LRCLIB",
+        title=title,
+    )
+    subtitle_lyrics = clean_legit_lyrics_candidate(
+        subtitle_lyrics,
+        source="YouTube subtitle",
+        title=title,
+    )
+
+    subtitle_is_approved = subtitle_candidate_is_approved(subtitle_candidate)
+    if subtitle_lyrics and not subtitle_is_approved:
+        print("  Subtitle text exists but failed language validation; not writing it.")
+        subtitle_lyrics = ""
+
+    subtitle_source = youtube_subtitle_source_name(subtitle_candidate)
+    subtitle_label = (
+        "YouTube auto subtitle"
+        if subtitle_candidate and subtitle_candidate.get("automatic")
+        else "YouTube manual subtitle"
+    )
+
+    if genius_lyrics:
+        similarity, matched_source = best_source_agreement(
+            "Genius",
+            genius_lyrics,
+            [
+                ("LRCLIB", lrclib_lyrics),
+                (subtitle_label, subtitle_lyrics),
+            ],
         )
-
-        if not subtitle_is_approved:
+        if matched_source and similarity >= MIN_LYRIC_SOURCE_AGREEMENT:
             print(
-                f"  Rejecting subtitle; using verified "
-                f"{library_source_label} result."
+                "  Genius lyrics are corroborated by "
+                f"{matched_source} at {similarity:.2%}; using Genius."
             )
-            return library_lyrics, library_source, similarity
+            return genius_lyrics, "genius", similarity
 
-        if similarity >= 0.80:
-            print(
-                f"  Sources agree sufficiently; using "
-                f"{library_source_label} lyrics."
-            )
-            return library_lyrics, library_source, similarity
-
-        subtitle_kind = (
-            "automatic" if subtitle_candidate.get("automatic") else "manual"
+    if lrclib_lyrics:
+        similarity, matched_source = best_source_agreement(
+            "LRCLIB",
+            lrclib_lyrics,
+            [
+                ("Genius", genius_lyrics),
+                (subtitle_label, subtitle_lyrics),
+            ],
         )
-        if subtitle_kind == "manual":
+        if matched_source and similarity >= MIN_LYRIC_SOURCE_AGREEMENT:
             print(
-                "  Approved manual YouTube subtitle disagrees with "
-                f"{library_source_label} below 80%; using the manual subtitle."
+                "  LRCLIB lyrics are corroborated by "
+                f"{matched_source} at {similarity:.2%}; using LRCLIB."
+            )
+            return lrclib_lyrics, "lrclib", similarity
+
+    if subtitle_lyrics and subtitle_is_approved:
+        if subtitle_candidate and subtitle_candidate.get("automatic"):
+            print(
+                "  Using approved automatic YouTube subtitles because "
+                "no Genius/LRCLIB result reached 80% agreement."
             )
         else:
             print(
-                "  No approved manual subtitle won, and approved automatic "
-                f"YouTube subtitles disagree with {library_source_label} "
-                "below 80%; using the automatic subtitle."
+                "  Using approved manual YouTube subtitles because "
+                "no Genius/LRCLIB result reached 80% agreement."
             )
-        return subtitle_lyrics, "youtube_subtitles_validated", similarity
+        return subtitle_lyrics, subtitle_source, None
 
-    if library_lyrics:
+    low_confidence_sources = []
+    if genius_lyrics:
+        low_confidence_sources.append("Genius")
+    if lrclib_lyrics:
+        low_confidence_sources.append("LRCLIB")
+
+    if low_confidence_sources:
         print(
-            f"  Using strict {library_source_label} lyrics; "
-            "no approved YouTube subtitle was found."
+            "  Leaving lyrics blank rather than writing low-confidence "
+            f"{'/'.join(low_confidence_sources)} lyrics without 80% agreement."
         )
-        return library_lyrics, library_source, None
-
-    if subtitle_lyrics and subtitle_is_approved:
-        print(
-            "  Using YouTube subtitle only because it passed track-code, "
-            "full-text language, expected-language, and length gates."
-        )
-        return subtitle_lyrics, "youtube_subtitles_validated", None
-
-    if subtitle_lyrics and not subtitle_is_approved:
-        print("  Subtitle text exists but failed validation; not writing it.")
 
     return None, None, None
 
@@ -2237,7 +2544,7 @@ def write_tags(file_path: str, title: str, artist: str, album: str = ""):
         raise RuntimeError(f"Tag write failed: {e}")
 
 
-def write_lyrics(file_path: str, lyrics: str, replace_existing=False):
+def write_lyrics(file_path: str, lyrics: str, replace_existing=False, language_code=""):
     lyrics = clean_lyrics_for_tag(lyrics)
     if not lyrics:
         return
@@ -2302,7 +2609,14 @@ def write_lyrics(file_path: str, lyrics: str, replace_existing=False):
                     if str(text).strip():
                         return
 
-            tags.add(USLT(encoding=3, lang="eng", desc="", text=lyrics))
+            tags.add(
+                USLT(
+                    encoding=3,
+                    lang=id3_lyrics_language(language_code),
+                    desc="",
+                    text=lyrics,
+                )
+            )
             retry_file_operation(
                 f"saving ID3 lyrics for {file_path}",
                 lambda: tags.save(file_path, v2_version=3),
@@ -2607,8 +2921,8 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
             try:
                 lyrics = None
                 selected_lyrics_source = None
-                library_lyrics = None
-                library_source = "lrclib"
+                lyrics_language_code = ""
+                lrclib_lyrics = None
                 subtitle_lyrics = None
                 subtitle_candidate = None
 
@@ -2627,44 +2941,49 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
                         require_artist=False,
                     )
 
-                if genius_lyrics:
-                    lyrics = genius_lyrics
-                    selected_lyrics_source = "genius"
-                    print("  Genius lyrics found; skipping LRCLIB and YouTube subtitles.")
+                duration = read_duration_seconds(file_path)
+                lrclib_lyrics = get_lyrics_from_lrclib(
+                    title=title,
+                    artist=artist,
+                    duration=duration,
+                    album=existing_album,
+                )
+
+                if video_id:
+                    subtitle_lyrics, subtitle_candidate = get_lyrics_from_youtube_subtitles(
+                        video_id=video_id,
+                        video_title=cleaned_name_for_ai,
+                        title=title,
+                        artist=artist,
+                        library_lyrics=lrclib_lyrics,
+                        explicit_language=ARGS.preferred_language,
+                    )
                 else:
-                    duration = read_duration_seconds(file_path)
-                    library_lyrics = get_lyrics_from_lrclib(
-                        title=title,
-                        artist=artist,
-                        duration=duration,
-                        album=existing_album,
-                    )
+                    print("  No YouTube video id found in filename; cannot look up subtitle lyrics.")
 
-                    if video_id:
-                        subtitle_lyrics, subtitle_candidate = get_lyrics_from_youtube_subtitles(
-                            video_id=video_id,
-                            video_title=cleaned_name_for_ai,
-                            title=title,
-                            artist=artist,
-                            library_lyrics=library_lyrics,
-                            explicit_language=ARGS.preferred_language,
-                        )
-                    else:
-                        print("  No YouTube video id found in filename; cannot look up subtitle lyrics.")
+                lyrics, selected_lyrics_source, lyric_source_similarity = choose_ranked_lyrics(
+                    genius_lyrics=genius_lyrics,
+                    lrclib_lyrics=lrclib_lyrics,
+                    subtitle_lyrics=subtitle_lyrics,
+                    subtitle_candidate=subtitle_candidate,
+                    title=title,
+                    artist=artist,
+                )
 
-                    lyrics, selected_lyrics_source, lyric_source_similarity = choose_best_lyrics(
-                        library_lyrics=library_lyrics,
-                        subtitle_lyrics=subtitle_lyrics,
-                        subtitle_candidate=subtitle_candidate,
-                        library_source=library_source,
-                        title=title,
-                        artist=artist,
-                    )
+                if selected_lyrics_source and selected_lyrics_source.startswith("youtube_"):
+                    lyrics_language_code = subtitle_language_code(subtitle_candidate)
+                elif lyrics:
+                    lyrics_language_code = detect_lyrics_language_code(lyrics)
 
                 if lyrics:
                     cleaned_lyrics = clean_lyrics_for_tag(lyrics)
                     if cleaned_lyrics:
-                        write_lyrics(file_path, cleaned_lyrics, replace_existing=True)
+                        write_lyrics(
+                            file_path,
+                            cleaned_lyrics,
+                            replace_existing=True,
+                            language_code=lyrics_language_code,
+                        )
                         lyrics_found = True
                         lyrics_source = selected_lyrics_source
                         subtitle_track = subtitle_candidate.get("name") if subtitle_candidate else None

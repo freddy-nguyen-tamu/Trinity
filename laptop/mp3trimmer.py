@@ -887,19 +887,25 @@ class MP3Trimmer(QtWidgets.QMainWindow):
                     orig_tags = ID3(self.original_file)
                     title = orig_tags.get('TIT2')
                     artist = orig_tags.get('TPE1')
-                    lyrics = orig_tags.get('USLT')
+                    lyrics_frames = orig_tags.getall('USLT') + orig_tags.getall('SYLT')
+                    for frame in orig_tags.getall('TXXX'):
+                        if 'lyric' in str(getattr(frame, 'desc', '')).casefold():
+                            lyrics_frames.append(frame)
                     comment_frames = orig_tags.getall('COMM')
                     url_frames = orig_tags.getall('WOAS') + orig_tags.getall('WXXX')
-                    if title or artist or lyrics or comment_frames or url_frames:
+                    if title or artist or lyrics_frames or comment_frames or url_frames:
                         out_audio = MP3(path, ID3=ID3)
                         if out_audio.tags is None:
                             out_audio.tags = ID3()
                         if title:
-                            out_audio.tags.add(title)
+                            out_audio.tags.add(copy.copy(title))
                         if artist:
-                            out_audio.tags.add(artist)
-                        if lyrics:
-                            out_audio.tags.add(lyrics)
+                            out_audio.tags.add(copy.copy(artist))
+                        if lyrics_frames:
+                            out_audio.tags.delall('USLT')
+                            out_audio.tags.delall('SYLT')
+                            for frame in lyrics_frames:
+                                out_audio.tags.add(copy.copy(frame))
                         if comment_frames:
                             out_audio.tags.delall('COMM')
                             for frame in comment_frames:
