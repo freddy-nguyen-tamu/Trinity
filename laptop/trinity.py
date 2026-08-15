@@ -7,6 +7,8 @@ import subprocess
 import sys
 import time
 
+from upload_identity import upload_history_key as build_upload_history_key
+
 try:
     from mutagen import File as MutagenFile
     from mutagen.aiff import AIFF
@@ -341,10 +343,7 @@ def relative_finished_name(path):
 
 
 def uploaded_history_key(path):
-    abs_path = os.path.abspath(path)
-    name = relative_finished_name(abs_path)
-    size = os.path.getsize(abs_path) if os.path.exists(abs_path) else 0
-    return f"{name}|{size}"
+    return build_upload_history_key(path, base_dir=FINISHED_DIR)
 
 
 def strip_history_size_suffix(item):
@@ -361,19 +360,15 @@ def stable_finished_name_key(name):
 
 
 def history_key_from_item(item):
+    recorded_key = str(item.get("history_key") or "").strip()
+    if recorded_key.startswith("upload-v2|"):
+        return recorded_key
+
     path = safe_finished_path(item.get("path", ""))
-    name = relative_finished_name(path) if path else item.get("name", "")
-    size = item.get("size")
+    if path and os.path.exists(path):
+        return uploaded_history_key(path)
 
-    if size is None and path and os.path.exists(path):
-        size = os.path.getsize(path)
-
-    try:
-        size = int(size)
-    except (TypeError, ValueError):
-        size = 0
-
-    return f"{name}|{size}"
+    return ""
 
 
 def load_history_file(path, purpose):
@@ -792,7 +787,6 @@ def pending_finished_test_files():
 
 def pending_finished_drive_upload_files():
     uploaded_history = load_uploaded_history()
-    drive_uploaded_history = load_drive_uploaded_history()
     pending = []
 
     for path in sorted(snapshot_finished_files()):
@@ -802,28 +796,10 @@ def pending_finished_drive_upload_files():
         history_key = uploaded_history_key(path)
         if history_key not in uploaded_history:
             continue
-        if history_key in drive_uploaded_history:
-            continue
 
         pending.append(path)
 
     return pending
-
-
-def finished_files_uploaded_to_android_and_drive():
-    uploaded_history = load_uploaded_history()
-    drive_uploaded_history = load_drive_uploaded_history()
-    ready = []
-
-    for path in sorted(snapshot_finished_files()):
-        if not is_supported_audio_file(path):
-            continue
-
-        history_key = uploaded_history_key(path)
-        if history_key in uploaded_history and history_key in drive_uploaded_history:
-            ready.append(path)
-
-    return ready
 
 
 def remember_successful_uploads(successful_items):
@@ -1181,50 +1157,6 @@ def print_drive_upload_summary(summary):
         log(f"Drive upload/delete error: {summary['error']}")
 
 
-def delete_finished_files_already_uploaded_to_both(paths):
-    if not paths:
-        log("")
-        log("No finished/ files already uploaded to both Android and Drive need local cleanup.")
-        return
-
-    log("")
-    log("Moving finished/ files already recorded as uploaded to both Android and Drive to system trash:")
-    print_numbered_files("Already uploaded to both:", paths)
-
-    deleted = []
-    failed = []
-
-    for path in paths:
-        safe_path = safe_finished_path(path)
-        if not safe_path or not os.path.exists(safe_path):
-            continue
-
-        try:
-            recycle_file_if_exists(
-                safe_path,
-                f"moving already uploaded finished file to system trash {safe_path}",
-            )
-            deleted.append(safe_path)
-            log(f"Moved local file already uploaded to Android and Drive to system trash: {safe_path}")
-        except Exception as e:
-            failed.append(
-                {
-                    "path": safe_path,
-                    "name": relative_finished_name(safe_path),
-                    "error": str(e),
-                }
-            )
-            log(
-                "WARNING: Could not move file already uploaded to Android and Drive to system trash: "
-                f"{safe_path} ({e})"
-            )
-
-    log(f"Moved already-uploaded local files to system trash: {len(deleted)}")
-    if failed:
-        log(f"Failed to move already-uploaded local files to system trash: {len(failed)}")
-        print_numbered_files("Already-uploaded trash move failures:", failed)
-
-
 def auto_drive_upload_then_delete(drive_candidates):
     if not drive_candidates:
         log("")
@@ -1454,9 +1386,6 @@ def main():
     if should_upload:
         try:
             auto_drive_upload_then_delete(drive_candidates)
-            delete_finished_files_already_uploaded_to_both(
-                finished_files_uploaded_to_android_and_drive()
-            )
         finally:
             close_run_log()
     else:

@@ -9,6 +9,8 @@ import sys
 import time
 from pathlib import Path
 
+from upload_identity import calculate_file_hash, upload_history_key as build_upload_history_key
+
 DRIVE_FOLDER_ID = "1qbVH_yaNn1aagSrMGvZIggCjSvRzZRSs"
 SERVICE_ACCOUNT_EMAIL = "trinitydrive@wavestack2.iam.gserviceaccount.com"
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -214,11 +216,15 @@ def load_manifest_files(manifest_path):
 
 def file_item(path):
     path = Path(path)
-    return {
+    item = {
         "path": str(path),
         "name": path.name,
         "size": path.stat().st_size if path.exists() else 0,
     }
+    if path.exists():
+        item["history_key"] = build_upload_history_key(path, base_dir=FINISHED_DIR)
+        item["md5"] = calculate_file_hash(path, "md5")
+    return item
 
 
 def load_history_file(path, purpose):
@@ -252,9 +258,7 @@ def relative_finished_name(path):
 
 
 def uploaded_history_key(path):
-    path = Path(path).resolve()
-    size = path.stat().st_size if path.exists() else 0
-    return f"{relative_finished_name(path)}|{size}"
+    return build_upload_history_key(path, base_dir=FINISHED_DIR)
 
 
 def write_summary(summary_path, summary):
@@ -391,7 +395,58 @@ def validate_drive_folder(service, folder_id):
     return folder
 
 
-def upload_one_file(service, file_path, folder_id):
+def drive_query_literal(value):
+    return str(value).replace("\\", "\\\\").replace("'", "\\'")
+
+
+def find_existing_drive_file(service, file_path, folder_id, expected_md5):
+    file_path = Path(file_path)
+    expected_size = file_path.stat().st_size
+    escaped_name = drive_query_literal(file_path.name)
+    escaped_folder_id = drive_query_literal(folder_id)
+    query = (
+        f"'{escaped_folder_id}' in parents and "
+        f"name = '{escaped_name}' and trashed = false"
+    )
+
+    page_token = None
+    while True:
+        response = (
+            service.files()
+            .list(
+                q=query,
+                fields=(
+                    "nextPageToken,files("
+                    "id,name,size,md5Checksum,webViewLink,parents,trashed)"
+                ),
+                pageSize=100,
+                pageToken=page_token,
+                spaces="drive",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
+            .execute()
+        )
+
+        for item in response.get("files", []):
+            try:
+                item_size = int(item.get("size", -1))
+            except (TypeError, ValueError):
+                item_size = -1
+
+            if (
+                item_size == expected_size
+                and str(item.get("md5Checksum") or "").casefold()
+                == str(expected_md5 or "").casefold()
+            ):
+                return item
+
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            return None
+
+
+def upload_one_file(service, file_path, folder_id, expected_md5=None):
     from googleapiclient.http import MediaFileUpload
 
     file_path = Path(file_path)
@@ -428,6 +483,14 @@ def upload_one_file(service, file_path, folder_id):
             raise RuntimeError(
                 f"Drive uploaded size mismatch for {file_path.name}: "
                 f"local={expected_size}, drive={returned_size_int}"
+            )
+
+    returned_md5 = uploaded.get("md5Checksum")
+    if expected_md5 and returned_md5:
+        if str(returned_md5).casefold() != str(expected_md5).casefold():
+            raise RuntimeError(
+                f"Drive uploaded checksum mismatch for {file_path.name}: "
+                f"local={expected_md5}, drive={returned_md5}"
             )
 
     return uploaded
@@ -538,20 +601,40 @@ def main():
             file_path = Path(file_path)
 
             try:
-                print(f"[{index}/{len(files)}] Uploading: {file_path.name}")
-                uploaded = upload_one_file(service, file_path, args.folder_id)
-
                 success_item = file_item(file_path)
+                print(f"[{index}/{len(files)}] Checking Drive: {file_path.name}")
+                uploaded = find_existing_drive_file(
+                    service,
+                    file_path,
+                    args.folder_id,
+                    success_item.get("md5"),
+                )
+                drive_already_present = uploaded is not None
+
+                if drive_already_present:
+                    print(
+                        "Confirmed identical untrashed Drive file: "
+                        f"{file_path.name}"
+                    )
+                else:
+                    print(f"[{index}/{len(files)}] Uploading: {file_path.name}")
+                    uploaded = upload_one_file(
+                        service,
+                        file_path,
+                        args.folder_id,
+                        expected_md5=success_item.get("md5"),
+                    )
+                    print(f"Uploaded: {file_path.name}")
+
                 success_item.update(
                     {
                         "drive_file_id": uploaded.get("id"),
                         "drive_name": uploaded.get("name"),
                         "drive_web_view_link": uploaded.get("webViewLink"),
+                        "drive_already_present": drive_already_present,
                     }
                 )
                 summary["successful"].append(success_item)
-
-                print(f"Uploaded: {file_path.name}")
 
                 if args.delete_after_upload:
                     history_key = uploaded_history_key(file_path)

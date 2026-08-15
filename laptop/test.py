@@ -10,6 +10,7 @@ import re
 import time
 import unicodedata
 import requests
+from html.parser import HTMLParser
 from xml.etree import ElementTree
 from urllib.parse import parse_qs, urlparse
 
@@ -38,7 +39,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_AUDIO_FOLDER = os.path.join(BASE_DIR, "_working_downloads")
 LYRICS_NOT_FOUND_HISTORY_PATH = os.path.join(BASE_DIR, "_lyrics_not_found_history.json")
 LYRICS_NOT_FOUND_HISTORY_VERSION = 2
-LYRICS_NOT_FOUND_RESOLVER_VERSION = 4
+LYRICS_NOT_FOUND_RESOLVER_VERSION = 5
 MIN_LYRIC_SOURCE_AGREEMENT = 0.80
 
 
@@ -279,6 +280,106 @@ def clean_lyrics_for_tag(lyrics: str) -> str:
         cleaned_lines.pop()
 
     return "\n".join(cleaned_lines).strip()
+
+
+class GeniusLyricsHTMLParser(HTMLParser):
+    BLOCK_TAGS = {"div", "p", "section", "article", "li", "h1", "h2", "h3"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.container_tag = ""
+        self.container_depth = 0
+        self.current_parts = []
+        self.lyrics_containers = []
+
+    def append_break(self):
+        if self.current_parts and self.current_parts[-1] != "\n":
+            self.current_parts.append("\n")
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.casefold()
+        attrs = {str(key).casefold(): value for key, value in attrs}
+
+        if not self.container_depth:
+            if str(attrs.get("data-lyrics-container", "")).casefold() == "true":
+                self.container_tag = tag
+                self.container_depth = 1
+                self.current_parts = []
+            return
+
+        if tag == self.container_tag:
+            self.container_depth += 1
+        if tag == "br" or tag in self.BLOCK_TAGS:
+            self.append_break()
+
+    def handle_startendtag(self, tag, attrs):
+        if self.container_depth and tag.casefold() == "br":
+            self.append_break()
+
+    def handle_endtag(self, tag):
+        if not self.container_depth:
+            return
+
+        tag = tag.casefold()
+        if tag in self.BLOCK_TAGS:
+            self.append_break()
+
+        if tag == self.container_tag:
+            self.container_depth -= 1
+            if not self.container_depth:
+                text = "".join(self.current_parts).strip()
+                if text:
+                    self.lyrics_containers.append(text)
+                self.container_tag = ""
+                self.current_parts = []
+
+    def handle_data(self, data):
+        if self.container_depth:
+            self.current_parts.append(data)
+
+
+def clean_genius_lyrics_for_tag(lyrics: str, title: str = "") -> str:
+    cleaned = clean_lyrics_for_tag(lyrics)
+    if not cleaned:
+        return ""
+
+    lines = cleaned.splitlines()
+    title_lyrics = norm_text(f"{title} Lyrics").casefold()
+
+    while lines:
+        first = norm_text(lines[0])
+        folded = first.casefold()
+        contributor_prefix = re.match(
+            r"^\d+\s+contributors?\s*",
+            first,
+            flags=re.IGNORECASE,
+        )
+        if contributor_prefix:
+            remainder = first[contributor_prefix.end():].strip()
+            if remainder:
+                lines[0] = remainder
+            else:
+                lines.pop(0)
+            continue
+        if folded in {"lyrics", title_lyrics}:
+            lines.pop(0)
+            continue
+        break
+
+    while lines and re.fullmatch(r"\d*\s*embed", lines[-1], flags=re.IGNORECASE):
+        lines.pop()
+
+    return clean_lyrics_for_tag("\n".join(lines))
+
+
+def extract_genius_lyrics_from_html(html_text: str, title: str = "") -> str:
+    parser = GeniusLyricsHTMLParser()
+    parser.feed(html_text or "")
+    parser.close()
+    return clean_genius_lyrics_for_tag(
+        "\n\n".join(parser.lyrics_containers),
+        title=title,
+    )
 
 
 def clean_input_filename(name: str) -> str:
@@ -1476,24 +1577,9 @@ def get_lyrics_from_genius(title: str, artist: str, require_artist=True):
         if page_resp.status_code != 200:
             return None
 
-        html_text = page_resp.text
-        lyrics_parts = re.findall(
-            r'<div[^>]*data-lyrics-container="true"[^>]*>(.*?)</div>',
-            html_text,
-            re.DOTALL,
-        )
-        if not lyrics_parts:
+        lyrics = extract_genius_lyrics_from_html(page_resp.text, title=title)
+        if not lyrics:
             return None
-
-        lyrics_lines = []
-        for part in lyrics_parts:
-            part = re.sub(r'<br\s*/?>', "\n", part)
-            part = re.sub(r"<[^>]+>", "", part)
-            part = html.unescape(part)
-            lyrics_lines.append(part.strip())
-
-        lyrics = "\n\n".join(lyrics_lines).strip()
-        lyrics = clean_lyrics_for_tag(lyrics)
         if not genius_lyrics_text_looks_usable(lyrics, title=title):
             print(
                 "  Genius lyrics rejected because the extracted page text "
@@ -2289,7 +2375,20 @@ def get_lyrics_from_youtube_subtitles(
 
 def normalize_lyrics_for_similarity(text):
     text = remove_square_bracket_content(text or "")
-    text = unicodedata.normalize("NFKC", text).lower()
+    text = unicodedata.normalize("NFKD", text).lower()
+
+    folded_chars = []
+    for char in text:
+        if (
+            unicodedata.combining(char)
+            and folded_chars
+            and "LATIN" in unicodedata.name(folded_chars[-1], "")
+        ):
+            continue
+        folded_chars.append(char)
+
+    text = unicodedata.normalize("NFC", "".join(folded_chars))
+    text = text.replace("đ", "d")
     text = re.sub(r"\([^)]*(official|lyrics?|video|audio|remix|cover)[^)]*\)", " ", text)
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
     text = re.sub(r"\s+", " ", text).strip()
@@ -2303,7 +2402,12 @@ def lyric_similarity(left, right):
     if not left_norm or not right_norm:
         return 0.0
 
-    sequence_ratio = difflib.SequenceMatcher(None, left_norm, right_norm).ratio()
+    sequence_ratio = difflib.SequenceMatcher(
+        None,
+        left_norm,
+        right_norm,
+        autojunk=False,
+    ).ratio()
     left_words = set(left_norm.split())
     right_words = set(right_norm.split())
 
