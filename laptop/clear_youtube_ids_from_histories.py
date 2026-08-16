@@ -1,7 +1,9 @@
 import argparse
 import json
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -112,8 +114,9 @@ def item_matches_ids(item, ids):
     if not isinstance(item, str):
         return False
 
-    item_folded = item.casefold()
-    return any(youtube_id.casefold() in item_folded for youtube_id in ids)
+    # YouTube video IDs are case-sensitive. Do not clear a different video whose
+    # ID differs only by letter case.
+    return any(youtube_id in item for youtube_id in ids)
 
 
 def value_matches_ids(value, ids):
@@ -132,7 +135,17 @@ def value_matches_ids(value, ids):
     return False
 
 
-def filter_history_data(data, ids):
+def dict_has_direct_id_trace(data, ids):
+    """Return whether a mapping directly identifies one requested video."""
+    return any(
+        item_matches_ids(str(key), ids)
+        or (isinstance(value, str) and item_matches_ids(value, ids))
+        for key, value in data.items()
+    )
+
+
+def filter_json_data(data, ids):
+    """Remove ID-bearing records while preserving an arbitrary JSON shape."""
     removed = []
 
     if isinstance(data, list):
@@ -153,16 +166,14 @@ def filter_history_data(data, ids):
                 removed.append(str(key))
                 continue
 
-            if isinstance(value, dict) and not any(
-                isinstance(item, (list, dict)) for item in value.values()
-            ):
-                if value_matches_ids(value, ids):
-                    changed = True
-                    removed.append(str(key))
-                else:
-                    filtered[key] = value
+            # Dictionary-of-record histories commonly use an unrelated path or
+            # filename as the key and put video_id in a direct field. Remove the
+            # whole record so it cannot remain as stale processed/uploaded state.
+            if isinstance(value, dict) and dict_has_direct_id_trace(value, ids):
+                changed = True
+                removed.append(str(key))
             elif isinstance(value, (list, dict)):
-                new_value, nested_removed = filter_history_data(value, ids)
+                new_value, nested_removed = filter_json_data(value, ids)
                 filtered[key] = new_value
                 if nested_removed:
                     changed = True
@@ -174,7 +185,14 @@ def filter_history_data(data, ids):
                 filtered[key] = value
         return filtered if changed else data, removed
 
+    if isinstance(data, str) and item_matches_ids(data, ids):
+        return None, [data]
+
     return data, removed
+
+
+# Keep the old function name available for callers that imported this script.
+filter_history_data = filter_json_data
 
 
 def load_json(path):
@@ -183,25 +201,70 @@ def load_json(path):
 
 
 def save_json(path, data):
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            temporary_path = Path(f.name)
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
-def clear_ids_from_histories(ids, dry_run=False):
-    history_files = sorted(SCRIPT_DIR.glob("*history*.json"))
+def find_json_files(root_dir=SCRIPT_DIR):
+    root_dir = Path(root_dir).resolve()
+    return sorted(
+        (
+            path
+            for path in root_dir.rglob("*")
+            if path.is_file() and path.suffix.casefold() == ".json"
+        ),
+        key=lambda path: str(path).casefold(),
+    )
+
+
+def clear_ids_from_histories(ids, dry_run=False, root_dir=SCRIPT_DIR):
+    root_dir = Path(root_dir).resolve()
+    json_files = find_json_files(root_dir)
     results = []
 
-    for path in history_files:
+    for path in json_files:
         try:
             data = load_json(path)
         except Exception as e:
             results.append((path, None, [f"ERROR reading JSON: {e}"]))
             continue
 
-        filtered, removed = filter_history_data(data, ids)
+        filtered, removed = filter_json_data(data, ids)
+        if removed and value_matches_ids(filtered, ids):
+            results.append(
+                (
+                    path,
+                    None,
+                    ["ERROR: an ID trace remained after filtering; file was not changed"],
+                )
+            )
+            continue
+
         if removed and not dry_run:
-            save_json(path, filtered)
+            try:
+                save_json(path, filtered)
+            except Exception as e:
+                results.append((path, None, [f"ERROR writing JSON: {e}"]))
+                continue
 
         results.append((path, len(removed), removed))
 
@@ -210,7 +273,10 @@ def clear_ids_from_histories(ids, dry_run=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Remove listed YouTube video IDs from every *history*.json file beside this script."
+        description=(
+            "Recursively remove listed YouTube video IDs from every JSON file "
+            "under the laptop folder."
+        )
     )
     parser.add_argument(
         "--ids-file",
@@ -245,20 +311,30 @@ def main():
         print("")
         print("DRY RUN: no files will be changed.")
 
+    json_files = find_json_files(SCRIPT_DIR)
+    print(f"Scanning {len(json_files)} JSON file(s) recursively under: {SCRIPT_DIR}")
     results = clear_ids_from_histories(ids, dry_run=args.dry_run)
 
     print("")
-    print("History cleanup summary")
+    print("JSON cleanup summary")
     print("-" * 50)
 
     total_removed = 0
     for path, removed_count, removed_items in results:
+        try:
+            display_path = path.relative_to(SCRIPT_DIR)
+        except ValueError:
+            display_path = path
+
         if removed_count is None:
-            print(f"{path.name}: {removed_items[0]}")
+            print(f"{display_path}: {removed_items[0]}")
             continue
 
         total_removed += removed_count
-        print(f"{path.name}: removed {removed_count} entr{'y' if removed_count == 1 else 'ies'}")
+        print(
+            f"{display_path}: removed {removed_count} "
+            f"entr{'y' if removed_count == 1 else 'ies'}"
+        )
         for item in removed_items:
             print(f"  {item}")
 
