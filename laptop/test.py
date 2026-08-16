@@ -39,7 +39,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_AUDIO_FOLDER = os.path.join(BASE_DIR, "_working_downloads")
 LYRICS_NOT_FOUND_HISTORY_PATH = os.path.join(BASE_DIR, "_lyrics_not_found_history.json")
 LYRICS_NOT_FOUND_HISTORY_VERSION = 2
-LYRICS_NOT_FOUND_RESOLVER_VERSION = 5
+LYRICS_NOT_FOUND_RESOLVER_VERSION = 6
 MIN_LYRIC_SOURCE_AGREEMENT = 0.80
 
 
@@ -1429,7 +1429,13 @@ def _lrclib_search(
     return None
 
 
-def get_lyrics_from_lrclib(title, artist, duration=None, album=""):
+def get_lyrics_from_lrclib(
+    title,
+    artist,
+    duration=None,
+    album="",
+    title_only_query=False,
+):
     if not title:
         return None
 
@@ -1437,14 +1443,14 @@ def get_lyrics_from_lrclib(title, artist, duration=None, album=""):
     artist = norm_text(artist)
     album = norm_text(album)
 
-    if artist and artist != "Unknown":
+    if artist and artist != "Unknown" and not title_only_query:
         lyrics = _lrclib_get(title=title, artist=artist, duration=duration, album=album)
         if lyrics:
             return lyrics
 
     query = (
         f"{artist} {title}".strip()
-        if artist and artist != "Unknown"
+        if artist and artist != "Unknown" and not title_only_query
         else title
     )
     if artist and artist != "Unknown":
@@ -1461,7 +1467,12 @@ def get_lyrics_from_lrclib(title, artist, duration=None, album=""):
     )
 
 
-def get_lyrics_from_genius(title: str, artist: str, require_artist=True):
+def get_lyrics_from_genius(
+    title: str,
+    artist: str,
+    require_artist=True,
+    title_only_query=False,
+):
     if not title or not GENIUS_API_TOKEN:
         return None
 
@@ -1472,8 +1483,17 @@ def get_lyrics_from_genius(title: str, artist: str, require_artist=True):
         and artist
         and artist.casefold() != "unknown"
     )
-    query = f"{artist} {title}".strip() if require_artist else title
-    search_label = "title+artist" if require_artist else "title-only"
+    query = (
+        f"{artist} {title}".strip()
+        if require_artist and not title_only_query
+        else title
+    )
+    if require_artist and title_only_query:
+        search_label = "title-only query with artist validation"
+    elif require_artist:
+        search_label = "title+artist"
+    else:
+        search_label = "title-only"
     headers = {"Authorization": f"Bearer {GENIUS_API_TOKEN}"}
 
     try:
@@ -1590,6 +1610,70 @@ def get_lyrics_from_genius(title: str, artist: str, require_artist=True):
         return lyrics
     except Exception:
         return None
+
+
+def find_genius_lyrics_with_no_result_retry(title, artist):
+    has_title_and_artist = has_usable_title_and_artist(title, artist)
+
+    if has_title_and_artist:
+        lyrics = get_lyrics_from_genius(
+            title=title,
+            artist=artist,
+            require_artist=True,
+        )
+        if lyrics:
+            return lyrics, True, False
+
+        print(
+            "  Genius title+artist search returned no accepted result; "
+            "retrying with a title-only query and the same artist validation."
+        )
+        lyrics = get_lyrics_from_genius(
+            title=title,
+            artist=artist,
+            require_artist=True,
+            title_only_query=True,
+        )
+        return lyrics, False, True
+
+    lyrics = get_lyrics_from_genius(
+        title=title,
+        artist="",
+        require_artist=False,
+        title_only_query=True,
+    )
+    return lyrics, False, True
+
+
+def find_lrclib_lyrics_with_no_result_retry(
+    title,
+    artist,
+    duration=None,
+    album="",
+):
+    has_title_and_artist = has_usable_title_and_artist(title, artist)
+    lyrics = get_lyrics_from_lrclib(
+        title=title,
+        artist=artist,
+        duration=duration,
+        album=album,
+    )
+
+    if lyrics or not has_title_and_artist:
+        return lyrics, bool(lyrics and has_title_and_artist), not has_title_and_artist
+
+    print(
+        "  LRCLIB title+artist search returned no accepted result; "
+        "retrying with a title-only query and the same artist validation."
+    )
+    lyrics = get_lyrics_from_lrclib(
+        title=title,
+        artist=artist,
+        duration=duration,
+        album=album,
+        title_only_query=True,
+    )
+    return lyrics, False, True
 
 
 YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -2469,6 +2553,7 @@ def choose_ranked_lyrics(
     subtitle_candidate=None,
     title="",
     artist="",
+    finalize_fallback=True,
 ):
     genius_lyrics = clean_legit_lyrics_candidate(
         genius_lyrics,
@@ -2530,6 +2615,9 @@ def choose_ranked_lyrics(
             )
             return lrclib_lyrics, "lrclib", similarity
 
+    if not finalize_fallback:
+        return None, None, None
+
     if subtitle_lyrics and subtitle_is_approved:
         if subtitle_candidate and subtitle_candidate.get("automatic"):
             print(
@@ -2556,6 +2644,90 @@ def choose_ranked_lyrics(
         )
 
     return None, None, None
+
+
+def choose_ranked_lyrics_with_rejected_candidate_retries(
+    genius_lyrics=None,
+    lrclib_lyrics=None,
+    subtitle_lyrics=None,
+    subtitle_candidate=None,
+    title="",
+    artist="",
+    genius_found_with_artist=False,
+    lrclib_found_with_artist=False,
+    genius_title_only_attempted=False,
+    lrclib_title_only_attempted=False,
+    genius_title_only_lookup=None,
+    lrclib_title_only_lookup=None,
+):
+    provisional_choice = choose_ranked_lyrics(
+        genius_lyrics=genius_lyrics,
+        lrclib_lyrics=lrclib_lyrics,
+        subtitle_lyrics=subtitle_lyrics,
+        subtitle_candidate=subtitle_candidate,
+        title=title,
+        artist=artist,
+        finalize_fallback=False,
+    )
+    lyrics, selected_source, similarity = provisional_choice
+
+    if selected_source == "genius":
+        return lyrics, selected_source, similarity
+
+    if (
+        selected_source != "genius"
+        and genius_found_with_artist
+        and not genius_title_only_attempted
+        and callable(genius_title_only_lookup)
+    ):
+        print(
+            "  Genius title+artist candidate was rejected by final lyric "
+            "evaluation; retrying with a title-only query and the same "
+            "artist validation."
+        )
+        fallback_genius_lyrics = genius_title_only_lookup()
+        if fallback_genius_lyrics:
+            fallback_choice = choose_ranked_lyrics(
+                genius_lyrics=fallback_genius_lyrics,
+                lrclib_lyrics=lrclib_lyrics,
+                subtitle_lyrics=subtitle_lyrics,
+                subtitle_candidate=subtitle_candidate,
+                title=title,
+                artist=artist,
+                finalize_fallback=False,
+            )
+            if fallback_choice[1] == "genius":
+                return fallback_choice
+            if selected_source != "lrclib":
+                genius_lyrics = fallback_genius_lyrics
+                lyrics, selected_source, similarity = fallback_choice
+
+    if selected_source == "lrclib":
+        return lyrics, selected_source, similarity
+
+    if (
+        lrclib_found_with_artist
+        and not lrclib_title_only_attempted
+        and callable(lrclib_title_only_lookup)
+    ):
+        print(
+            "  LRCLIB title+artist candidate was rejected by final lyric "
+            "evaluation; retrying with a title-only query and the same "
+            "artist validation."
+        )
+        fallback_lrclib_lyrics = lrclib_title_only_lookup()
+        if fallback_lrclib_lyrics:
+            lrclib_lyrics = fallback_lrclib_lyrics
+
+    return choose_ranked_lyrics(
+        genius_lyrics=genius_lyrics,
+        lrclib_lyrics=lrclib_lyrics,
+        subtitle_lyrics=subtitle_lyrics,
+        subtitle_candidate=subtitle_candidate,
+        title=title,
+        artist=artist,
+        finalize_fallback=True,
+    )
 
 
 def write_tags(file_path: str, title: str, artist: str, album: str = ""):
@@ -3030,23 +3202,19 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
                 subtitle_lyrics = None
                 subtitle_candidate = None
 
-                genius_lyrics = None
-                if has_usable_title_and_artist(title, artist):
-                    genius_lyrics = get_lyrics_from_genius(
-                        title=title,
-                        artist=artist,
-                        require_artist=True,
-                    )
-
-                if not genius_lyrics:
-                    genius_lyrics = get_lyrics_from_genius(
-                        title=title,
-                        artist="",
-                        require_artist=False,
-                    )
+                has_title_and_artist = has_usable_title_and_artist(title, artist)
+                (
+                    genius_lyrics,
+                    genius_found_with_artist,
+                    genius_title_only_attempted,
+                ) = find_genius_lyrics_with_no_result_retry(title, artist)
 
                 duration = read_duration_seconds(file_path)
-                lrclib_lyrics = get_lyrics_from_lrclib(
+                (
+                    lrclib_lyrics,
+                    lrclib_found_with_artist,
+                    lrclib_title_only_attempted,
+                ) = find_lrclib_lyrics_with_no_result_retry(
                     title=title,
                     artist=artist,
                     duration=duration,
@@ -3065,13 +3233,40 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
                 else:
                     print("  No YouTube video id found in filename; cannot look up subtitle lyrics.")
 
-                lyrics, selected_lyrics_source, lyric_source_similarity = choose_ranked_lyrics(
-                    genius_lyrics=genius_lyrics,
-                    lrclib_lyrics=lrclib_lyrics,
-                    subtitle_lyrics=subtitle_lyrics,
-                    subtitle_candidate=subtitle_candidate,
-                    title=title,
-                    artist=artist,
+                lyrics, selected_lyrics_source, lyric_source_similarity = (
+                    choose_ranked_lyrics_with_rejected_candidate_retries(
+                        genius_lyrics=genius_lyrics,
+                        lrclib_lyrics=lrclib_lyrics,
+                        subtitle_lyrics=subtitle_lyrics,
+                        subtitle_candidate=subtitle_candidate,
+                        title=title,
+                        artist=artist,
+                        genius_found_with_artist=genius_found_with_artist,
+                        lrclib_found_with_artist=lrclib_found_with_artist,
+                        genius_title_only_attempted=genius_title_only_attempted,
+                        lrclib_title_only_attempted=lrclib_title_only_attempted,
+                        genius_title_only_lookup=(
+                            lambda: get_lyrics_from_genius(
+                                title=title,
+                                artist=artist,
+                                require_artist=True,
+                                title_only_query=True,
+                            )
+                            if has_title_and_artist
+                            else None
+                        ),
+                        lrclib_title_only_lookup=(
+                            lambda: get_lyrics_from_lrclib(
+                                title=title,
+                                artist=artist,
+                                duration=duration,
+                                album=existing_album,
+                                title_only_query=True,
+                            )
+                            if has_title_and_artist
+                            else None
+                        ),
+                    )
                 )
 
                 if selected_lyrics_source and selected_lyrics_source.startswith("youtube_"):

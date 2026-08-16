@@ -1297,7 +1297,6 @@ def main():
     scripts_before_upload = [
         "thumbnail.py",
         "mediahuman.py",
-        "prepforaichat.py",
         "test.py",
     ]
 
