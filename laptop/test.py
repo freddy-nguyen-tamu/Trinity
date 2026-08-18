@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlparse
 from yt_dlp import YoutubeDL
 from yt_dlp.networking import Request as YtDlpRequest
 
+from groq_dynamic import groq_chat_try_all_models, load_groq_keys
 from mutagen import File
 from mutagen.mp3 import MP3
 from mutagen.flac import FLAC
@@ -91,20 +92,7 @@ def parse_args():
 ARGS = parse_args()
 AUDIO_FOLDER = os.path.abspath(ARGS.audio_folder)
 
-GROQ_API_KEYS = []
-
-base_key = os.getenv("GROQ_API_KEY")
-if base_key:
-    GROQ_API_KEYS.append(("GROQ_API_KEY", base_key))
-
-for i in range(1, 10):
-    key_name = f"GROQ_API_KEY{i}"
-    key_value = os.getenv(key_name)
-    if key_value:
-        GROQ_API_KEYS.append((key_name, key_value))
-
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_API_KEYS = load_groq_keys()
 
 LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
 LRCLIB_GET_URL = "https://lrclib.net/api/get"
@@ -514,119 +502,14 @@ def parse_retry_after_seconds(resp: requests.Response) -> float:
 
 
 def groq_chat(messages, max_tokens=220, temperature=0, timeout=60, max_retries=8, json_mode=True):
-    if not GROQ_API_KEYS:
-        raise RuntimeError(
-            "No Groq API keys are available. Set GROQ_API_KEY or GROQ_API_KEY1 through GROQ_API_KEY9."
-        )
-
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
-
-    backoff = 1.0
-
-    for attempt in range(1, max_retries + 1):
-        rate_limit_waits = []
-        network_errors = []
-        api_errors = []
-
-        for key_name, api_key in GROQ_API_KEYS:
-            try:
-                resp = requests.post(
-                    GROQ_API_URL,
-                    headers=make_groq_headers(api_key),
-                    json=payload,
-                    timeout=timeout,
-                )
-            except requests.RequestException as e:
-                network_errors.append((key_name, str(e)))
-                print(
-                    f"[NET] {key_name} network error. "
-                    f"Trying next key before sleeping. Attempt {attempt}/{max_retries}"
-                )
-                continue
-
-            if resp.status_code == 200:
-                if key_name != "GROQ_API_KEY":
-                    print(f"[OK] Groq request succeeded using {key_name}.")
-                return resp.json()
-
-            if resp.status_code == 429:
-                wait_s = max(parse_retry_after_seconds(resp), backoff) + 0.25
-                rate_limit_waits.append(wait_s)
-                print(
-                    f"[429] {key_name} rate limited. "
-                    f"Trying next key before sleeping. Attempt {attempt}/{max_retries}"
-                )
-                continue
-
-            if resp.status_code == 413:
-                raise RuntimeError(
-                    "Groq request too large. Reduce prompt size before retrying this step."
-                )
-
-            if resp.status_code == 400:
-                try:
-                    err = resp.json()
-                except Exception:
-                    err = {}
-
-                code = err.get("error", {}).get("code", "")
-                if code == "json_validate_failed" and json_mode:
-                    print("[400] JSON validation failed in JSON mode. Retrying without JSON mode...")
-                    return groq_chat(
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        timeout=timeout,
-                        max_retries=max_retries,
-                        json_mode=False,
-                    )
-
-            api_errors.append((key_name, resp.status_code, resp.text[:300]))
-            print(
-                f"[{resp.status_code}] Groq API error using {key_name}. "
-                f"Trying next key. Attempt {attempt}/{max_retries}"
-            )
-            continue
-
-        if api_errors and not rate_limit_waits and not network_errors:
-            summary = "; ".join(
-                f"{key_name}:{status}" for key_name, status, _ in api_errors
-            )
-            raise RuntimeError(
-                "All loaded Groq API keys failed for this request "
-                f"({summary})."
-            )
-
-        if attempt == max_retries:
-            if network_errors and not rate_limit_waits:
-                last_key, last_error = network_errors[-1]
-                raise RuntimeError(f"Network error calling Groq using {last_key}: {last_error}")
-
-            raise RuntimeError("Groq API error: too many retries across all API keys.")
-
-        if rate_limit_waits:
-            wait_s = max(rate_limit_waits)
-        else:
-            wait_s = backoff + 0.25
-
-        print(
-            f"All {len(GROQ_API_KEYS)} loaded Groq API key(s) failed or were rate limited. "
-            f"Sleeping {wait_s:.2f}s, then retrying from GROQ_API_KEY. "
-            f"Attempt {attempt}/{max_retries}"
-        )
-
-        time.sleep(wait_s)
-        backoff = min(backoff * 1.6, 20.0)
-
-    raise RuntimeError("Groq API error: too many retries across all API keys.")
+    return groq_chat_try_all_models(
+        messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        timeout=timeout,
+        max_retry_rounds=max_retries,
+        json_mode=json_mode,
+    )
 
 
 def build_single_prompt(item_id, file_name):
