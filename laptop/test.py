@@ -40,7 +40,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_AUDIO_FOLDER = os.path.join(BASE_DIR, "_working_downloads")
 LYRICS_NOT_FOUND_HISTORY_PATH = os.path.join(BASE_DIR, "_lyrics_not_found_history.json")
 LYRICS_NOT_FOUND_HISTORY_VERSION = 2
-LYRICS_NOT_FOUND_RESOLVER_VERSION = 10
+LYRICS_NOT_FOUND_RESOLVER_VERSION = 11
 MIN_LYRIC_SOURCE_AGREEMENT = 0.80
 
 
@@ -2222,10 +2222,13 @@ def groq_confirm_subtitle_language(
         {
             "role": "system",
             "content": (
-                "Return JSON only. Decide whether the subtitle text is the "
-                "right lyrics language for this YouTube music video. Use the "
-                "expected_language when present. Return exactly: "
-                '{"approved": true/false, "language": "iso-639-1", "reason": "short reason"}.'
+                "Return JSON only. Decide whether the subtitle text uses the "
+                "same language as the YouTube video title and is therefore the "
+                "right lyrics language for this music video. Use the expected_language "
+                "when present, but inspect the actual video_title and subtitle_sample. "
+                "Return exactly: "
+                '{"approved": true/false, "same_language_as_video_title": '
+                'true/false, "language": "iso-639-1", "reason": "short reason"}.'
             ),
         },
         {
@@ -2245,7 +2248,10 @@ def groq_confirm_subtitle_language(
         print(f"  Groq subtitle language validation unavailable: {error}")
         return None
 
-    approved = bool(result.get("approved"))
+    same_language_as_video_title = (
+        result.get("same_language_as_video_title") is True
+    )
+    approved = bool(result.get("approved")) and same_language_as_video_title
     detected_language = normalize_language_code(result.get("language"))
     expected = normalize_language_code(expected_language)
 
@@ -2458,32 +2464,46 @@ def get_lyrics_from_youtube_subtitles(
         f"{len(automatic_candidates)} automatic."
     )
 
+    # Original manual tracks get the first and only priority check. Do not let
+    # locally inferred language filter them out before Groq compares their text
+    # with the actual video title.
+    approved_manual = validate_subtitle_candidates(
+        manual_candidates,
+        expected_language=normalize_language_code(explicit_language),
+        video_title=video_title,
+        title=title,
+        artist=artist,
+        candidate_limit=len(manual_candidates),
+    )
+    manual_choice = choose_unambiguous_approved_subtitle(
+        approved_manual,
+        "manual",
+    )
+    result["manual_lyrics"], result["manual_candidate"] = manual_choice
+    if result["manual_lyrics"] and result["manual_candidate"]:
+        print(
+            "  Groq approved an original manual YouTube subtitle as the same "
+            "language as the video title; skipping automatic subtitles and "
+            "library lyric searches."
+        )
+        return result
+
+    if manual_candidates:
+        print(
+            "  No original manual YouTube subtitle was approved by Groq as "
+            "the same language as the video title."
+        )
+
     if expected_language:
         print(
             f"  Expected lyrics language={expected_language} "
             f"from {expected_source}."
         )
-        manual_pool = [
-            candidate
-            for candidate in manual_candidates
-            if candidate.get("normalized_language_code") == expected_language
-        ]
         automatic_pool = [
             candidate
             for candidate in automatic_candidates
             if candidate.get("normalized_language_code") == expected_language
         ]
-
-        approved_manual = validate_subtitle_candidates(
-            manual_pool,
-            expected_language=expected_language,
-            video_title=video_title,
-            title=title,
-            artist=artist,
-            candidate_limit=len(manual_pool),
-        )
-        if approved_manual:
-            result["manual_lyrics"], result["manual_candidate"] = approved_manual[0]
 
         approved_automatic = validate_subtitle_candidates(
             automatic_pool,
@@ -2498,68 +2518,17 @@ def get_lyrics_from_youtube_subtitles(
                 approved_automatic[0]
             )
 
-        if not manual_pool and not automatic_pool:
+        if not automatic_pool:
             print("  No original subtitle track matches the expected lyrics language.")
-        elif not result["manual_lyrics"] and not result["automatic_lyrics"]:
+        elif not result["automatic_lyrics"]:
             print("  No YouTube subtitle passed language validation.")
         return result
 
-    manual_choice = (None, None)
-    if len(manual_candidates) == 1:
-        print(
-            "  Expected language is unknown, but exactly one original "
-            "manual subtitle exists; validating its actual text."
-        )
-        approved_manual = validate_subtitle_candidates(
-            manual_candidates,
-            video_title=video_title,
-            title=title,
-            artist=artist,
-        )
-        manual_choice = choose_unambiguous_approved_subtitle(
-            approved_manual,
-            "manual",
-        )
-    elif len(manual_candidates) > 1:
-        print(
-            "  Expected language is unknown and multiple original manual "
-            "subtitle languages exist. Validating all manual tracks."
-        )
-        approved_manual = validate_subtitle_candidates(
-            manual_candidates,
-            video_title=video_title,
-            title=title,
-            artist=artist,
-            candidate_limit=len(manual_candidates),
-        )
-        manual_choice = choose_unambiguous_approved_subtitle(
-            approved_manual,
-            "manual",
-        )
-
-    result["manual_lyrics"], result["manual_candidate"] = manual_choice
-
     automatic_pool = automatic_candidates
     automatic_expected_language = ""
-    if result["manual_candidate"]:
-        automatic_expected_language = subtitle_language_code(
-            result["manual_candidate"]
-        )
-        automatic_pool = [
-            candidate
-            for candidate in automatic_candidates
-            if candidate.get("normalized_language_code")
-            == automatic_expected_language
-        ]
-        print(
-            "  Searching for an automatic-caption baseline in the approved "
-            f"manual subtitle language={automatic_expected_language}."
-        )
 
     if not automatic_pool:
-        if result["manual_lyrics"]:
-            print("  No automatic subtitle is available in the approved manual language.")
-        elif not manual_candidates:
+        if not manual_candidates:
             print("  No original manual or automatic subtitles are available.")
         return result
 
@@ -3408,23 +3377,6 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
                 selected_subtitle_candidate = None
 
                 has_title_and_artist = has_usable_title_and_artist(title, artist)
-                (
-                    genius_lyrics,
-                    genius_found_with_artist,
-                    genius_title_only_attempted,
-                ) = find_genius_lyrics_with_no_result_retry(title, artist)
-
-                duration = read_duration_seconds(file_path)
-                (
-                    lrclib_lyrics,
-                    lrclib_found_with_artist,
-                    lrclib_title_only_attempted,
-                ) = find_lrclib_lyrics_with_no_result_retry(
-                    title=title,
-                    artist=artist,
-                    duration=duration,
-                    album=existing_album,
-                )
 
                 if video_id:
                     youtube_subtitles = get_lyrics_from_youtube_subtitles(
@@ -3441,43 +3393,81 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
                 else:
                     print("  No YouTube video id found in filename; cannot look up subtitle lyrics.")
 
-                lyrics, selected_lyrics_source, lyric_source_similarity = (
-                    choose_ranked_lyrics_with_rejected_candidate_retries(
-                        genius_lyrics=genius_lyrics,
-                        lrclib_lyrics=lrclib_lyrics,
-                        manual_subtitle_lyrics=manual_subtitle_lyrics,
-                        manual_subtitle_candidate=manual_subtitle_candidate,
-                        automatic_subtitle_lyrics=automatic_subtitle_lyrics,
-                        automatic_subtitle_candidate=automatic_subtitle_candidate,
+                approved_manual_lyrics = clean_legit_lyrics_candidate(
+                    manual_subtitle_lyrics,
+                    source="YouTube manual subtitle",
+                    title=title,
+                )
+                if (
+                    approved_manual_lyrics
+                    and subtitle_candidate_is_approved(manual_subtitle_candidate)
+                ):
+                    lyrics = approved_manual_lyrics
+                    selected_lyrics_source = youtube_subtitle_source_name(
+                        manual_subtitle_candidate
+                    )
+                    selected_subtitle_candidate = manual_subtitle_candidate
+                    print(
+                        "  Using Groq-approved manual YouTube subtitles; "
+                        "Genius, LRCLIB, automatic subtitles, and lyric "
+                        "comparisons were skipped."
+                    )
+                else:
+                    (
+                        genius_lyrics,
+                        genius_found_with_artist,
+                        genius_title_only_attempted,
+                    ) = find_genius_lyrics_with_no_result_retry(title, artist)
+
+                    duration = read_duration_seconds(file_path)
+                    (
+                        lrclib_lyrics,
+                        lrclib_found_with_artist,
+                        lrclib_title_only_attempted,
+                    ) = find_lrclib_lyrics_with_no_result_retry(
                         title=title,
                         artist=artist,
-                        genius_found_with_artist=genius_found_with_artist,
-                        lrclib_found_with_artist=lrclib_found_with_artist,
-                        genius_title_only_attempted=genius_title_only_attempted,
-                        lrclib_title_only_attempted=lrclib_title_only_attempted,
-                        genius_title_only_lookup=(
-                            lambda: get_lyrics_from_genius(
-                                title=title,
-                                artist=artist,
-                                require_artist=True,
-                                title_only_query=True,
-                            )
-                            if has_title_and_artist
-                            else None
-                        ),
-                        lrclib_title_only_lookup=(
-                            lambda: get_lyrics_from_lrclib(
-                                title=title,
-                                artist=artist,
-                                duration=duration,
-                                album=existing_album,
-                                title_only_query=True,
-                            )
-                            if has_title_and_artist
-                            else None
-                        ),
+                        duration=duration,
+                        album=existing_album,
                     )
-                )
+
+                    lyrics, selected_lyrics_source, lyric_source_similarity = (
+                        choose_ranked_lyrics_with_rejected_candidate_retries(
+                            genius_lyrics=genius_lyrics,
+                            lrclib_lyrics=lrclib_lyrics,
+                            manual_subtitle_lyrics=manual_subtitle_lyrics,
+                            manual_subtitle_candidate=manual_subtitle_candidate,
+                            automatic_subtitle_lyrics=automatic_subtitle_lyrics,
+                            automatic_subtitle_candidate=automatic_subtitle_candidate,
+                            title=title,
+                            artist=artist,
+                            genius_found_with_artist=genius_found_with_artist,
+                            lrclib_found_with_artist=lrclib_found_with_artist,
+                            genius_title_only_attempted=genius_title_only_attempted,
+                            lrclib_title_only_attempted=lrclib_title_only_attempted,
+                            genius_title_only_lookup=(
+                                lambda: get_lyrics_from_genius(
+                                    title=title,
+                                    artist=artist,
+                                    require_artist=True,
+                                    title_only_query=True,
+                                )
+                                if has_title_and_artist
+                                else None
+                            ),
+                            lrclib_title_only_lookup=(
+                                lambda: get_lyrics_from_lrclib(
+                                    title=title,
+                                    artist=artist,
+                                    duration=duration,
+                                    album=existing_album,
+                                    title_only_query=True,
+                                )
+                                if has_title_and_artist
+                                else None
+                            ),
+                        )
+                    )
 
                 if selected_lyrics_source == "youtube_manual_subtitles_validated":
                     selected_subtitle_candidate = manual_subtitle_candidate
