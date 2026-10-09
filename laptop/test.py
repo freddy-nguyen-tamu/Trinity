@@ -270,6 +270,52 @@ def clean_lyrics_for_tag(lyrics: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
+def format_automatic_subtitle_lyrics(lyrics: str) -> str:
+    """Make selected auto-captions readable without inventing lyric content."""
+    cleaned = clean_lyrics_for_tag(lyrics)
+    if not cleaned:
+        return ""
+
+    sentence_end = re.compile(r"[.!?]\s*$")
+    formatted_lines = []
+
+    for line in cleaned.splitlines():
+        line = line.strip()
+        if not line:
+            if formatted_lines and formatted_lines[-1] != "":
+                formatted_lines.append("")
+            continue
+
+        # Subtitle timings often split one sentence into several lowercase
+        # fragments. Join only an obvious continuation, preserving normal
+        # lyric line breaks and avoiding any invented punctuation.
+        if (
+            formatted_lines
+            and formatted_lines[-1]
+            and line[0].islower()
+            and not sentence_end.search(formatted_lines[-1])
+        ):
+            formatted_lines[-1] = f"{formatted_lines[-1]} {line}"
+            continue
+
+        line = re.sub(
+            r"(^|[.!?]\s+)([a-z])",
+            lambda match: f"{match.group(1)}{match.group(2).upper()}",
+            line,
+        )
+        formatted_lines.append(line)
+
+    while formatted_lines and formatted_lines[-1] == "":
+        formatted_lines.pop()
+
+    formatted = "\n".join(formatted_lines).strip()
+    return re.sub(
+        r"(^|[\n.!?]\s+)([a-z])",
+        lambda match: f"{match.group(1)}{match.group(2).upper()}",
+        formatted,
+    )
+
+
 class GeniusLyricsHTMLParser(HTMLParser):
     BLOCK_TAGS = {"div", "p", "section", "article", "li", "h1", "h2", "h3"}
 
@@ -2321,6 +2367,7 @@ def validate_subtitle_candidates(
     title="",
     artist="",
     candidate_limit=3,
+    allow_single_manual_language_mismatch=False,
 ):
     approved = []
 
@@ -2358,6 +2405,25 @@ def validate_subtitle_candidates(
         )
 
         if not validation.get("approved"):
+            # A sole original manual track is still preferable to generated
+            # captions or library guesses. Keep it available as an explicit
+            # fallback only when Groq answered and rejected the language match.
+            if (
+                allow_single_manual_language_mismatch
+                and len(candidates) == 1
+                and kind == "manual"
+                and validation.get("source") == "groq"
+            ):
+                fallback_candidate = dict(candidate)
+                fallback_candidate["language_validation"] = validation
+                fallback_candidate["language_match_approved"] = False
+                fallback_candidate["language_match_source"] = "groq_single_manual_fallback"
+                fallback_candidate["single_manual_language_mismatch_fallback"] = True
+                approved.append((text, fallback_candidate))
+                print(
+                    "  Groq rejected the language match, but this is the only "
+                    "original manual subtitle; retaining it as the manual-only fallback."
+                )
             continue
         if validation.get("source") != "groq":
             print(
@@ -2474,6 +2540,7 @@ def get_lyrics_from_youtube_subtitles(
         title=title,
         artist=artist,
         candidate_limit=len(manual_candidates),
+        allow_single_manual_language_mismatch=True,
     )
     manual_choice = choose_unambiguous_approved_subtitle(
         approved_manual,
@@ -2481,11 +2548,20 @@ def get_lyrics_from_youtube_subtitles(
     )
     result["manual_lyrics"], result["manual_candidate"] = manual_choice
     if result["manual_lyrics"] and result["manual_candidate"]:
-        print(
-            "  Groq approved an original manual YouTube subtitle as the same "
-            "language as the video title; skipping automatic subtitles and "
-            "library lyric searches."
-        )
+        if result["manual_candidate"].get(
+            "single_manual_language_mismatch_fallback"
+        ):
+            print(
+                "  Using the only original manual YouTube subtitle despite "
+                "Groq's language disagreement; skipping automatic subtitles "
+                "and library lyric searches."
+            )
+        else:
+            print(
+                "  Groq approved an original manual YouTube subtitle as the same "
+                "language as the video title; skipping automatic subtitles and "
+                "library lyric searches."
+            )
         return result
 
     if manual_candidates:
@@ -2623,7 +2699,19 @@ def subtitle_candidate_is_approved(subtitle_candidate):
     )
 
 
+def subtitle_candidate_is_accepted_for_lyrics(subtitle_candidate):
+    return subtitle_candidate_is_approved(subtitle_candidate) or bool(
+        subtitle_candidate
+        and subtitle_candidate.get("single_manual_language_mismatch_fallback")
+        and not subtitle_candidate.get("automatic")
+    )
+
+
 def youtube_subtitle_source_name(subtitle_candidate):
+    if subtitle_candidate and subtitle_candidate.get(
+        "single_manual_language_mismatch_fallback"
+    ):
+        return "youtube_manual_subtitles_single_track_fallback"
     if subtitle_candidate and subtitle_candidate.get("automatic"):
         return "youtube_auto_subtitles_validated"
     return "youtube_manual_subtitles_validated"
@@ -3400,7 +3488,9 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
                 )
                 if (
                     approved_manual_lyrics
-                    and subtitle_candidate_is_approved(manual_subtitle_candidate)
+                    and subtitle_candidate_is_accepted_for_lyrics(
+                        manual_subtitle_candidate
+                    )
                 ):
                     lyrics = approved_manual_lyrics
                     selected_lyrics_source = youtube_subtitle_source_name(
@@ -3408,7 +3498,7 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
                     )
                     selected_subtitle_candidate = manual_subtitle_candidate
                     print(
-                        "  Using Groq-approved manual YouTube subtitles; "
+                        "  Using the sole original manual YouTube subtitle; "
                         "Genius, LRCLIB, automatic subtitles, and lyric "
                         "comparisons were skipped."
                     )
@@ -3473,6 +3563,10 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
                     selected_subtitle_candidate = manual_subtitle_candidate
                 elif selected_lyrics_source == "youtube_auto_subtitles_validated":
                     selected_subtitle_candidate = automatic_subtitle_candidate
+
+                if selected_lyrics_source == "youtube_auto_subtitles_validated":
+                    lyrics = format_automatic_subtitle_lyrics(lyrics)
+                    print("  Formatted automatic YouTube captions into readable lyric lines.")
 
                 if selected_subtitle_candidate:
                     lyrics_language_code = subtitle_language_code(

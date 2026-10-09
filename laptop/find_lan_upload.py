@@ -3,6 +3,7 @@ import datetime
 import http.client
 import ipaddress
 import json
+import mimetypes
 import socket
 import sys
 import urllib.parse
@@ -14,6 +15,35 @@ PORT = 1234
 TIMEOUT = 0.6
 MAX_WORKERS = 128
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+UPLOAD_TIMEOUT = 300
+
+SUPPORTED_AUDIO_EXTENSIONS = {
+    ".mp3",
+    ".m4a",
+    ".mp4",
+    ".flac",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".wave",
+    ".aiff",
+    ".aif",
+    ".aac",
+}
+
+AUDIO_MIME_TYPES = {
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".wav": "audio/wav",
+    ".wave": "audio/wav",
+    ".aiff": "audio/aiff",
+    ".aif": "audio/aiff",
+    ".aac": "audio/aac",
+}
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_UPLOAD_DIR = str(BASE_DIR / "finished")
@@ -28,6 +58,27 @@ RECEIVER_APP_NAMES = {"Trinity", "YtbLanReceiver"}
 
 class UploadAuthError(RuntimeError):
     pass
+
+
+def is_supported_audio_file(path):
+    return Path(path).suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
+
+
+def audio_content_type(path):
+    path = Path(path)
+    return (
+        AUDIO_MIME_TYPES.get(path.suffix.lower())
+        or mimetypes.guess_type(path.name)[0]
+        or "application/octet-stream"
+    )
+
+
+def android_transport_filename(path):
+    """Keep original bytes while satisfying the installed receiver's MP3 suffix rule."""
+    path = Path(path)
+    if path.suffix.lower() == ".mp3":
+        return path.name
+    return path.name + ".mp3"
 
 
 def local_ipv4_addresses():
@@ -280,10 +331,10 @@ def collect_files(upload_dir, recursive=False):
         raise NotADirectoryError(f"Upload path is not a folder: {folder}")
 
     iterator = folder.rglob("*") if recursive else folder.iterdir()
-    files = [str(path) for path in iterator if path.is_file() and path.suffix.lower() == ".mp3"]
+    files = [str(path) for path in iterator if path.is_file() and is_supported_audio_file(path)]
 
     if not files:
-        raise FileNotFoundError(f"No MP3 files found in: {folder}")
+        raise FileNotFoundError(f"No supported audio files found in: {folder}")
 
     return files
 
@@ -313,15 +364,17 @@ def collect_manifest_files(manifest_path):
             continue
 
         path = Path(raw_path).expanduser().resolve()
-        if path.is_file() and path.suffix.lower() == ".mp3":
+        if path.is_file() and is_supported_audio_file(path):
             files.append(str(path))
         elif path.is_file():
-            print(f"Skipping non-MP3 manifest file: {path}")
+            print(f"Skipping unsupported audio manifest file: {path}")
         else:
             print(f"Skipping missing manifest file: {path}")
 
     if not files:
-        raise FileNotFoundError(f"No existing MP3 files found from manifest: {manifest}")
+        raise FileNotFoundError(
+            f"No existing supported audio files found from manifest: {manifest}"
+        )
 
     return files
 
@@ -359,10 +412,11 @@ def upload_one_file(base_url, file_path, token=""):
 
     host = parsed.hostname
     port = parsed.port or PORT
-    remote_path = "/upload-file?filename=" + urllib.parse.quote(file_path.name, safe="")
+    transport_name = android_transport_filename(file_path)
+    remote_path = "/upload-file?filename=" + urllib.parse.quote(transport_name, safe="")
     size = file_path.stat().st_size
 
-    conn = http.client.HTTPConnection(host, port=port, timeout=60)
+    conn = http.client.HTTPConnection(host, port=port, timeout=UPLOAD_TIMEOUT)
     try:
         conn.putrequest("POST", remote_path, skip_accept_encoding=True)
         conn.putheader("Host", f"{host}:{port}")
@@ -370,7 +424,9 @@ def upload_one_file(base_url, file_path, token=""):
         token = normalize_token(token)
         if token:
             conn.putheader(TOKEN_HEADER, token)
-        conn.putheader("Content-Type", "audio/mpeg")
+        conn.putheader("Content-Type", audio_content_type(file_path))
+        conn.putheader("X-Trinity-Original-Filename", urllib.parse.quote(file_path.name, safe=""))
+        conn.putheader("X-Trinity-Original-Extension", file_path.suffix.lower())
         conn.putheader("Content-Length", str(size))
         conn.endheaders()
 
@@ -389,9 +445,25 @@ def upload_one_file(base_url, file_path, token=""):
             raise RuntimeError(f"Android receiver returned HTTP {response.status}: {body}")
 
         try:
-            return json.loads(body)
+            result = json.loads(body)
         except json.JSONDecodeError:
-            return {"ok": True, "raw_response": body}
+            result = {"ok": True, "raw_response": body}
+
+        if result.get("ok") is False:
+            raise RuntimeError(f"Android receiver rejected the upload: {body}")
+
+        received_bytes = result.get("bytes")
+        if received_bytes is not None and int(received_bytes) != size:
+            raise RuntimeError(
+                f"Android receiver byte-count mismatch: sent={size}, "
+                f"received={received_bytes}"
+            )
+
+        result["original_name"] = file_path.name
+        result["transport_name"] = transport_name
+        result["content_type"] = audio_content_type(file_path)
+        result["original_bytes_preserved"] = True
+        return result
     finally:
         conn.close()
 
@@ -403,6 +475,12 @@ def upload_files(base_url, files, token=""):
     for index, file_path in enumerate(files, start=1):
         item = file_items([file_path])[0]
         print(f"[{index}/{len(files)}] Uploading: {item['name']} ({item['size']} bytes)")
+        transport_name = android_transport_filename(file_path)
+        if transport_name != item["name"]:
+            print(
+                "    Preserving the original audio bytes; the installed Android "
+                f"receiver will store this as: {transport_name}"
+            )
         try:
             response = upload_one_file(base_url, file_path, token=token)
             item["receiver_response"] = response
@@ -418,17 +496,17 @@ def upload_files(base_url, files, token=""):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Find the Trinity Android LAN receiver and upload local MP3 files directly."
+        description="Find the Trinity Android LAN receiver and upload local audio files directly."
     )
     parser.add_argument(
         "--dir",
         default=DEFAULT_UPLOAD_DIR,
-        help="Folder whose MP3 files should be uploaded.",
+        help="Folder whose supported audio files should be uploaded.",
     )
     parser.add_argument(
         "--manifest",
         default=None,
-        help="JSON manifest listing the exact MP3 files to upload.",
+        help="JSON manifest listing the exact audio files to upload.",
     )
     parser.add_argument(
         "--summary-json",
@@ -458,7 +536,7 @@ def main():
     parser.add_argument(
         "--recursive",
         action="store_true",
-        help="Upload MP3 files inside subfolders too.",
+        help="Upload supported audio files inside subfolders too.",
     )
     parser.add_argument(
         "--scan-only",
@@ -547,7 +625,7 @@ def main():
 
     summary["url"] = url
     print(f"Found Android receiver: {url}")
-    print(f"Uploading {len(files)} MP3 file(s) from: {source_label}")
+    print(f"Uploading {len(files)} audio file(s) from: {source_label}")
 
     successful, failed = upload_files(url, files, token=token)
     auth_failed = [item for item in failed if "pairing token" in item.get("error", "").lower()]
