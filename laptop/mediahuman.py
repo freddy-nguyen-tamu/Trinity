@@ -4,13 +4,13 @@ if os.environ.get("TRINITY_ENABLE_YTDLP_POT_PLUGIN", "").strip().lower() not in 
 
 import json
 import time
-from itertools import islice
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 from youtube_url_tag import (
     tag_downloaded_mp3_with_youtube_url, youtube_watch_url, recover_completed_mp3_ids,
 )
 from shared_history import load_set, save_set, flush_pending
+from playlist_scan import last_unprocessed_position, safe_to_stop
 
 # ==================================================================
 # CONFIGURATION
@@ -20,7 +20,6 @@ DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
 HISTORY_FILE = "Google Sheets / History / download_history"
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLBkuXLqNhqX5FsS2CEaSDlGTKAHIBPtLe"
 ALREADY_DOWNLOADED_STREAK_LIMIT = 30
-LAZY_PLAYLIST_LIMIT = 200
 if os.environ.get("TRINITY_SKIP_PLAYLIST_ON_30", "1") == "0":
     ALREADY_DOWNLOADED_STREAK_LIMIT = float("inf")
 
@@ -122,14 +121,13 @@ def extract_playlist_entries(playlist_url, use_cookies=False):
             },
         },
     }
-    if lazy:
-        ydl_opts_extract["playlistend"] = LAZY_PLAYLIST_LIMIT
 
+    # Materialize the generator while YoutubeDL is still open: in streaming
+    # mode it may need further playlist-page HTTP requests during iteration.
     with YoutubeDL(ydl_opts_extract) as ydl:
         info = ydl.extract_info(playlist_url, download=False)
-
-    raw_entries = info.get("entries") or []
-    return list(islice(raw_entries, LAZY_PLAYLIST_LIMIT)) if lazy else list(raw_entries)
+        # Complete ID enumeration is required to validate the 30-match stop.
+        return list(info.get("entries") or [])
 
 
 def try_download_video(
@@ -254,7 +252,10 @@ def download_playlist(playlist_url):
             print("Retrying playlist fetch with cookies...")
             video_entries = extract_playlist_entries(playlist_url, use_cookies=True)
 
-    print(f"Playlist has {len(video_entries)} videos.")
+    print(f"Playlist has {len(video_entries)} videos (YouTube playlist order).")
+    last_unprocessed = last_unprocessed_position(video_entries, history)
+    print(f"Last unprocessed playlist position: {last_unprocessed or 'none'}; "
+          "30-match early stop cannot skip IDs farther down.")
 
     # ------------------------------------------------------------------
     # DOWNLOAD EACH VIDEO
@@ -279,12 +280,17 @@ def download_playlist(playlist_url):
         if video_id in history:
             print(f"Skipping already downloaded: {video_title}")
             already_downloaded_streak += 1
-            if already_downloaded_streak >= ALREADY_DOWNLOADED_STREAK_LIMIT:
+            if safe_to_stop(already_downloaded_streak, ALREADY_DOWNLOADED_STREAK_LIMIT,
+                            index, last_unprocessed):
                 print(
                     f"Reached {ALREADY_DOWNLOADED_STREAK_LIMIT} already-downloaded "
-                    "videos in a row; skipping the rest of this playlist."
+                    "videos in a row; no later unprocessed IDs; stopping."
                 )
                 break
+            if already_downloaded_streak == ALREADY_DOWNLOADED_STREAK_LIMIT:
+                print(f"Reached {ALREADY_DOWNLOADED_STREAK_LIMIT} consecutive matches, "
+                      f"but an unprocessed ID exists at position {last_unprocessed}; "
+                      "continuing in playlist order.")
             continue
 
         already_downloaded_streak = 0

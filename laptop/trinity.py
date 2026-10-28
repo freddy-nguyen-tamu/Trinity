@@ -1307,7 +1307,7 @@ def main():
 
     os.environ["TRINITY_SKIP_PLAYLIST_ON_30"] = "1" if skip_playlist_on_30 else "0"
 
-    log("Use lazy playlist fetching? (yes = ~200 items, no = all items)")
+    log("Use streaming playlist fetching? (yes = lazy enumeration, no = eager; both scan ALL IDs)")
     lazy_playlist = input("Type yes / no (default: no): ").strip().lower() in {"yes", "y"}
     log(f"Lazy playlist fetching: {'yes' if lazy_playlist else 'no'}")
     log("")
