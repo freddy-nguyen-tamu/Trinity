@@ -7,7 +7,9 @@ import time
 from itertools import islice
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
-from youtube_url_tag import tag_downloaded_mp3_with_youtube_url, youtube_watch_url
+from youtube_url_tag import (
+    tag_downloaded_mp3_with_youtube_url, youtube_watch_url, recover_completed_mp3_ids,
+)
 from shared_history import load_set, save_set, flush_pending
 
 # ==================================================================
@@ -141,6 +143,8 @@ def try_download_video(
     ydl_opts_dl = {
         "format": format_selector,
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
+        "continuedl": True,  # Resume retained .part fragments after interruption.
+        "nopart": False,
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -215,6 +219,18 @@ def download_playlist(playlist_url):
 
     # Load previous history
     history = load_history()
+    recovered = recover_completed_mp3_ids(
+        DOWNLOAD_DIR, os.path.join(BASE_DIR, "finished")
+    )
+    recovered_ids = set(recovered) - history
+    if recovered_ids:
+        # Durable local journal is fsynced before playlist processing starts.
+        # If syncing Google fails, these completed files remain locally
+        # recoverable and will not be downloaded again after restarting.
+        save_history(history | recovered_ids)
+        history.update(recovered_ids)
+        print(f"Recovered {len(recovered_ids)} completed tagged MP3(s) into local "
+              "pending download history.", flush=True)
     last_history_sync = time.monotonic()
     print(f"Loaded {len(history)} previously downloaded entries.")
 

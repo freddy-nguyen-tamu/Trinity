@@ -4,10 +4,11 @@ All devices signing into the SAME Google account discover one spreadsheet
 named 'Trinity Shared History'. For multiple Google accounts, share that Sheet
 and optionally set TRINITY_HISTORY_SHEET_ID to its URL/ID on each device.
 
-No local JSON history is used at runtime. Existing JSON history files are
-non-destructively imported into the single 'History' worksheet as needed.
-Writers journal deltas locally and bulk-append them at tool completion,
-without overwriting remote records with stale snapshots.
+Existing JSON history files are non-destructively imported into the single
+'History' worksheet as needed. Completed downloads are journaled to a durable
+local write-ahead log immediately, so an interrupted run can skip them on
+restart. Only Google-confirmed entries are removed from the local journal,
+chunk by chunk, without overwriting another device's history.
 """
 
 from __future__ import annotations
@@ -367,7 +368,7 @@ def _row_already_applied(row, remote):
     return key in group and group[key] == json.loads(payload)
 
 
-def _append_bulk_rows(rows, max_body_bytes=BULK_MAX_BODY_BYTES):
+def _append_bulk_rows(rows, max_body_bytes=BULK_MAX_BODY_BYTES, on_batch_confirmed=None):
     """Append mixed-namespace rows in a few <2 MB API requests.
 
     A failed quota request is retried after increasing delays. For ambiguous
@@ -449,6 +450,11 @@ def _append_bulk_rows(rows, max_body_bytes=BULK_MAX_BODY_BYTES):
                 time.sleep(delay)
         if pending:
             raise RuntimeError("Bulk upload did not finish; rerun to safely resume")
+        # The callback verifies this specific batch on Google Sheets and then
+        # removes only its confirmed entries from the durable local journal.
+        # If verification or compaction fails, the journal remains recoverable.
+        if on_batch_confirmed is not None:
+            on_batch_confirmed(original)
         print(f"Bulk write {batch_number}/{len(batches)} complete.", flush=True)
     global _REMOTE_CACHE
     _REMOTE_CACHE = None
@@ -767,11 +773,48 @@ def _queue_changes(namespace, changes):
     return len(changes)
 
 
-def flush_pending():
-    """Bulk-write all queued histories once; call at program/phase end.
+def _acknowledge_confirmed_rows(rows, remote=None):
+    """Gradually prune durable pending work only after Google confirms it.
 
-    Safely rerunnable after a failed write. Data remains on disk until a
-    successful verified append. Other processes' active journals are skipped.
+    A failed append, ambiguous response, interrupted process or failed remote
+    verification must never erase the local resume journal. Compaction is
+    atomic; if it fails the in-memory queue is restored too.
+    """
+    if not rows:
+        return
+    if remote is None:
+        remote, _ = _read_remote(force=True)
+    unconfirmed = [row for row in rows if not _row_already_applied(row, remote)]
+    if unconfirmed:
+        raise RuntimeError(
+            f"Google Sheets has not confirmed {len(unconfirmed)} pending history "
+            "changes; local resume journal preserved"
+        )
+
+    previous = dict(_PENDING)
+    for _, namespace, key, op, payload in rows:
+        current = _PENDING.get((namespace, key))
+        if current is None:
+            continue
+        expected = json.loads(payload) if op == "put" else None
+        if current == (op, expected):
+            _PENDING.pop((namespace, key), None)
+    try:
+        _persist_pending()
+    except Exception:
+        _PENDING.clear()
+        _PENDING.update(previous)
+        raise
+
+
+def flush_pending():
+    """Reconcile and bulk-write queued history, pruning confirmed chunks.
+
+    A per-download fsynced local journal is the source of truth for unsynced
+    completions. Before attempting uploads we read current Google history and
+    eliminate entries already uploaded by this or another device. Each bulk
+    request is verified independently, then only that request's journal keys
+    are removed. Remaining work is recoverable even after a mid-flush crash.
     """
     global _JOURNAL_HANDLE
     with LOCK:
@@ -779,20 +822,20 @@ def flush_pending():
         if not _PENDING:
             return 0
         remote, _ = _read_remote(force=True)
-        changes = [_make_row(ns, key, op, value)
-                   for (ns, key), (op, value) in _PENDING.items()]
-        missing = [row for row in changes if not _row_already_applied(row, remote)]
-        if missing:
-            writes = _append_bulk_rows(missing)
-            final, _ = _read_remote(force=True)
-            failures = [row for row in changes if not _row_already_applied(row, final)]
-            if failures:
-                raise RuntimeError(f"Google Sheets did not confirm {len(failures)} queued "
-                                   "history changes; local pending journal preserved")
-        else:
-            writes = 0
-        _PENDING.clear()
-        _persist_pending()  # delete durable journal only after confirmation
+        rows = [_make_row(ns, key, op, value)
+                for (ns, key), (op, value) in _PENDING.items()]
+        already = [row for row in rows if _row_already_applied(row, remote)]
+        if already:
+            _acknowledge_confirmed_rows(already, remote=remote)
+        missing = [row for row in rows if not _row_already_applied(row, remote)]
+        writes = _append_bulk_rows(
+            missing, on_batch_confirmed=_acknowledge_confirmed_rows
+        ) if missing else 0
+        if _PENDING:
+            raise RuntimeError(
+                f"{len(_PENDING)} history changes remain unconfirmed; "
+                "local resume journal preserved"
+            )
         if _JOURNAL_HANDLE is not None:
             _release_file_lock(_JOURNAL_HANDLE)
             _JOURNAL_HANDLE = None

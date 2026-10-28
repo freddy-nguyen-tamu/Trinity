@@ -315,6 +315,10 @@ def move_working_items_to_finished():
         return moved_paths
 
     for item_name in sorted(os.listdir(WORKING_DOWNLOADS_DIR)):
+        # Never move yt-dlp's resumable fragments into finished/.
+        if item_name.casefold().endswith((".part", ".ytdl", ".tmp", ".temp")):
+            log(f"Preserved incomplete download for resume: {item_name}")
+            continue
         source_path = os.path.join(WORKING_DOWNLOADS_DIR, item_name)
         destination_path = unique_destination(os.path.join(FINISHED_DIR, item_name))
         try:
@@ -1376,13 +1380,18 @@ def main():
 
     except KeyboardInterrupt:
         log("")
-        log("Interrupted. Moving staged files before closing...")
+        log("Interrupted. Preserving working files and yt-dlp partial downloads for resume...")
         exit_code = 130
     except SystemExit as e:
         exit_code = e.code if isinstance(e.code, int) else 1
     finally:
         try:
-            cleanup_moved = move_working_items_to_finished()
+            # Do not move .part fragments (or an incompletely postprocessed
+            # MP3) out of the download directory after an interrupted run.
+            # yt-dlp needs the original filenames to resume next time.
+            cleanup_moved = move_working_items_to_finished() if exit_code == 0 else []
+            if exit_code:
+                log("Working files and partial downloads were kept for the next run.")
             if cleanup_moved:
                 downloaded_paths = sorted(set(downloaded_paths) | set(cleanup_moved))
                 upload_candidates = sorted(

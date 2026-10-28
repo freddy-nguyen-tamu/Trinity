@@ -1,4 +1,5 @@
 import os
+import re
 
 from mutagen.mp3 import MP3
 from mutagen.id3 import COMM, WOAS
@@ -160,3 +161,56 @@ def tag_downloaded_mp3_with_youtube_url(
 
     print(f"Could not find final MP3 to tag with YouTube URL: {youtube_url}")
     return None
+
+
+_YOUTUBE_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{11}(?![A-Za-z0-9_-])")
+_YOUTUBE_LINK_PATTERN = re.compile(
+    r"(?:youtube\.com/watch\?v=|youtu\.be/)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])",
+    re.IGNORECASE,
+)
+
+
+def recover_completed_mp3_ids(*folders):
+    """Recover completed downloads from ID3 tags after a forced shutdown.
+
+    We only accept MP3s with a valid embedded YouTube URL or our own
+    'YouTube ID:' comment. Partial .part/.ytdl downloads and untagged files
+    are never treated as successfully downloaded. No files are modified.
+    """
+    from mutagen.id3 import ID3, ID3NoHeaderError
+
+    found = {}
+    for folder in folders:
+        if not os.path.isdir(folder):
+            continue
+        for current, _, filenames in os.walk(folder):
+            for name in filenames:
+                if not name.casefold().endswith(".mp3"):
+                    continue
+                path = os.path.join(current, name)
+                try:
+                    if os.path.getsize(path) < 4096:
+                        continue
+                    tags = ID3(path)
+                    ids = []
+                    for frame in tags.getall("COMM"):
+                        for line in getattr(frame, "text", []) or []:
+                            text = str(line)
+                            if YOUTUBE_ID_COMMENT_PREFIX in text:
+                                portion = text.split(YOUTUBE_ID_COMMENT_PREFIX, 1)[1].strip()
+                                match = _YOUTUBE_ID_PATTERN.search(portion)
+                                if match:
+                                    ids.append(match.group())
+                    for frame in tags.getall("WOAS"):
+                        match = _YOUTUBE_LINK_PATTERN.search(str(getattr(frame, "url", "")))
+                        if match:
+                            ids.append(match.group(1))
+                    # Reject conflicting metadata, which may indicate a reused
+                    # audio file or an interrupted tag update.
+                    if ids and len(set(ids)) == 1:
+                        found.setdefault(ids[0], path)
+                except Exception:
+                    # Malformed or partially written MP3s must not block
+                    # recovery of other successfully completed downloads.
+                    continue
+    return found
