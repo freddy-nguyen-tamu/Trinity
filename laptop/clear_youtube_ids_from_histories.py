@@ -7,6 +7,8 @@ import tempfile
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from shared_history import load_map, save_map, load_set, save_set, shared_sheet_url, flush_pending
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_IDS_FILE = SCRIPT_DIR / "youtube_ids_to_clear_from_histories.txt"
@@ -237,45 +239,35 @@ def find_json_files(root_dir=SCRIPT_DIR):
 
 
 def clear_ids_from_histories(ids, dry_run=False, root_dir=SCRIPT_DIR):
-    root_dir = Path(root_dir).resolve()
-    json_files = find_json_files(root_dir)
+    """Remove video references from the shared Sheet, not stale local JSON.
+
+    root_dir remains accepted for compatibility with older call sites.
+    """
+    del root_dir
     results = []
-
-    for path in json_files:
-        try:
-            data = load_json(path)
-        except Exception as e:
-            results.append((path, None, [f"ERROR reading JSON: {e}"]))
-            continue
-
-        filtered, removed = filter_json_data(data, ids)
-        if removed and value_matches_ids(filtered, ids):
-            results.append(
-                (
-                    path,
-                    None,
-                    ["ERROR: an ID trace remained after filtering; file was not changed"],
-                )
-            )
-            continue
-
+    for namespace in ("download_history", "android_uploaded", "drive_uploaded", "test_processed"):
+        history = load_set(namespace)
+        removed = sorted(item for item in history if item_matches_ids(item, ids))
         if removed and not dry_run:
-            try:
-                save_json(path, filtered)
-            except Exception as e:
-                results.append((path, None, [f"ERROR writing JSON: {e}"]))
-                continue
+            save_set(namespace, history.difference(removed))
+        results.append((namespace, len(removed), removed))
 
-        results.append((path, len(removed), removed))
-
+    namespace = "lyrics_not_found"
+    items = load_map(namespace)
+    removed = sorted(key for key, record in items.items()
+                     if item_matches_ids(key, ids) or value_matches_ids(record, ids))
+    if removed and not dry_run:
+        for key in removed:
+            items.pop(key, None)
+        save_map(namespace, items)
+    results.append((namespace, len(removed), removed))
     return results
 
 
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Recursively remove listed YouTube video IDs from every JSON file "
-            "under the laptop folder."
+            "Remove listed YouTube video IDs from the shared Trinity Google Sheet."
         )
     )
     parser.add_argument(
@@ -286,7 +278,7 @@ def main():
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Show what would be removed without changing history files.",
+        help="Preview removal without writing to Google Sheets.",
     )
     args = parser.parse_args()
 
@@ -311,24 +303,17 @@ def main():
         print("")
         print("DRY RUN: no files will be changed.")
 
-    json_files = find_json_files(SCRIPT_DIR)
-    print(f"Scanning {len(json_files)} JSON file(s) recursively under: {SCRIPT_DIR}")
+    print(f"Google Sheet: {shared_sheet_url()}")
     results = clear_ids_from_histories(ids, dry_run=args.dry_run)
+    if not args.dry_run:
+        flush_pending()  # All five namespaces, one bulk API operation.
 
     print("")
-    print("JSON cleanup summary")
+    print("Shared history cleanup summary")
     print("-" * 50)
 
     total_removed = 0
-    for path, removed_count, removed_items in results:
-        try:
-            display_path = path.relative_to(SCRIPT_DIR)
-        except ValueError:
-            display_path = path
-
-        if removed_count is None:
-            print(f"{display_path}: {removed_items[0]}")
-            continue
+    for display_path, removed_count, removed_items in results:
 
         total_removed += removed_count
         print(
@@ -352,3 +337,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"ERROR: {e}")
         sys.exit(1)
+

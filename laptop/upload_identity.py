@@ -127,7 +127,7 @@ def normalized_relative_name(path, base_dir=None):
     else:
         name = path.name
 
-    return os.path.normcase(name.replace("\\", "/").strip())
+    return name.replace("\\", "/").strip().casefold()
 
 
 def upload_history_key(path, base_dir=None):
@@ -140,3 +140,22 @@ def upload_history_key(path, base_dir=None):
         f"upload-v2|youtube={youtube_id}|name={name}|"
         f"size={stat.st_size}|sha256={sha256}"
     )
+
+
+def youtube_history_alias(path):
+    """Portable marker for a YouTube ID seeded across Trinity devices.
+
+    These aliases are operator-asserted historical identities, not file hashes.
+    Actual file-specific upload records remain authoritative for destructive
+    actions (such as moving a local file to the recycle bin).
+    """
+    video_id = youtube_id_from_audio(path)
+    return "youtube:" + video_id if video_id else ""
+
+
+def history_has_audio(history, path, base_dir=None):
+    """True for an exact upload signature or a previously seeded video alias."""
+    alias = youtube_history_alias(path)
+    if alias and alias in history:
+        return True
+    return upload_history_key(path, base_dir=base_dir) in history

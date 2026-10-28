@@ -7,7 +7,11 @@ import subprocess
 import sys
 import time
 
-from upload_identity import upload_history_key as build_upload_history_key
+from upload_identity import (
+    upload_history_key as build_upload_history_key,
+    history_has_audio, youtube_history_alias,
+)
+from shared_history import load_set, save_set, flush_pending
 
 try:
     from mutagen import File as MutagenFile
@@ -22,8 +26,28 @@ except Exception:
     MutagenFile = None
     AIFF = FLAC = ID3 = MP4 = OggOpus = OggVorbis = WAVE = None
 
-# Path to Python interpreter
-PYTHON_EXE = r"C:\Users\qacer\AppData\Local\Python\pythoncore-3.14-64\python.exe"
+# Run child scripts with the same interpreter that launched Trinity.
+# For PyInstaller builds, sys.executable is Trinity.exe, not Python.
+def resolve_python_executable():
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+
+    explicit = os.environ.get("TRINITY_PYTHON_EXE", "").strip()
+    if explicit:
+        if not os.path.isfile(explicit):
+            raise RuntimeError(f"TRINITY_PYTHON_EXE does not exist: {explicit}")
+        return explicit
+
+    installed = shutil.which("python") or shutil.which("python3")
+    if installed:
+        return installed
+    raise RuntimeError(
+        "Trinity was built as an executable and requires Python to run "
+        "its companion scripts. Install Python or set TRINITY_PYTHON_EXE."
+    )
+
+
+PYTHON_EXE = resolve_python_executable()
 
 def current_app_dir():
     if getattr(sys, "frozen", False):
@@ -355,7 +379,7 @@ def strip_history_size_suffix(item):
 
 def stable_finished_name_key(name):
     normalized = str(name).replace("\\", "/").strip()
-    normalized = os.path.normcase(normalized)
+    normalized = normalized.casefold()
     return f"finished-name:{normalized}"
 
 
@@ -371,26 +395,26 @@ def history_key_from_item(item):
     return ""
 
 
+def _history_namespace(path):
+    names = {
+        os.path.basename(UPLOADED_HISTORY_FILE): "android_uploaded",
+        os.path.basename(DRIVE_UPLOADED_HISTORY_FILE): "drive_uploaded",
+        os.path.basename(TEST_PROCESSED_HISTORY_FILE): "test_processed",
+    }
+    name = os.path.basename(os.fspath(path))
+    if name not in names:
+        raise ValueError(f"Unrecognized shared history type: {name}")
+    return names[name]
+
+
 def load_history_file(path, purpose):
-    if not os.path.exists(path):
-        return set()
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        log(f"Could not read {purpose} history; treating matching finished files as pending: {e}")
-        return set()
-
-    if isinstance(data, list):
-        return {str(item) for item in data}
-
-    return set()
+    # Fail closed if Google Sheets is unavailable. Returning an empty set here
+    # could cause mistaken uploads and inconsistent file-deletion decisions.
+    return load_set(_history_namespace(path))
 
 
 def save_history_file(path, history):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(sorted(history), f, indent=2, ensure_ascii=False)
+    save_set(_history_namespace(path), history)
 
 
 def load_uploaded_history():
@@ -436,7 +460,7 @@ def pending_finished_upload_files():
     for path in sorted(snapshot_finished_files()):
         if not is_supported_audio_file(path):
             continue
-        if uploaded_history_key(path) not in uploaded_history:
+        if not history_has_audio(uploaded_history, path, base_dir=FINISHED_DIR):
             pending.append(path)
 
     return pending
@@ -766,7 +790,7 @@ def pending_finished_test_files():
             continue
 
         if not has_lyrics:
-            if processed_key in processed_history:
+            if processed_key in processed_history or youtube_history_alias(path) in processed_history:
                 skipped_previously_attempted_no_lyrics += 1
             else:
                 pending.append(path)
@@ -793,8 +817,7 @@ def pending_finished_drive_upload_files():
         if not is_supported_audio_file(path):
             continue
 
-        history_key = uploaded_history_key(path)
-        if history_key not in uploaded_history:
+        if not history_has_audio(uploaded_history, path, base_dir=FINISHED_DIR):
             continue
 
         pending.append(path)
@@ -1390,11 +1413,10 @@ def main():
     else:
         close_run_log()
 
+    # Ensure Android and Drive upload histories are committed together.
+    flush_pending()
     if exit_code:
         sys.exit(exit_code)
-
-
-FALLBACK_PYTHON_EXE = r"C:\Users\qacer\miniconda3\python.exe"
 
 
 def run_auto_thumbnail(upload_candidates):
@@ -1424,28 +1446,25 @@ def run_auto_thumbnail(upload_candidates):
     child_env["PYTHONUNBUFFERED"] = "1"
     args = ["--manifest", manifest_path]
 
-    for python_path in (PYTHON_EXE, FALLBACK_PYTHON_EXE):
-        log(f"  Trying: {python_path}")
-        process = subprocess.Popen(
-            [python_path, "-u", script_path, *args],
-            cwd=SCRIPTS_DIR,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=child_env,
-        )
-        if process.stdout:
-            for line in process.stdout:
-                write_log_raw(line)
-        return_code = process.wait()
-        if return_code == 0:
-            log(f"FINISHED: auto_thumbnail.py (using {python_path})")
-            break
-        log(f"  Failed with exit code {return_code}, trying fallback Python...")
+    log(f"  Python: {PYTHON_EXE}")
+    process = subprocess.Popen(
+        [PYTHON_EXE, "-u", script_path, *args],
+        cwd=SCRIPTS_DIR,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=child_env,
+    )
+    if process.stdout:
+        for line in process.stdout:
+            write_log_raw(line)
+    return_code = process.wait()
+    if return_code == 0:
+        log(f"FINISHED: auto_thumbnail.py (using {PYTHON_EXE})")
     else:
-        log("ERROR: auto_thumbnail.py failed with both Python interpreters.")
+        log(f"ERROR: auto_thumbnail.py exited with code {return_code}.")
 
     remove_file_if_exists(manifest_path, "removing auto_thumbnail manifest")
     log("Auto-thumbnail check complete.")
@@ -1453,3 +1472,4 @@ def run_auto_thumbnail(upload_candidates):
 
 if __name__ == "__main__":
     main()
+

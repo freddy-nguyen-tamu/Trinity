@@ -39,3 +39,17 @@ client_secret*.json
 *service-account*.json
 *serviceaccount*.json
 wavestack2-*.json
+
+# Shared Google Sheets history configuration / OAuth token
+history_sheet_config.json
+_google_sheets_history_token.json
+
+# OAuth client secrets (including Windows Downloads credentials copies)
+credentials.json
+trinity history client_secret*.json
+
+
+# Crash-recoverable pending Google Sheets writes (never commit local journals)
+_pending_sheet_history_*.json
+_pending_sheet_history_*.lock
+_pending_sheet_history_*.json.tmp

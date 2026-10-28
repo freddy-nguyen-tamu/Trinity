@@ -8,10 +8,11 @@ from itertools import islice
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 from youtube_url_tag import tag_downloaded_mp3_with_youtube_url, youtube_watch_url
+from shared_history import load_set, save_set, flush_pending
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
-HISTORY_FILE = "download_history.json"
+HISTORY_FILE = "Google Sheets / History / download_history"
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLBkuXLqNhqX5FsS2CEaSDlGTKAHIBPtLe"
 ALREADY_DOWNLOADED_STREAK_LIMIT = 30
 LAZY_PLAYLIST_LIMIT = 200
@@ -56,26 +57,13 @@ FORMAT_CANDIDATES = [
 
 
 def load_history():
-    if not os.path.exists(HISTORY_FILE):
-        return set()
-
-    try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return set(str(x) for x in data)
-    except Exception as e:
-        print(f"Could not read {HISTORY_FILE}: {e}")
-
-    return set()
+    # All downloaders share one history in Google Sheets.
+    return load_set("download_history")
 
 
 def save_history(history):
-    try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(history), f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"Could not write {HISTORY_FILE}: {e}")
+    # Append only this process's additions/deletions, not a stale full snapshot.
+    save_set("download_history", history)
 
 
 def make_common_opts(use_cookies=False, player_clients=None, video_download=False):
@@ -242,6 +230,7 @@ def download_playlist(playlist_url):
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
     history = load_history()
+    last_history_sync = time.monotonic()
     print(f"Loaded {len(history)} previously downloaded entries from {HISTORY_FILE}.")
 
     print("Fetching playlist information...")
@@ -270,6 +259,12 @@ def download_playlist(playlist_url):
             print(f"Skipping entry #{index}: missing video id")
             already_downloaded_streak = 0
             continue
+
+        # Read new entries from other laptops during long-running playlists.
+        # Throttling prevents excessive Sheets API requests.
+        if time.monotonic() - last_history_sync >= 30:
+            history = load_history()
+            last_history_sync = time.monotonic()
 
         if video_id in history:
             print(f"Skipping already downloaded: {title}")
@@ -339,8 +334,10 @@ def download_playlist(playlist_url):
         else:
             print(f"Giving up for now: {title}")
 
+    flush_pending()  # One quota-friendly Sheets upload for the entire playlist.
     print("\nAll done!")
 
 
 if __name__ == "__main__":
     download_playlist(PLAYLIST_URL)
+

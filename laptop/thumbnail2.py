@@ -7,11 +7,12 @@ import time
 from itertools import islice
 from yt_dlp import YoutubeDL
 from youtube_url_tag import tag_downloaded_mp3_with_youtube_url, youtube_watch_url
+from shared_history import load_set, save_set, flush_pending
 
 # Config
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
-HISTORY_FILE = "download_history.json"
+HISTORY_FILE = "Google Sheets / History / download_history"
 ALREADY_DOWNLOADED_STREAK_LIMIT = 30
 LAZY_PLAYLIST_LIMIT = 200
 if os.environ.get("TRINITY_SKIP_PLAYLIST_ON_30", "1") == "0":
@@ -29,20 +30,19 @@ def make_cookie_opts():
 
 
 def load_history():
-    if not os.path.exists(HISTORY_FILE):
-        return set()
-    with open(HISTORY_FILE, "r") as f:
-        return set(json.load(f))
+    # All downloaders share one history in Google Sheets.
+    return load_set("download_history")
 
 
 def save_history(history):
-    with open(HISTORY_FILE, "w") as f:
-        json.dump(list(history), f, indent=2)
+    # Append only this process's additions/deletions, not a stale full snapshot.
+    save_set("download_history", history)
 
 
 def download_playlist(playlist_url):
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     history = load_history()
+    last_history_sync = time.monotonic()
     print(f"Loaded {len(history)} previously downloaded entries.")
 
     # Fetch playlist info
@@ -78,6 +78,12 @@ def download_playlist(playlist_url):
     for entry in video_entries:
         video_id = entry.get("id")
         video_title = entry.get("title")
+
+        # Read new entries from other laptops during long-running playlists.
+        # Throttling prevents excessive Sheets API requests.
+        if time.monotonic() - last_history_sync >= 30:
+            history = load_history()
+            last_history_sync = time.monotonic()
 
         if video_id in history:
             print(f"Skipping already downloaded: {video_title}")
@@ -124,14 +130,19 @@ def download_playlist(playlist_url):
                     started_at=started_at,
                     video_id=video_id,
                 )
-            history.add(video_id)
-            save_history(history)
         except Exception as e:
             print(f"Error downloading {video_title}: {e}")
+            continue
 
+        # A failed Sheet write must be reported as such, not silently skipped.
+        history.add(video_id)
+        save_history(history)
+
+    flush_pending()  # One quota-friendly Sheets upload for the entire playlist.
     print("All done!")
 
 
 if __name__ == "__main__":
     playlist_url = "https://www.youtube.com/playlist?list=PLBkuXLqNhqX5FsS2CEaSDlGTKAHIBPtLe"
     download_playlist(playlist_url)
+

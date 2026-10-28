@@ -18,6 +18,7 @@ from yt_dlp import YoutubeDL
 from yt_dlp.networking import Request as YtDlpRequest
 
 from groq_dynamic import groq_chat_try_all_models, load_groq_keys
+from shared_history import load_map, save_map, flush_pending
 from mutagen import File
 from mutagen.mp3 import MP3
 from mutagen.flac import FLAC
@@ -3231,42 +3232,17 @@ def current_timestamp():
 
 
 def load_lyrics_not_found_history():
-    if not os.path.exists(LYRICS_NOT_FOUND_HISTORY_PATH):
-        return {"version": LYRICS_NOT_FOUND_HISTORY_VERSION, "items": {}}
-
-    try:
-        with open(LYRICS_NOT_FOUND_HISTORY_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        print(f"Could not read lyrics not-found history; starting fresh: {e}")
-        return {"version": LYRICS_NOT_FOUND_HISTORY_VERSION, "items": {}}
-
-    if not isinstance(data, dict):
-        return {"version": LYRICS_NOT_FOUND_HISTORY_VERSION, "items": {}}
-
-    items = data.get("items")
-    if not isinstance(items, dict):
-        items = {}
-
+    # One record per cache key in the shared History tab. No local JSON fallback.
     return {
         "version": LYRICS_NOT_FOUND_HISTORY_VERSION,
-        "items": items,
-        "updated_at": data.get("updated_at"),
+        "items": load_map("lyrics_not_found"),
     }
 
 
 def save_lyrics_not_found_history(history):
     history["version"] = LYRICS_NOT_FOUND_HISTORY_VERSION
     history["updated_at"] = current_timestamp()
-    temp_path = LYRICS_NOT_FOUND_HISTORY_PATH + ".tmp"
-
-    def write_history():
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        os.replace(temp_path, LYRICS_NOT_FOUND_HISTORY_PATH)
-
-    retry_file_operation("saving lyrics not-found history", write_history)
+    save_map("lyrics_not_found", history.get("items", {}))
 
 
 def lyrics_not_found_cache_key(file_path):
@@ -3306,16 +3282,35 @@ def lyrics_not_found_signature_matches(record, signature):
     return True
 
 
+def stable_lyrics_key(signature):
+    """Key cache by video ID where possible; otherwise normalized song tags.
+
+    Signature validation still checks resolver_version, title, and artist so
+    stale lookup failures don't suppress a newly improved resolver.
+    """
+    video_id = str(signature.get("video_id") or "").strip()
+    if video_id:
+        return "youtube:" + video_id
+    title = str(signature.get("title") or "").strip().casefold()
+    artist = str(signature.get("artist") or "").strip().casefold()
+    if title and artist:
+        return "song:" + json.dumps([title, artist], ensure_ascii=False, separators=(",", ":"))
+    return signature["file_path"]
+
+
 def lyrics_not_found_cache_hit(history, file_path, signature):
     if ARGS.retry_missing_lyrics:
         return False
-
-    record = history.get("items", {}).get(lyrics_not_found_cache_key(file_path))
+    items = history.get("items", {})
+    record = items.get(stable_lyrics_key(signature))
+    if record is None:
+        # Legacy history may have been imported using absolute file paths.
+        record = items.get(lyrics_not_found_cache_key(file_path))
     return lyrics_not_found_signature_matches(record, signature)
 
 
 def remember_lyrics_not_found(history, signature):
-    key = signature["file_path"]
+    key = stable_lyrics_key(signature)
     existing = history.setdefault("items", {}).get(key, {})
     attempt_count = int(existing.get("attempt_count") or 0) + 1
     record = dict(signature)
@@ -3325,10 +3320,26 @@ def remember_lyrics_not_found(history, signature):
     save_lyrics_not_found_history(history)
 
 
-def forget_lyrics_not_found(history, file_path):
+def forget_lyrics_not_found(history, file_path, video_id="", title="", artist=""):
     key = lyrics_not_found_cache_key(file_path)
-    if key in history.get("items", {}):
-        history["items"].pop(key, None)
+    portable = stable_lyrics_key({
+        "file_path": key, "video_id": video_id,
+        "title": norm_text(title), "artist": norm_text(artist),
+    })
+    to_remove = {key, portable}
+    items = history.get("items", {})
+    # Also remove legacy path-keyed records on other devices referring to
+    # the same video/song, rather than leaving stale negative results.
+    for record_key, record in items.items():
+        if not isinstance(record, dict):
+            continue
+        if record.get("file_path") == key:
+            to_remove.add(record_key)
+        elif stable_lyrics_key(record) == portable and portable != key:
+            to_remove.add(record_key)
+    if any(k in items for k in to_remove):
+        for k in to_remove:
+            items.pop(k, None)
         save_lyrics_not_found_history(history)
 
 
@@ -3431,7 +3442,7 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
     lyrics_lookup_skipped_not_found_cache = False
 
     if already_has_lyrics:
-        forget_lyrics_not_found(lyrics_not_found_history, file_path)
+        forget_lyrics_not_found(lyrics_not_found_history, file_path, video_id, title, artist)
         print("  Skipped lyrics: already present")
     else:
         lyrics_not_found_signature = build_lyrics_not_found_signature(
@@ -3598,7 +3609,7 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
                     print("  No lyrics found")
 
                 if lyrics_found:
-                    forget_lyrics_not_found(lyrics_not_found_history, file_path)
+                    forget_lyrics_not_found(lyrics_not_found_history, file_path, video_id, title, artist)
                 else:
                     remember_lyrics_not_found(lyrics_not_found_history, lyrics_not_found_signature)
             except Exception as e:
@@ -3626,6 +3637,7 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
     if did_expensive_lookup:
         time.sleep(0.4)
 
+flush_pending()  # Commit lyrics history in one bulk Sheets write.
 print("\nDone.")
 print(json.dumps(all_metadata, ensure_ascii=False, indent=2))
 
@@ -3639,3 +3651,4 @@ else:
         print(f"\nMOVED {len(moved_paths)} WORKING ITEM(S) TO: {FINISHED_DIR}")
     except Exception as e:
         raise SystemExit(f"Could not move working files to finished: {e}")
+

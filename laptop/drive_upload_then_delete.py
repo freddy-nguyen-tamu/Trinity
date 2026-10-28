@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from upload_identity import calculate_file_hash, upload_history_key as build_upload_history_key
+from shared_history import load_set
 
 DRIVE_FOLDER_ID = "1qbVH_yaNn1aagSrMGvZIggCjSvRzZRSs"
 SERVICE_ACCOUNT_EMAIL = "trinitydrive@wavestack2.iam.gserviceaccount.com"
@@ -228,24 +229,9 @@ def file_item(path):
 
 
 def load_history_file(path, purpose):
-    history_path = Path(path).expanduser().resolve()
-
-    if not history_path.exists():
-        print(f"{purpose} history does not exist: {history_path}")
-        return set()
-
-    try:
-        with history_path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        print(f"Could not read {purpose} history: {e}")
-        return set()
-
-    if isinstance(data, list):
-        return {str(item) for item in data}
-
-    print(f"Ignoring {purpose} history because it is not a JSON list: {history_path}")
-    return set()
+    # The --android-uploaded-history-json flag remains for CLI compatibility,
+    # but is no longer read: the source of truth is the shared Google Sheet.
+    return load_set("android_uploaded")
 
 
 def relative_finished_name(path):
