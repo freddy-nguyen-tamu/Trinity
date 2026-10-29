@@ -53,3 +53,9 @@ trinity history client_secret*.json
 _pending_sheet_history_*.json
 _pending_sheet_history_*.lock
 _pending_sheet_history_*.json.tmp
+
+# Drive quota rotation runtime tokens, state and backups
+laptop/_drive_storage_full.json
+laptop/_drive_storage_full.json.tmp
+laptop/_google_drive_oauth_token.json.tmp
+laptop/trinity.py.backup-pre-quota-*

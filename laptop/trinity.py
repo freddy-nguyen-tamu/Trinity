@@ -1185,86 +1185,55 @@ def print_drive_upload_summary(summary):
 
 
 def auto_drive_upload_then_delete(drive_candidates):
+    """Run verified, quota-aware Drive API uploads with independent account rotation.
+
+    Android success must already be journaled in the shared Google Sheet.
+    The child handles each Drive success, Sheet confirmation and safe local
+    trash independently. On storage exhaustion it pauses Drive transfers and
+    optionally opens browser sign-in for a different account, without failing
+    Trinity's unrelated download, test or history processing work.
+    """
     if not drive_candidates:
         log("")
         log("No finished/ files are waiting for Drive upload/delete.")
         return
 
     log("")
-    log("Finished files already sent to Android and waiting for Drive upload/delete:")
-    print_numbered_files("Pending Drive files:", drive_candidates)
-
-    log("")
-    log(f"Google Drive target folder ID: {DRIVE_FOLDER_ID}")
-    log(f"Using OAuth client JSON: {DRIVE_OAUTH_CLIENT_JSON_FILE}")
-    log(f"OAuth token cache: {DRIVE_OAUTH_TOKEN_FILE}")
-    log("First OAuth run prints a login URL to copy into your chosen browser.")
-    log("Future runs reuse the cached token.")
-    log("")
-    log(
-        "Automatically uploading these Android-confirmed files to Google Drive, "
-        "then moving each local finished/ file to system trash only after its Drive upload succeeds."
-    )
-
+    log("DRIVE UPLOAD: verified completion, partial history sync and quota rotation")
+    print_numbered_files("Android-confirmed candidates:", drive_candidates)
     files_to_upload = write_drive_upload_manifest(drive_candidates)
     if not files_to_upload:
-        log("No valid finished/ files were available for Drive upload/delete.")
         return
 
-    if not os.path.exists(DRIVE_OAUTH_CLIENT_JSON_FILE):
-        log(f"OAuth client JSON does not exist: {DRIVE_OAUTH_CLIENT_JSON_FILE}")
-        log("Create a Google Cloud OAuth Client ID with application type Desktop app,")
-        log("download its JSON, and save it as google_drive_oauth_client.json inside ytb/.")
-        log("The service-account JSON cannot upload into a normal My Drive shared folder because")
-        log("Google service accounts do not have Drive storage quota.")
-        log("Kept files in finished/.")
+    # All successful Android transfers have already been queued with the
+    # crash-recoverable Google Sheets history journal. Confirm it remotely
+    # BEFORE Drive-side deletions can be considered.
+    try:
+        flush_pending()
+    except Exception as error:
+        log(f"Google Sheets history sync failed; Drive cleanup is blocked: {error}")
+        log("Unconfirmed history and all local originals are preserved.")
         return
 
-    log("")
-    log("AUTOMATIC DRIVE UPLOAD/DELETE")
-    log("-" * 50)
-    log(f"This will upload {len(files_to_upload)} file(s) to Google Drive folder:")
-    log(f"  {DRIVE_FOLDER_ID}")
-    log("")
-    log("After each file uploads successfully to Drive, that same local file will be moved to system trash from:")
-    log(f"  {FINISHED_DIR}")
-    log("")
-    log("Files that fail Drive upload will NOT be moved to system trash.")
-
-    remove_file_if_exists(DRIVE_UPLOAD_SUMMARY_FILE, "removing old Drive upload/delete summary")
-
-    return_code = run_script(
-        "drive_upload_then_delete.py",
+    result = run_script(
+        "drive_quota_rotation.py",
         [
-            "--manifest",
-            DRIVE_UPLOAD_MANIFEST_FILE,
-            "--oauth-client-json",
-            DRIVE_OAUTH_CLIENT_JSON_FILE,
-            "--oauth-token-json",
-            DRIVE_OAUTH_TOKEN_FILE,
-            "--folder-id",
-            DRIVE_FOLDER_ID,
-            "--summary-json",
-            DRIVE_UPLOAD_SUMMARY_FILE,
-            "--android-uploaded-history-json",
-            UPLOADED_HISTORY_FILE,
-            "--delete-after-upload",
+            "--manifest", DRIVE_UPLOAD_MANIFEST_FILE,
+            "--folder-id", DRIVE_FOLDER_ID,
+            "--summary-json", DRIVE_UPLOAD_SUMMARY_FILE,
         ],
         check=False,
     )
-
     summary = load_drive_upload_summary()
     print_drive_upload_summary(summary)
-    remember_successful_drive_uploads(summary)
-
-    if return_code == 0:
-        log("Drive upload/delete completed.")
+    if summary.get("quota_paused"):
+        log("Google Drive storage is full; Drive uploading is paused.")
+        log("All completed Android/Drive histories are preserved in Google Sheets.")
+        log("Sign into another account with access to the same folder to resume.")
+    elif result:
+        log("Drive upload had errors. Local originals not confirmed on BOTH sides were retained.")
     else:
-        log(
-            "Drive upload/delete finished with errors. "
-            "Any file that failed Drive upload was kept in finished/."
-        )
-
+        log("Drive upload finished; only doubly confirmed files were recycled.")
 
 def print_run_summary(downloaded_paths, upload_summary, upload_candidates):
     attempted = summary_items(upload_summary, "attempted")
