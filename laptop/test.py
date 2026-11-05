@@ -1,3 +1,4 @@
+
 import argparse
 import difflib
 import html
@@ -3165,6 +3166,39 @@ def write_lyrics(file_path: str, lyrics: str, replace_existing=False, language_c
         raise RuntimeError(f"Lyrics write failed: {e}")
 
 
+def ensure_m4a_standard_properties(file_path: str, title: str = "", artist: str = "", lyrics: str = ""):
+    """Add missing standard M4A title/artist/lyrics atoms without touching audio.
+
+    Some M4A files carry readable values in nonstandard or alternate tags.
+    Windows-compatible M4A metadata readers expect the standard MP4 atoms.
+    This only fills absent fields and preserves existing metadata and artwork.
+    """
+    if get_file_ext(file_path) != ".m4a":
+        return []
+
+    audio = MP4(file_path)
+    if audio.tags is None:
+        audio.add_tags()
+
+    changed = []
+    for key, value in (
+        ("\xa9nam", norm_text(title)),
+        ("\xa9ART", norm_text(artist)),
+        ("\xa9lyr", str(lyrics or "").strip()),
+    ):
+        if not value or first_tag_text(audio.tags.get(key)):
+            continue
+        audio.tags[key] = [value]
+        changed.append(key)
+
+    if changed:
+        retry_file_operation(
+            f"saving standard M4A song properties for {file_path}",
+            audio.save,
+        )
+    return changed
+
+
 def clear_lyrics(file_path: str):
     audio = get_audio_object(file_path)
     if not audio:
@@ -3352,6 +3386,9 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
     existing_artist = existing_metadata["artist"]
     existing_album = existing_metadata["album"]
     existing_lyrics_before = existing_metadata.get("lyrics") or ""
+    m4a_lyrics_candidate = (
+        existing_lyrics_before if existing_metadata["has_lyrics"] else ""
+    )
     already_has_lyrics = (
         existing_metadata["has_lyrics"]
         and not ARGS.recheck_existing_lyrics
@@ -3589,6 +3626,7 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
                 if lyrics:
                     cleaned_lyrics = clean_lyrics_for_tag(lyrics)
                     if cleaned_lyrics:
+                        m4a_lyrics_candidate = cleaned_lyrics
                         write_lyrics(
                             file_path,
                             cleaned_lyrics,
@@ -3614,6 +3652,18 @@ for idx, (original_file_name, file_path) in enumerate(file_entries, start=1):
                     remember_lyrics_not_found(lyrics_not_found_history, lyrics_not_found_signature)
             except Exception as e:
                 print(f"  Lyrics error: {e}")
+
+    # M4A-only safeguard: fill standard atoms if the existing pipeline left
+    # them absent, including lyrics carried by alternate M4A metadata keys.
+    if get_file_ext(file_path) == ".m4a":
+        try:
+            added_atoms = ensure_m4a_standard_properties(
+                file_path, title=title, artist=artist, lyrics=m4a_lyrics_candidate,
+            )
+            if added_atoms:
+                print(f"  Added standard M4A properties: {', '.join(added_atoms)}")
+        except Exception as e:
+            print(f"  Could not sync standard M4A properties: {e}")
 
     all_metadata.append({
         "file_name": original_file_name,
@@ -3651,4 +3701,3 @@ else:
         print(f"\nMOVED {len(moved_paths)} WORKING ITEM(S) TO: {FINISHED_DIR}")
     except Exception as e:
         raise SystemExit(f"Could not move working files to finished: {e}")
-
