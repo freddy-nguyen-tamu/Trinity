@@ -218,6 +218,10 @@ def render_audio(crops: Sequence[Crop], path: str, codec: str) -> None:
 
 
 class WaveformWidget(QtWidgets.QWidget):
+    # The waveform follows available window WIDTH, but stops growing vertically.
+    # Large monitors and maximized windows must not stretch it into a tall graph.
+    MAX_WAVEFORM_HEIGHT = 280
+
     leftHandleMoved = QtCore.pyqtSignal(float)
     rightHandleMoved = QtCore.pyqtSignal(float)
     cursorClicked = QtCore.pyqtSignal(float)
@@ -231,6 +235,7 @@ class WaveformWidget(QtWidgets.QWidget):
         self.setFocusPolicy(QtCore.Qt.ClickFocus)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.setMinimumSize(200, 115)
+        self.setMaximumHeight(self.MAX_WAVEFORM_HEIGHT)
         self.duration = 0.0
         self._base_pos = np.empty(0, dtype=np.float32)
         self._base_neg = np.empty(0, dtype=np.float32)
@@ -242,8 +247,15 @@ class WaveformWidget(QtWidgets.QWidget):
         self.editable = True
         self.dragging = None
         self.active_handle = None
+        # When the handles share a screen pixel, wait for the first pointer
+        # movement to select the handle by drag direction instead of always
+        # stealing the End handle with the Start handle.
+        self._overlap_press_x = None
         self.handle_extend, self.handle_width = 16, 28
         self.cursor_color = QtGui.QColor(255, 200, 0)
+
+    def sizeHint(self):
+        return QtCore.QSize(750, self.MAX_WAVEFORM_HEIGHT)
 
     def set_audio_data(self, samples: np.ndarray, duration: float, editable: bool = True) -> None:
         """Cache a width-independent envelope; rebuild visible peaks on EACH resize."""
@@ -263,6 +275,9 @@ class WaveformWidget(QtWidgets.QWidget):
             self._base_neg = np.empty(0, dtype=np.float32)
             self.max_abs = 1.0
         self.left_frac, self.right_frac, self.cursor_frac = 0.0, 1.0, 0.0
+        self.active_handle = None
+        self.dragging = None
+        self._overlap_press_x = None
         self._rebuild_visible_peaks()
         self._emit_time_signals()
         self.update()
@@ -377,39 +392,83 @@ class WaveformWidget(QtWidgets.QWidget):
         p.drawLine(cx, 0, cx, h)
         p.end()
 
+    def _select_handle(self, name: str) -> None:
+        self.dragging = name
+        self.active_handle = name
+        self._overlap_press_x = None
+        self.setCursor(QtCore.Qt.SizeHorCursor)
+        self.handleClicked.emit(name)
+
     def mousePressEvent(self, event):
         if event.button() != QtCore.Qt.LeftButton or self.duration <= 0:
             return
         x = event.x()
         self.setFocus()
+        self._overlap_press_x = None
         lx = round(self.left_frac * (self.width() - 1))
         rx = round(self.right_frac * (self.width() - 1))
         if self.editable:
-            # Prefer a selected handle when two handles overlap.
-            choices = [(abs(x - lx), "left"), (abs(x - rx), "right")]
-            closest = min(choices, key=lambda entry: entry[0])
-            if closest[0] <= self.handle_width // 2:
-                self.dragging = closest[1]
-                self.setCursor(QtCore.Qt.SizeHorCursor)
-                self.handleClicked.emit(self.dragging)
+            radius = self.handle_width // 2
+            left_hit = abs(x - lx) <= radius
+            right_hit = abs(x - rx) <= radius
+            if left_hit or right_hit:
+                if left_hit and right_hit:
+                    # Explicit override is available even if the handles are
+                    # exactly on top of each other (or a user cannot drag).
+                    if event.modifiers() & QtCore.Qt.AltModifier:
+                        choice = 'right'
+                    elif event.modifiers() & QtCore.Qt.ShiftModifier:
+                        choice = 'left'
+                    elif lx == rx and x == lx:
+                        # A drag to the RIGHT will grab End, a drag to the LEFT
+                        # will grab Start. Don't choose early on mouse down.
+                        self._overlap_press_x = x
+                        self.setCursor(QtCore.Qt.SizeHorCursor)
+                        return
+                    elif lx == rx:
+                        choice = 'right' if x > lx else 'left'
+                    elif abs(x - lx) == abs(x - rx):
+                        choice = self.active_handle or 'right'
+                    else:
+                        choice = 'left' if abs(x - lx) < abs(x - rx) else 'right'
+                else:
+                    choice = 'left' if left_hit else 'right'
+                self._select_handle(choice)
                 return
+        self.dragging = None
+        self.active_handle = None
         self.handleFocusLost.emit()
         self.set_cursor_time(x / max(1, self.width() - 1) * self.duration, notify=True)
 
     def mouseMoveEvent(self, event):
-        if self.dragging is None or not self.editable:
+        if not self.editable:
+            return
+        if self._overlap_press_x is not None:
+            dx = event.x() - self._overlap_press_x
+            # Ignore tiny motion caused by a normal click. If both bars are
+            # in the same pixel, motion direction resolves the ambiguity.
+            if abs(dx) < 2:
+                return
+            self._select_handle('right' if dx > 0 else 'left')
+        if self.dragging is None:
             return
         seconds = max(0, min(event.x() / max(1, self.width() - 1), 1)) * self.duration
-        if self.dragging == "left":
+        if self.dragging == 'left':
             self.set_left_time(seconds)
         else:
             self.set_right_time(seconds)
 
     def mouseReleaseEvent(self, event):
+        if self._overlap_press_x is not None:
+            # A click without dragging selects the OTHER handle, so the
+            # keyboard arrows can still operate either overlapped bar.
+            next_handle = 'right' if self.active_handle != 'right' else 'left'
+            self._select_handle(next_handle)
         if self.dragging is not None:
             previous = self.dragging
             self.dragging = None
             self.dragFinished.emit(previous)
+        self._overlap_press_x = None
         self.setCursor(QtCore.Qt.ArrowCursor)
 
     def _emit_time_signals(self):
@@ -911,6 +970,10 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         main.setContentsMargins(12, 10, 12, 10)
         main.setSpacing(10)
         top = QtWidgets.QHBoxLayout()
+        self.sidebar_button = self._button("Crops ◀", self._toggle_sidebar, top)
+        self.sidebar_button.setCheckable(True)
+        self.sidebar_button.setChecked(True)
+        self.sidebar_button.setToolTip("Collapse or reopen the crop queue (Ctrl+B)")
         self.open_button = self._button("Open audio", self.open_file, top)
         self.btn_keep = self._button("Keep", lambda: self.set_mode(True), top)
         self.btn_remove = self._button("Remove", lambda: self.set_mode(False), top)
@@ -919,13 +982,15 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         self.btn_keep.setChecked(True)
         self.btn_keep.setStyleSheet("QPushButton{background:#1b415f;color:white;border:none;border-radius:5px;padding:7px 12px;font-weight:600;} QPushButton:checked{background:#2f7847;}")
         self.btn_remove.setStyleSheet("QPushButton{background:#1b415f;color:white;border:none;border-radius:5px;padding:7px 12px;font-weight:600;} QPushButton:checked{background:#974347;}")
-        self.reset_button = self._button("Reset", self.reset_trim, top)
         top.addStretch()
-        self.save_button = self._button("Save current", self.save_file, top)
-        self.add_button = self._button("+ Add crop", self.add_crop, top)
-        self.update_button = self._button("Update crop", self.update_crop, top)
-        self.sidebar_button = self._button("Hide crops ◀", self._toggle_sidebar, top)
         main.addLayout(top)
+        actions = QtWidgets.QHBoxLayout()
+        self.reset_button = self._button("Reset", self.reset_trim, actions)
+        self.save_button = self._button("Save current", self.save_file, actions)
+        self.add_button = self._button("+ Add crop", self.add_crop, actions)
+        self.update_button = self._button("Update crop", self.update_crop, actions)
+        actions.addStretch()
+        main.addLayout(actions)
 
         self.file_label = QtWidgets.QLabel("No file loaded")
         self.file_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
@@ -941,7 +1006,7 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         self.waveform.dragFinished.connect(self.on_handle_drag_finished)
         margins = QtWidgets.QHBoxLayout()
         margins.setContentsMargins(30, 0, 30, 0)
-        margins.addWidget(self.waveform)
+        margins.addWidget(self.waveform, 1, QtCore.Qt.AlignVCenter)
         main.addLayout(margins, 1)
 
         bottom = QtWidgets.QHBoxLayout()
@@ -968,6 +1033,8 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         main.addLayout(bottom)
         self.statusBar().showMessage("Crops are virtual: no cropped files are written until export")
         self._init_sidebar()
+        self.sidebar_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+B"), self)
+        self.sidebar_shortcut.activated.connect(self.sidebar_button.click)
         self._refresh_edit_controls()
 
     def _button(self, name: str, callback, layout):
@@ -981,7 +1048,9 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         self.dock = QtWidgets.QDockWidget("Crop queue (drag to reorder)", self)
         self.dock.setObjectName("CropQueueDock")
         self.dock.setAllowedAreas(QtCore.Qt.RightDockWidgetArea)
-        self.dock.setFeatures(QtWidgets.QDockWidget.DockWidgetClosable)
+        # Use ONE persistent, checkable button for collapse AND reopen.
+        # Avoid a second close button that can hide the panel unexpectedly.
+        self.dock.setFeatures(QtWidgets.QDockWidget.NoDockWidgetFeatures)
         self.dock.visibilityChanged.connect(self._dock_visibility_changed)
         panel = QtWidgets.QWidget()
         panel.setStyleSheet("background:#10283e;color:white;")
@@ -1019,12 +1088,22 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         self.dock.resize(300, self.height())
 
     def _dock_visibility_changed(self, visible):
-        self.sidebar_button.setText("Hide crops ◀" if visible else "Show crops ▶")
+        # isHidden() tracks deliberate collapse, unlike isVisible() which is
+        # false whenever the WHOLE app is minimized/closed or not shown yet.
+        expanded = not self.dock.isHidden()
+        previous_blocked = self.sidebar_button.blockSignals(True)
+        self.sidebar_button.setChecked(expanded)
+        self.sidebar_button.setText("Crops ◀" if expanded else "Crops ▶")
+        self.sidebar_button.blockSignals(previous_blocked)
         if self.isVisible() and not self._closing:
             self._save_session()
 
     def _toggle_sidebar(self):
-        self.dock.setVisible(not self.dock.isVisible())
+        expand = self.dock.isHidden()
+        self.dock.setVisible(expand)
+        if expand:
+            self.dock.raise_()
+        self._dock_visibility_changed(expand)
 
     def _session_path(self) -> str:
         base = QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.AppDataLocation)
@@ -1039,7 +1118,7 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         try:
             path = self._session_path()
             saved = {"version": 2, "next_index": self.next_index,
-                     "sidebar_visible": self.dock.isVisible(),
+                     "sidebar_visible": not self.dock.isHidden(),
                      "crops": [asdict(c) for c in self.crops]}
             tmp = path + ".new"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -1146,7 +1225,8 @@ class MP3Trimmer(QtWidgets.QMainWindow):
             self.editing_crop_id = None
             self._queue_changed()
             self.crop_list.setCurrentRow(self.crop_list.count() - 1)
-            self.dock.show()
+            # Respect the user's collapsed sidebar state. The same top-row
+            # button can reopen it whenever they want.
             self.statusBar().showMessage(crop.name + " added (metadata only)", 4000)
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Cannot add crop", str(e))
