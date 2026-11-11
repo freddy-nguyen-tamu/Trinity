@@ -24,7 +24,6 @@ SCOPES = [
 
 SERVICE_ACCOUNT_QUOTA_MARKERS = (
     "Service Accounts do not have storage quota",
-    "storageQuotaExceeded",
 )
 
 try:
@@ -374,8 +373,8 @@ def validate_drive_folder(service, folder_id):
 
     if can_add_children is False:
         raise RuntimeError(
-            "The service account can see the folder but cannot upload into it. "
-            f"Make sure {SERVICE_ACCOUNT_EMAIL} has Editor permission."
+            "The authenticated Google account can see the folder but cannot upload into it. "
+            "Give the selected account Editor permission to the target folder."
         )
 
     return folder
@@ -537,6 +536,24 @@ def main():
 
     args = parser.parse_args()
 
+    # Use Trinity's existing crash-safe Drive uploader for OAuth uploads that
+    # also recycle finished/ files. It handles quota rotation, uses the same
+    # Google Sheets history, verifies Drive size/checksum and folder identity,
+    # and only recycles an original after BOTH histories are confirmed.
+    # Keep the prior service-account and non-deleting modes unchanged.
+    if args.oauth_client_json and args.delete_after_upload:
+        if not args.oauth_token_json:
+            parser.error("--oauth-token-json is required with --oauth-client-json.")
+        from drive_quota_rotation import run as run_quota_aware_upload
+        code = run_quota_aware_upload(argparse.Namespace(
+            manifest=Path(args.manifest),
+            folder_id=args.folder_id,
+            summary_json=Path(args.summary_json) if args.summary_json else SCRIPT_DIR / "_last_drive_upload_delete_summary.json",
+            oauth_client_json=Path(args.oauth_client_json),
+            oauth_token_json=Path(args.oauth_token_json),
+        ))
+        sys.exit(code)
+
     summary = {
         "timestamp": now_iso(),
         "folder_id": args.folder_id,
@@ -695,3 +712,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

@@ -96,9 +96,26 @@ def from_client_json(data):
     }}
 
 
-def oauth_app():
-    # No new credentials download: reuse the Desktop OAuth app already used
-    # for the shared Google Sheet if available.
+def oauth_app(client_json=None):
+    # Prefer the existing, explicitly configured Drive Desktop OAuth client.
+    # Do not accidentally use a different restricted Sheets OAuth application.
+    candidates = []
+    if client_json:
+        candidates.append(Path(client_json).expanduser())
+    else:
+        candidates.append(ROOT / 'google_drive_oauth_client.json')
+
+    for path in candidates:
+        if not path.is_file():
+            if client_json:
+                raise FileNotFoundError('Drive OAuth client JSON not found: ' + str(path))
+            continue
+        config = from_client_json(load_json(path))
+        if config:
+            return config
+        raise ValueError('Drive OAuth client must be a Desktop/installed application: ' + str(path))
+
+    # Fallback for installations that only have the Sheets Desktop OAuth app.
     token = load_json(SHEETS_TOKEN, {})
     if isinstance(token, dict) and token.get('client_id'):
         return {'installed': {
@@ -112,7 +129,7 @@ def oauth_app():
     profile = os.getenv('USERPROFILE')
     if profile:
         locations.append(Path(profile) / 'Downloads')
-    name_patterns = ['google_drive_oauth_client.json', 'credentials.json', '*client_secret*.json']
+    name_patterns = ['credentials.json', '*client_secret*.json']
     for folder in locations:
         for pat in name_patterns:
             for path in folder.glob(pat):
@@ -124,46 +141,67 @@ def oauth_app():
                     return config
     raise RuntimeError(
         'No installed-app Google OAuth client configuration found. '
-        'Browser authorization requires an OAuth client ID. Trinity can reuse '
-        '_google_sheets_history_token.json or your existing Desktop OAuth client; '
-        'you do not need a separate WaveStack service-account key.'
+        'Browser authorization requires a Desktop OAuth client. '
+        'Your Google Sheets credentials and token are separate.'
     )
 
 
-def authenticate(force=False):
+def authenticate(force=False, token_path=None, client_json=None):
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
 
+    token_path = Path(token_path or TOKEN_PATH)
     creds = None
-    if not force and TOKEN_PATH.is_file():
+    if not force and token_path.is_file():
         try:
-            creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
             if not set(SCOPES).issubset(set(creds.scopes or [])):
                 creds = None
-            if creds and creds.expired and creds.refresh_token:
+            if creds and expired_and_refreshable(creds):
                 creds.refresh(Request())
-        except Exception:
+        except Exception as error:
+            print('Cached Drive login needs reauthorization: ' + str(error), flush=True)
             creds = None
     if not creds or not creds.valid:
-        config = oauth_app()
+        config = oauth_app(client_json)
         flow = InstalledAppFlow.from_client_config(config, SCOPES)
-        print('Opening browser. Select the Google account with Editor access to the target Drive folder.', flush=True)
+        print('Select a Google account with AVAILABLE storage and Editor access to the same Drive folder.', flush=True)
+        print('A browser sign-in should open; the authorization URL is also printed below.', flush=True)
         creds = flow.run_local_server(
             port=0, open_browser=True,
-            prompt='select_account',
-            authorization_prompt_message='Google Drive sign-in URL: {url}',
+            prompt='select_account consent',
+            authorization_prompt_message='Google Drive account-selection URL: {url}',
         )
-    atomic_json(TOKEN_PATH, json.loads(creds.to_json()))
+    # Do not cache the newly selected account until its identity and folder
+    # permissions have been verified by the caller.
+    service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+    about = service.about().get(fields='user(emailAddress),storageQuota(limit,usage)').execute(num_retries=2)
+    email = str((about.get('user') or {}).get('emailAddress') or '(unknown account)')
+    return service, email, creds, about.get('storageQuota') or {}
+
+
+def expired_and_refreshable(credentials):
+    return bool(credentials.expired and credentials.refresh_token)
+
+
+def save_accepted_drive_token(token_path, credentials):
+    token_path = Path(token_path)
+    atomic_json(token_path, json.loads(credentials.to_json()))
     try:
-        TOKEN_PATH.chmod(0o600)
+        token_path.chmod(0o600)
     except OSError:
         pass
-    service = build('drive', 'v3', credentials=creds, cache_discovery=False)
-    about = service.about().get(fields='user(emailAddress)').execute(num_retries=2)
-    email = str((about.get('user') or {}).get('emailAddress') or '(unknown account)')
-    return service, email
+
+
+def account_is_full(quota):
+    try:
+        limit = int(quota.get('limit') or 0)
+        usage = int(quota.get('usage') or 0)
+        return limit > 0 and usage >= limit
+    except (ValueError, TypeError, AttributeError):
+        return False
 
 
 def error_reason(exc):
@@ -255,12 +293,15 @@ def save_summary(path, summary):
 
 
 def prompt_rotate():
-    if not sys.stdin.isatty():
+    # The parent may pipe stdout, so always print a complete, flushed line
+    # before asking for input. Redirected stdin can still supply a response;
+    # EOF safely pauses the uploader instead of hanging or deleting anything.
+    print('Sign in to a DIFFERENT Google account with free space and folder access, then resume? [y/N]', flush=True)
+    try:
+        response = input().strip().lower()
+    except (EOFError, OSError):
+        print('No interactive response received; retaining local originals.', flush=True)
         return False
-    # Parent Trinity streams child stdout line-by-line; finish the line before
-    # reading stdin or the user never sees the prompt.
-    print('Sign in to a DIFFERENT Google account with folder access and resume Drive uploads now? [y/N]', flush=True)
-    response = input().strip().lower()
     return response in ('y', 'yes')
 
 
@@ -286,37 +327,63 @@ def run(args):
     service, account = None, None
     remaining = list(files)
     attempted_accounts = set()
+    token_path = Path(getattr(args, 'oauth_token_json', None) or TOKEN_PATH).expanduser().resolve()
+    client_json = getattr(args, 'oauth_client_json', None)
 
     while remaining:
         if service is None:
-            if PAUSE_PATH.is_file():
-                paused = load_json(PAUSE_PATH, {})
-                print('\nDRIVE STORAGE FULL: previous upload account was paused.', flush=True)
-                print('Confirmed previous uploads are recorded in the shared Google Sheet. Unuploaded originals are preserved.', flush=True)
+            rotating = PAUSE_PATH.is_file()
+            if rotating:
+                paused = load_json(PAUSE_PATH, {}) or {}
+                print('\nDRIVE STORAGE FULL / ACCOUNT ROTATION', flush=True)
+                print('Previous account: ' + str(paused.get('account') or '(unknown)'), flush=True)
+                print('Completed uploads remain in Sheets history; unuploaded originals are retained.', flush=True)
                 if not prompt_rotate():
                     summary['quota_paused'] = True
                     save_summary(args.summary_json, summary)
-                    print('Drive transfer paused. Trinity will continue its normal shutdown; rerun to resume.', flush=True)
+                    print('Drive transfers paused. Rerun Trinity to try another account.', flush=True)
                     return 0
-                TOKEN_PATH.unlink(missing_ok=True)
             try:
-                service, account = authenticate(force=PAUSE_PATH.is_file())
-                verify_folder(service, args.folder_id)
+                service, account, creds, quota = authenticate(
+                    force=rotating, token_path=token_path, client_json=client_json,
+                )
+                print('Selected Drive account: ' + account, flush=True)
+                if account.casefold() in attempted_accounts or account_is_full(quota):
+                    reason = ('already exhausted during this run' if account.casefold() in attempted_accounts
+                              else 'Drive reports no remaining storage')
+                    print('Account cannot be used: ' + reason + '. Select a different account.', flush=True)
+                    attempted_accounts.add(account.casefold())
+                    atomic_json(PAUSE_PATH, {'account': account, 'time': dt.datetime.now().isoformat(),
+                                             'reason': 'storageQuotaExceeded'})
+                    service = None
+                    summary['quota_paused'] = True
+                    save_summary(args.summary_json, summary)
+                    continue
+                try:
+                    verify_folder(service, args.folder_id)
+                except Exception as folder_error:
+                    print('The selected account cannot use the original Drive folder: ' + str(folder_error), flush=True)
+                    print('Share that SAME folder with the new account as Editor, or choose another account.', flush=True)
+                    atomic_json(PAUSE_PATH, {'account': account, 'time': dt.datetime.now().isoformat(),
+                                             'reason': 'folderAccessDenied'})
+                    summary['quota_paused'] = True
+                    save_summary(args.summary_json, summary)
+                    service = None
+                    continue
+                save_accepted_drive_token(token_path, creds)
             except Exception as exc:
                 summary['error'] = 'Drive sign-in/folder validation failed: ' + str(exc)
                 save_summary(args.summary_json, summary)
-                print(summary['error'])
-                return 1
-            if account in attempted_accounts:
-                summary['error'] = ('The selected storage account was already exhausted in this run. '
-                                    'Choose another account with access to the folder.')
-                save_summary(args.summary_json, summary)
-                print(summary['error'])
-                TOKEN_PATH.unlink(missing_ok=True)
-                atomic_json(PAUSE_PATH, {'account': account, 'reason': 'already_exhausted_in_run'})
+                print(summary['error'], flush=True)
+                if rotating:
+                    print('Account was not switched; local originals are safe. Rerun to retry sign-in.', flush=True)
+                    summary['quota_paused'] = True
+                    save_summary(args.summary_json, summary)
+                    return 0
                 return 1
             PAUSE_PATH.unlink(missing_ok=True)
             summary['quota_paused'] = False
+            summary['error'] = None
             summary['accounts_used'].append(account)
             save_summary(args.summary_json, summary)
             print('Drive account: ' + account + ' (Sheets history remains under its own account)', flush=True)
@@ -364,8 +431,10 @@ def run(args):
                 print('\nGOOGLE DRIVE STORAGE EXHAUSTED for: ' + account, flush=True)
                 print('Uploaded successes are committed to the shared Google Sheet. Keeping unuploaded originals.', flush=True)
                 # Explicitly discard ONLY the Drive uploader token, never Sheets credentials.
-                attempted_accounts.add(account)
-                TOKEN_PATH.unlink(missing_ok=True)
+                attempted_accounts.add(account.casefold())
+                # Only the Drive OAuth token is invalidated for rotation; never
+                # touch the independent Sheets OAuth token or its WAL.
+                token_path.unlink(missing_ok=True)
                 atomic_json(PAUSE_PATH, {'account': account, 'time': dt.datetime.now().isoformat(),
                                          'reason': 'storageQuotaExceeded'})
                 summary['quota_paused'] = True
@@ -395,6 +464,8 @@ def main():
     parser.add_argument('--manifest', type=Path, required=True)
     parser.add_argument('--folder-id', required=True)
     parser.add_argument('--summary-json', type=Path, default=ROOT / '_last_drive_upload_delete_summary.json')
+    parser.add_argument('--oauth-client-json', type=Path, default=None)
+    parser.add_argument('--oauth-token-json', type=Path, default=None)
     args = parser.parse_args()
     try:
         return run(args)
@@ -405,3 +476,5 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+
+
