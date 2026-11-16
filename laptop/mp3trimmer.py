@@ -7,6 +7,8 @@ Install Python packages: pip install PyQt5 numpy mutagen
 Crops store ONLY source-file paths and edit ranges; no cropped audio is saved.
 The queue is auto-restored between launches. Source audio files must remain in place.
 The temporary WAV used for joined preview is deleted when it is no longer needed.
+Per-crop optional speed uses pitch-preserving FFmpeg atempo at PLAY/EXPORT time.
+In joined editing, changing a rate modifies only the virtual crop model and timeline.
 """
 from __future__ import annotations
 
@@ -14,6 +16,7 @@ import base64
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -36,6 +39,13 @@ from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm
 
 SAMPLE_RATE = 44100
+# Joined editing changes only the stored Crop range/rate. Preview waveforms
+# use the source PCM without audio processing; FFmpeg pitch-preserving atempo
+# is applied only when playing/exporting a speed-adjusted crop. No fades,
+# crossfades, pitch shifting, or changes to the original files are introduced.
+MIN_SPEED_RATE = 0.05
+MAX_SPEED_RATE = 32.0
+PREVIEW_ROW_HEIGHT = 86
 DEFAULT_DIR = r"C:\Users\qacer\Downloads\ytb\laptop\finished"
 OPEN_FILTER = (
     "Audio files (*.mp3 *.m4a *.m4u *.m4b *.aac *.flac *.wav *.ogg "
@@ -110,6 +120,37 @@ def write_wav_fast(path: str, samples: np.ndarray, rate: int = SAMPLE_RATE) -> N
         data.tofile(f)
 
 
+def validate_speed_rate(rate: Any) -> float:
+    try:
+        value = float(rate)
+    except (ValueError, TypeError, OverflowError):
+        raise ValueError("Speed must be a valid number")
+    if not math.isfinite(value) or not MIN_SPEED_RATE <= value <= MAX_SPEED_RATE:
+        raise ValueError(f"Speed must be between {MIN_SPEED_RATE:g}× and {MAX_SPEED_RATE:g}×")
+    return value
+
+
+def atempo_factors(rate: float) -> List[float]:
+    """Decompose tempo into high-quality .5–2 stages (avoids high-rate skips).
+
+    FFmpeg `atempo` time-stretches without changing pitch. Chaining bounded
+    stages avoids the documented audio sample skipping at extreme values.
+    """
+    remaining = validate_speed_rate(rate)
+    if abs(remaining - 1) < 1e-9:
+        return []
+    factors: List[float] = []
+    while remaining > 2.0 + 1e-9:
+        factors.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5 - 1e-9:
+        factors.append(0.5)
+        remaining /= 0.5
+    if abs(remaining - 1.0) > 1e-8:
+        factors.append(remaining)
+    return factors
+
+
 @dataclass
 class Crop:
     uid: str
@@ -121,6 +162,11 @@ class Crop:
     duration: float
     file_size: int = 0
     file_mtime_ns: int = 0
+    speed_enabled: bool = False
+    speed_rate: float = 1.0
+
+    def playback_rate(self) -> float:
+        return validate_speed_rate(self.speed_rate) if self.speed_enabled else 1.0
 
     @classmethod
     def from_record(cls, value: Dict[str, Any]) -> "Crop":
@@ -129,7 +175,9 @@ class Crop:
                    end=float(value["end"]), keep=bool(value["keep"]),
                    duration=float(value["duration"]),
                    file_size=int(value.get("file_size", 0)),
-                   file_mtime_ns=int(value.get("file_mtime_ns", 0)))
+                   file_mtime_ns=int(value.get("file_mtime_ns", 0)),
+                   speed_enabled=bool(value.get("speed_enabled", False)),
+                   speed_rate=validate_speed_rate(value.get("speed_rate", 1.0)))
 
     def parts(self) -> List[Tuple[float, float]]:
         """'Remove' keeps BOTH sides of the removed interval as one logical crop."""
@@ -140,7 +188,7 @@ class Crop:
         return [(a, b) for a, b in choices if b - a >= 0.001]
 
     def effective_duration(self) -> float:
-        return sum(b - a for a, b in self.parts())
+        return sum(b - a for a, b in self.parts()) / self.playback_rate()
 
 
 @dataclass(frozen=True)
@@ -156,6 +204,7 @@ class PreviewSegment:
     preview_end: float
     start_editable: bool
     end_editable: bool
+    speed_rate: float = 1.0
 
     def boundary_time(self, side: str) -> float:
         return self.preview_start if side == "start" else self.preview_end
@@ -176,28 +225,27 @@ def preview_parts(crop: Crop) -> List[Tuple[int, float, float]]:
     return [(index, start, end) for index, start, end in pieces if end - start >= .001]
 
 
-def assemble_joined_preview(crops: Sequence[Crop],
-                            source_samples: Dict[str, np.ndarray]) -> Tuple[np.ndarray, List[PreviewSegment]]:
-    """Construct the joined waveform from ORIGINAL SOURCE PCM, including extensions.
+def describe_joined_preview(crops: Sequence[Crop],
+                            source_samples: Dict[str, np.ndarray]) -> Tuple[List[PreviewSegment], int]:
+    """Map original source timestamps onto a virtual playback timeline.
 
-    This cache is only for waveform/audio preview. Final exports still trim the
-    original high-quality sources through FFmpeg as before.
+    This creates NO joined PCM, no clipped source files, and no audio effects.
+    Called on every boundary edit so its sole output is updated timeline data.
     """
-    arrays: List[np.ndarray] = []
     segments: List[PreviewSegment] = []
-    position = 0  # actual decoded sample count, avoiding accumulating rounding errors
+    position = 0
     for crop in crops:
         if crop.source not in source_samples:
             raise ValueError("Missing preview samples for " + crop.source)
         source = source_samples[crop.source]
+        rate = crop.playback_rate()
         for part_index, a, b in preview_parts(crop):
             first = max(0, min(len(source), round(a * SAMPLE_RATE)))
             last = max(first, min(len(source), round(b * SAMPLE_RATE)))
             if last <= first:
                 continue
-            arrays.append(source[first:last])
             start = position / SAMPLE_RATE
-            position += last - first
+            position += max(1, round((last - first) / rate))
             end = position / SAMPLE_RATE
             segments.append(PreviewSegment(
                 crop_uid=crop.uid, crop_name=crop.name, source=crop.source,
@@ -205,10 +253,31 @@ def assemble_joined_preview(crops: Sequence[Crop],
                 source_end=last / SAMPLE_RATE, preview_start=start, preview_end=end,
                 start_editable=crop.keep or part_index == 1,
                 end_editable=crop.keep or part_index == 0,
+                speed_rate=rate,
             ))
-    if not arrays:
+    if not segments:
         raise ValueError("None of the crops contain audible audio")
-    return np.concatenate(arrays), segments
+    return segments, position
+
+
+def assemble_joined_preview(crops: Sequence[Crop],
+                            source_samples: Dict[str, np.ndarray]) -> Tuple[np.ndarray, List[PreviewSegment]]:
+    """Create playback PCM ONLY on demand, from unmodified source samples.
+
+    The interactive editor is virtual: it calls describe_joined_preview instead.
+    This function does not use any DSP/fades/normalization or hard cut source
+    files; it simply presents selected intervals consecutively to the player.
+    """
+    if any(abs(crop.playback_rate() - 1.0) > 1e-8 for crop in crops):
+        raise ValueError("Time-stretched audio must be rendered via pitch-preserving FFmpeg atempo")
+    segments, sample_count = describe_joined_preview(crops, source_samples)
+    parts = [source_samples[seg.source][round(seg.source_start * SAMPLE_RATE):
+                                         round(seg.source_end * SAMPLE_RATE)]
+             for seg in segments]
+    joined = np.concatenate(parts)
+    if len(joined) != sample_count:
+        raise RuntimeError("Joined audio differs from the source timestamp map")
+    return joined, segments
 
 
 def nudge_preview_boundary(crop: Crop, part_index: int, side: str,
@@ -229,7 +298,10 @@ def nudge_preview_boundary(crop: Crop, part_index: int, side: str,
         field = "end"
     else:
         return False
-    minimum = max(1 / SAMPLE_RATE, .001)
+    # The preview renderer excludes pieces shorter than 1 ms. After sample
+    # quantization, 0.001 s can round DOWN to 44 samples at 44.1 kHz; use
+    # ceil to keep even the tiniest legal crop visible and selectable.
+    minimum = math.ceil(.001 * SAMPLE_RATE) / SAMPLE_RATE
     if field == "start":
         lower = minimum if not crop.keep else 0.0
         upper = crop.end - minimum if crop.keep else crop.end
@@ -258,55 +330,96 @@ def source_audio_profile(path: str) -> Tuple[int, int]:
 
 
 def render_audio(crops: Sequence[Crop], path: str, codec: str) -> None:
-    """Trim from original audio, not the 44.1-kHz mono waveform preview.
+    """Export original-source sample ranges, respecting the joined editor timestamps.
 
-    Consistent source rates pass through unchanged; mixed sources are unified at
-    the highest compatible rate for the selected codec. ALAC uses 32-bit PCM
-    internally rather than throwing away high-resolution sample precision.
+    Unlike a timestamp-based `atrim=start:...`, `atrim=start_sample:...`
+    indexes decoded audio from sample zero. This removes ambiguity from MP3
+    encoder delay, container start_time, and non-zero input presentation times.
+
+    Multiple crop pieces from the SAME audio input are branched through `asplit`
+    before trimming, making it explicit that every piece independently reads
+    the unmodified source. Time stretching is per-piece, using `atempo` only
+    for crops whose effective speed differs from 1×. It changes tempo without
+    shifting pitch. No fades, gain changes, crossfades or source modifications.
     """
-    segments: List[Tuple[str, float, float]] = []
+    segments: List[Tuple[str, float, float, float]] = []
     for crop in crops:
+        rate = crop.playback_rate()
         for a, b in crop.parts():
-            segments.append((crop.source, a, b))
+            segments.append((crop.source, a, b, rate))
     if not segments:
         raise ValueError("The selected crop(s) contain no audio")
-    sources = list(dict.fromkeys(src for src, _, _ in segments))
-    if not all(os.path.isfile(x) for x in sources):
-        missing = [x for x in sources if not os.path.isfile(x)]
+
+    sources = list(dict.fromkeys(src for src, _, _, _ in segments))
+    missing = [src for src in sources if not os.path.isfile(src)]
+    if missing:
         raise FileNotFoundError("Source file missing:\n" + "\n".join(missing))
-    index = {path: i for i, path in enumerate(sources)}
+
+    index = {source: i for i, source in enumerate(sources)}
+    profiles = {source: source_audio_profile(source) for source in sources}
     if codec == "preview":
-        output_rate, layout, sample_format = SAMPLE_RATE, "stereo", "fltp"
+        output_rate, layout, sample_format = SAMPLE_RATE, "mono", "s16"
     else:
-        profiles = [source_audio_profile(src) for src in sources]
-        rates = [rate for rate, channels in profiles]
+        rates = [rate for rate, channels in profiles.values()]
         output_rate = max(rates)
         if codec == "mp3":
-            output_rate = min((32000, 44100, 48000), key=lambda rate: abs(rate - min(output_rate, 48000)))
+            output_rate = min((32000, 44100, 48000),
+                              key=lambda rate: abs(rate - min(output_rate, 48000)))
         elif codec == "aac":
             output_rate = min(output_rate, 96000)
         else:
             output_rate = min(output_rate, 192000)
-        layout = "mono" if all(channels == 1 for rate, channels in profiles) else "stereo"
+        layout = "mono" if all(channels == 1 for rate, channels in profiles.values()) else "stereo"
         sample_format = "s32p" if codec == "alac" else "fltp"
+
     args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
-    for src in sources:
-        args.extend(["-i", src])
+    for source in sources:
+        args.extend(["-i", source])
+
+    # Give each reuse of a source its own explicitly numbered input branch.
+    # Without asplit, reusing the same labelled stream relies on implicit graph
+    # behavior, which is fragile for multiple edits on a compressed source.
+    used_per_source: Dict[str, int] = {source: 0 for source in sources}
+    counts: Dict[str, int] = {source: 0 for source in sources}
+    for source, _, _, _ in segments:
+        counts[source] += 1
     chains: List[str] = []
-    for n, (src, start, stop) in enumerate(segments):
-        chains.append(
-            f"[{index[src]}:a:0]atrim=start={start:.8f}:end={stop:.8f},"
-            f"asetpts=PTS-STARTPTS,aresample={output_rate},"
-            f"aformat=sample_fmts={sample_format}:channel_layouts={layout}[s{n}]"
-        )
+    for source in sources:
+        if counts[source] > 1:
+            pads = "".join(f"[input{index[source]}_{i}]" for i in range(counts[source]))
+            chains.append(f"[{index[source]}:a:0]asplit={counts[source]}{pads}")
+
+    for number, (source, start, end, rate) in enumerate(segments):
+        branch = used_per_source[source]
+        used_per_source[source] += 1
+        input_pad = (f"[input{index[source]}_{branch}]" if counts[source] > 1
+                     else f"[{index[source]}:a:0]")
+        # atrim's *_sample options count decoded audio, independent of PTS.
+        # Use the ORIGINAL source's sample rate, not the 44.1-kHz graph rate.
+        source_rate, _ = profiles[source]
+        first_sample = max(0, round(start * source_rate))
+        end_sample = max(first_sample + 1, round(end * source_rate))
+        filters = [
+            f"atrim=start_sample={first_sample}:end_sample={end_sample}",
+            "asetpts=N/SR/TB",
+            f"aresample={output_rate}",
+        ]
+        filters.extend(f"atempo={factor:.12g}" for factor in atempo_factors(rate))
+        filters.extend([
+            f"aformat=sample_fmts={sample_format}:channel_layouts={layout}",
+            "asetpts=N/SR/TB",
+        ])
+        chains.append(input_pad + ",".join(filters) + f"[s{number}]")
+
     if len(segments) == 1:
         chains.append("[s0]anull[aout]")
     else:
         chains.append("".join(f"[s{i}]" for i in range(len(segments))) +
                       f"concat=n={len(segments)}:v=0:a=1[aout]")
-    args += ["-filter_complex", ";".join(chains), "-map", "[aout]", "-map_metadata", "-1", "-vn"]
+    args += ["-filter_complex", ";".join(chains), "-map", "[aout]",
+             "-map_metadata", "-1", "-vn"]
     if codec == "preview":
-        args += ["-ac", "1", "-c:a", "pcm_s16le", "-f", "wav"]
+        args += ["-c:a", "pcm_s16le", "-f", "wav"]
     elif codec == "mp3":
         args += ["-c:a", "libmp3lame", "-q:a", "2", "-id3v2_version", "3", "-f", "mp3"]
     elif codec == "alac":
@@ -333,6 +446,8 @@ class WaveformWidget(QtWidgets.QWidget):
     handleFocusLost = QtCore.pyqtSignal()
     dragFinished = QtCore.pyqtSignal(str)
     previewBoundaryClicked = QtCore.pyqtSignal(object)
+    previewBoundaryDragged = QtCore.pyqtSignal(object, float)   # key, absolute SOURCE time
+    previewDragFinished = QtCore.pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -359,7 +474,10 @@ class WaveformWidget(QtWidgets.QWidget):
         self.handle_extend, self.handle_width = 16, 28
         self.cursor_color = QtGui.QColor(255, 200, 0)
         self.preview_segments: List[PreviewSegment] = []
+        self._virtual_preview_sources: Dict[str, np.ndarray] = {}
         self.preview_selected: Optional[Tuple[str, int, str]] = None
+        self._preview_drag = None
+        self._drag_last_emit = 0.0
 
     def sizeHint(self):
         return QtCore.QSize(750, self.MAX_WAVEFORM_HEIGHT)
@@ -387,18 +505,34 @@ class WaveformWidget(QtWidgets.QWidget):
         self._overlap_press_x = None
         # The MainWindow immediately reapplies markers after a preview rebuild.
         self.preview_segments = []
+        self._virtual_preview_sources = {}
         self.preview_selected = None
         self._rebuild_visible_peaks()
         self._emit_time_signals()
         self.update()
 
     def set_preview_segments(self, segments: Sequence[PreviewSegment],
-                             selected: Optional[Tuple[str, int, str]] = None):
+                             selected: Optional[Tuple[str, int, str]] = None,
+                             source_samples: Optional[Dict[str, np.ndarray]] = None):
         self.preview_segments = list(segments)
+        # The editor draws audio directly from these source arrays: no joined
+        # buffer is created until the user requests playback.
+        self._virtual_preview_sources = source_samples if source_samples is not None else {}
+        if self._virtual_preview_sources:
+            self._rebuild_visible_peaks()
         valid = {(s.crop_uid, s.part_index, side)
                  for s in self.preview_segments for side in ("start", "end")}
         self.preview_selected = selected if selected in valid else None
+        # One independent lane for each audible piece (Remove crops can have two
+        # lanes); a scroll viewport limits visible height to 280 px.
+        if not self.editable:
+            self.setFixedHeight(max(115, len(self.preview_segments) * PREVIEW_ROW_HEIGHT))
         self.update()
+
+    def restore_editor_height(self):
+        self.setMinimumHeight(115)
+        self.setMaximumHeight(self.MAX_WAVEFORM_HEIGHT)
+        self.updateGeometry()
 
     def selected_preview_segment(self) -> Optional[PreviewSegment]:
         if not self.preview_selected:
@@ -408,28 +542,39 @@ class WaveformWidget(QtWidgets.QWidget):
                      if s.crop_uid == uid and s.part_index == part), None)
 
     def _preview_boundary_at(self, x: int, y: int) -> Optional[Tuple[str, int, str]]:
-        """At a join, Start (top) and End (bottom) are independently clickable."""
-        if not self.preview_segments:
+        """Row chooses the crop, X chooses the boundary: no join-click ambiguity."""
+        if not self.preview_segments or y < 0:
             return None
+        row = min(len(self.preview_segments) - 1, y // PREVIEW_ROW_HEIGHT)
+        # One-piece preview takes the widget's full height.
+        if len(self.preview_segments) == 1:
+            row = 0
+        if row < 0 or row >= len(self.preview_segments):
+            return None
+        seg = self.preview_segments[row]
         width = max(1, self.width() - 1)
-        height = self.height()
         candidates = []
-        for seg in self.preview_segments:
-            for side in ("start", "end"):
-                px = round(seg.boundary_time(side) / max(self.duration, 1e-9) * width)
-                dx = abs(x - px)
-                if dx > 13:
-                    continue
-                anchor = 17 if side == "start" else height - 17
-                dy = abs(y - anchor)
-                key = (seg.crop_uid, seg.part_index, side)
-                # Y position is decisive when two sides meet at the same X.
-                candidates.append((dx * 2 + dy / 10, dx, dy,
-                                   0 if key == self.preview_selected else 1, key))
-        if not candidates:
+        for side in ("start", "end"):
+            px = round(seg.boundary_time(side) / max(self.duration, 1e-9) * width)
+            dx = abs(x - px)
+            if dx > 15:
+                continue
+            # Even if a tiny segment begins/ends at the same pixel, top and
+            # bottom half of its own ROW choose Start vs End independently.
+            local_y = y if row == 0 else y - row * PREVIEW_ROW_HEIGHT
+            row_height = self.height() if len(self.preview_segments) == 1 else PREVIEW_ROW_HEIGHT
+            anchor = 14 if side == "start" else row_height - 14
+            dy = abs(local_y - anchor)
+            key = (seg.crop_uid, seg.part_index, side)
+            candidates.append((dy, dx, 0 if key == self.preview_selected else 1, key))
+        return min(candidates)[-1] if candidates else None
+
+    def _preview_drag_target(self, x: int) -> Optional[float]:
+        state = self._preview_drag
+        if state is None:
             return None
-        candidates.sort(key=lambda item: item[:4])
-        return candidates[0][-1]
+        return state["original"] + ((x - state["start_x"]) * state["duration"] * state["rate"] /
+                                    max(1, state["width"] - 1))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -437,6 +582,9 @@ class WaveformWidget(QtWidgets.QWidget):
         self.update()
 
     def _rebuild_visible_peaks(self):
+        if self._virtual_preview_sources and self.preview_segments and self.duration > 0:
+            self._rebuild_virtual_peaks()
+            return
         n, width = len(self._base_pos), max(1, self.width())
         if not n:
             self._peaks_pos = np.zeros(width, dtype=np.float32)
@@ -450,6 +598,40 @@ class WaveformWidget(QtWidgets.QWidget):
             indexes = np.minimum((np.arange(width, dtype=np.int64) * n) // width, n - 1)
             self._peaks_pos = self._base_pos[indexes]
             self._peaks_neg = self._base_neg[indexes]
+
+    def _rebuild_virtual_peaks(self):
+        """Paint each crop on its own row using ORIGINAL PCM, never joined PCM.
+
+        `reduceat` creates just a width-sized display envelope for each part.
+        This is visual-only and does not change the playback samples or crops.
+        """
+        width = max(1, self.width())
+        self._peaks_pos = np.zeros(width, dtype=np.float32)
+        self._peaks_neg = np.zeros(width, dtype=np.float32)
+        for seg in self.preview_segments:
+            source = self._virtual_preview_sources.get(seg.source)
+            if source is None:
+                continue
+            a = max(0, min(len(source), round(seg.source_start * SAMPLE_RATE)))
+            b = max(a, min(len(source), round(seg.source_end * SAMPLE_RATE)))
+            if b <= a:
+                continue
+            start_x = max(0, min(width - 1, round(seg.preview_start / self.duration * (width - 1))))
+            end_x = max(start_x, min(width - 1, round(seg.preview_end / self.duration * (width - 1))))
+            pixels = end_x - start_x + 1
+            data = source[a:b]
+            if pixels <= len(data):
+                edges = (np.arange(pixels, dtype=np.int64) * len(data)) // pixels
+                top = np.maximum.reduceat(data, edges).astype(np.float32) / 32768.0
+                bottom = np.minimum.reduceat(data, edges).astype(np.float32) / 32768.0
+            else:
+                indexes = (np.arange(pixels, dtype=np.int64) * len(data)) // pixels
+                top = bottom = data[indexes].astype(np.float32) / 32768.0
+            sl = slice(start_x, end_x + 1)
+            self._peaks_pos[sl] = np.maximum(self._peaks_pos[sl], top)
+            self._peaks_neg[sl] = np.minimum(self._peaks_neg[sl], bottom)
+        self.max_abs = max(float(np.max(self._peaks_pos)),
+                           float(-np.min(self._peaks_neg)), 0.001)
 
     def set_keep_mode(self, keep: bool):
         self.keep_mode = bool(keep)
@@ -512,6 +694,77 @@ class WaveformWidget(QtWidgets.QWidget):
             p.setPen(QtGui.QColor(145, 168, 188))
             p.drawText(self.rect(), QtCore.Qt.AlignCenter, "Open an audio file to begin")
             return
+        if self.preview_segments and not self.editable:
+            # Professional multitrack-style joined timeline: all rows share a
+            # global X axis, but boundaries are NEVER stacked in the same row.
+            # They still play as one continuous audio buffer.
+            fm = p.fontMetrics()
+            for index, seg in enumerate(self.preview_segments):
+                top = index * PREVIEW_ROW_HEIGHT
+                bottom = (h if len(self.preview_segments) == 1
+                          else min(h, top + PREVIEW_ROW_HEIGHT))
+                row_h = bottom - top
+                if row_h <= 0 or top > event.rect().bottom() or bottom < event.rect().top():
+                    continue
+                sx = round(seg.preview_start / self.duration * (w - 1))
+                ex = round(seg.preview_end / self.duration * (w - 1))
+                chosen = self.preview_selected and seg.crop_uid == self.preview_selected[0] and seg.part_index == self.preview_selected[1]
+                p.fillRect(0, top, w, row_h - 1, QtGui.QColor(17, 37, 54) if index % 2 else QtGui.QColor(20, 47, 64))
+                p.fillRect(sx, top + 3, max(1, ex - sx), max(1, row_h - 7),
+                           QtGui.QColor(35, 124, 70) if chosen else QtGui.QColor(29, 92, 62))
+                # Waveform for only THIS crop; the other clips are transparent
+                # on this lane. Global X mapping preserves real joined time.
+                center = top + row_h * .58
+                local_hi = self._peaks_pos[max(0, sx):min(w, ex + 1)]
+                local_lo = self._peaks_neg[max(0, sx):min(w, ex + 1)]
+                local_peak = max(float(np.max(local_hi)) if len(local_hi) else 0.,
+                                 float(-np.min(local_lo)) if len(local_lo) else 0., .05)
+                amp = max(1, row_h * .28) / local_peak
+                p.setPen(QtCore.Qt.NoPen)
+                p.setBrush(QtGui.QColor(119, 214, 159))
+                for x in range(max(0, sx), min(w - 1, ex) + 1):
+                    upper = int(center - float(self._peaks_pos[x]) * amp)
+                    lower = int(center - float(self._peaks_neg[x]) * amp)
+                    upper = max(top + 22, upper)
+                    lower = min(bottom - 3, lower)
+                    p.drawRect(x, upper, 1, max(1, lower - upper))
+                # A source label at the left of each lane is always visible,
+                # even for tiny clips, where in-clip labels would be invisible.
+                name = f"{index + 1}. {seg.crop_name}" + (
+                    f" · {seg.speed_rate:g}×" if abs(seg.speed_rate - 1.0) > 1e-8 else "")
+                if sum(other.crop_uid == seg.crop_uid for other in self.preview_segments) > 1:
+                    name += f" · part {seg.part_index + 1}"
+                p.setPen(QtGui.QColor(210, 247, 223))
+                p.drawText(8, top + 16, fm.elidedText(name + "  ·  " + os.path.basename(seg.source),
+                                                     QtCore.Qt.ElideRight, max(30, w - 20)))
+                for side in ("start", "end"):
+                    key = (seg.crop_uid, seg.part_index, side)
+                    active = key == self.preview_selected
+                    x = sx if side == "start" else ex
+                    color = (QtGui.QColor(255, 241, 109) if active else
+                             QtGui.QColor(151, 244, 183) if seg.boundary_editable(side)
+                             else QtGui.QColor(114, 144, 130))
+                    p.setPen(QtGui.QPen(color, 3 if active else 2))
+                    p.drawLine(x, top + 19, x, bottom - 3)
+                    p.setPen(QtCore.Qt.NoPen)
+                    p.setBrush(color)
+                    if side == "start":
+                        points = [QtCore.QPoint(x-7, top+20), QtCore.QPoint(x+7, top+20), QtCore.QPoint(x, top+32)]
+                    else:
+                        points = [QtCore.QPoint(x-7, bottom-3), QtCore.QPoint(x+7, bottom-3), QtCore.QPoint(x, bottom-15)]
+                    p.drawPolygon(QtGui.QPolygon(points))
+                    if active:
+                        p.setPen(QtGui.QColor(255, 255, 220))
+                        # Label on the same lane; no need to spam-click joints.
+                        p.drawText(min(w-47, max(2, x+7)), top + row_h // 2,
+                                   "START" if side == "start" else "END")
+            # One continuous playback cursor traverses EVERY lane at once.
+            cx = round(self.cursor_frac * (w - 1))
+            p.setPen(QtGui.QPen(self.cursor_color, 2))
+            p.drawLine(cx, 0, cx, h)
+            p.end()
+            return
+
         center = h / 2
         factor = max(1, h / 2 - 8) / self.max_abs
         p.setPen(QtCore.Qt.NoPen)
@@ -536,63 +789,6 @@ class WaveformWidget(QtWidgets.QWidget):
             p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 200), 2))
             p.drawLine(lx, 0, lx, h)
             p.drawLine(rx, 0, rx, h)
-        if self.preview_segments and not self.editable:
-            # Joined preview has no Remove mode: every audible piece is green.
-            # Start markers live at TOP and End markers at BOTTOM so coincident
-            # join markers can be selected independently with the mouse.
-            for index, seg in enumerate(self.preview_segments):
-                sx = round(seg.preview_start / self.duration * (w - 1))
-                ex = round(seg.preview_end / self.duration * (w - 1))
-                selected = (self.preview_selected is not None and
-                            seg.crop_uid == self.preview_selected[0] and
-                            seg.part_index == self.preview_selected[1])
-                tone = QtGui.QColor(38, 178, 72, 64 if selected else (38 if index % 2 else 28))
-                p.fillRect(sx, 0, max(1, ex - sx), h, tone)
-                # Text is only drawn if the crop actually has enough screen space.
-                if ex - sx >= 84:
-                    available = max(0, ex - sx - 18)
-                    fm = QtGui.QFontMetrics(p.font())
-                    source = os.path.basename(seg.source)
-                    label = seg.crop_name
-                    if any(other is not seg and other.crop_uid == seg.crop_uid
-                           for other in self.preview_segments):
-                        label += " · part " + str(seg.part_index + 1)
-                    line = fm.elidedText(label, QtCore.Qt.ElideRight, available)
-                    p.setPen(QtGui.QColor(199, 249, 210))
-                    p.drawText(sx + 9, h // 2 - 8, line)
-                    if ex - sx >= 145:
-                        p.setPen(QtGui.QColor(164, 215, 179))
-                        p.drawText(sx + 9, h // 2 + 12,
-                                   fm.elidedText(source, QtCore.Qt.ElideRight, available))
-            # Paint the selected boundary last so adjoining lines cannot obscure it.
-            for active_pass in (False, True):
-                for seg in self.preview_segments:
-                    for side in ("start", "end"):
-                        key = (seg.crop_uid, seg.part_index, side)
-                        is_active = key == self.preview_selected
-                        if is_active != active_pass:
-                            continue
-                        x = round(seg.boundary_time(side) / self.duration * (w - 1))
-                        color = (QtGui.QColor(220, 255, 119) if is_active else
-                                 QtGui.QColor(116, 230, 153) if seg.boundary_editable(side)
-                                 else QtGui.QColor(105, 158, 132))
-                        p.setPen(QtGui.QPen(color, 3 if is_active else 1,
-                                            QtCore.Qt.SolidLine if is_active else QtCore.Qt.DashLine))
-                        p.drawLine(x, 0, x, h)
-                        # Small marker on opposite ends of the waveform for S/E.
-                        top = side == "start"
-                        mid_y = 12 if top else h - 13
-                        polygon = (QtGui.QPolygon([QtCore.QPoint(x - 8, 0),
-                                    QtCore.QPoint(x + 8, 0), QtCore.QPoint(x, 23)])
-                                   if top else QtGui.QPolygon([QtCore.QPoint(x - 8, h - 1),
-                                    QtCore.QPoint(x + 8, h - 1), QtCore.QPoint(x, h - 24)]))
-                        p.setPen(QtCore.Qt.NoPen)
-                        p.setBrush(color)
-                        p.drawPolygon(polygon)
-                        if is_active:
-                            p.setPen(QtGui.QPen(QtGui.QColor(250, 255, 236), 1))
-                            p.drawText(x + 8, mid_y + (13 if top else -5),
-                                       "START" if top else "END")
         cx = round(self.cursor_frac * (w - 1))
         p.setPen(QtGui.QPen(self.cursor_color, 2))
         p.drawLine(cx, 0, cx, h)
@@ -617,8 +813,16 @@ class WaveformWidget(QtWidgets.QWidget):
                 self.preview_selected = key
                 self.setCursor(QtCore.Qt.SizeHorCursor)
                 self.previewBoundaryClicked.emit(key)
+                seg = self.selected_preview_segment()
+                if seg and seg.boundary_editable(key[2]):
+                    self._preview_drag = dict(key=key, start_x=x, original=seg.original_time(key[2]),
+                                              width=self.width(), duration=self.duration,
+                                              rate=seg.speed_rate, moved=False)
+                else:
+                    self._preview_drag = None
                 self.update()
                 return
+            self._preview_drag = None
             self.preview_selected = None
             self.previewBoundaryClicked.emit(None)
             self.set_cursor_time(event.x() / max(1, self.width() - 1) * self.duration, notify=True)
@@ -660,6 +864,20 @@ class WaveformWidget(QtWidgets.QWidget):
 
     def mouseMoveEvent(self, event):
         if not self.editable:
+            if self._preview_drag is not None and event.buttons() & QtCore.Qt.LeftButton:
+                drag = self._preview_drag
+                target = self._preview_drag_target(event.x())
+                if abs(event.x() - drag["start_x"]) >= 2 and target is not None:
+                    drag["moved"] = True
+                    # Rebuilding a long joined buffer is relatively expensive;
+                    # cap pointer update frequency and ALWAYS apply final position
+                    # on mouse release so millisecond edits are not lost.
+                    import time
+                    now = time.monotonic()
+                    if now - self._drag_last_emit >= 0.04:
+                        self._drag_last_emit = now
+                        self.previewBoundaryDragged.emit(drag["key"], target)
+                return
             key = self._preview_boundary_at(event.x(), event.y())
             self.setCursor(QtCore.Qt.SizeHorCursor if key else QtCore.Qt.ArrowCursor)
             if key:
@@ -690,6 +908,16 @@ class WaveformWidget(QtWidgets.QWidget):
             self.set_right_time(seconds)
 
     def mouseReleaseEvent(self, event):
+        if self._preview_drag is not None:
+            drag = self._preview_drag
+            self._preview_drag = None
+            if drag["moved"]:
+                target = drag["original"] + ((event.x() - drag["start_x"]) * drag["duration"] * drag["rate"] /
+                                              max(1, drag["width"] - 1))
+                self.previewBoundaryDragged.emit(drag["key"], target)
+                self.previewDragFinished.emit(drag["key"])
+            self.setCursor(QtCore.Qt.ArrowCursor)
+            return
         if self._overlap_press_x is not None:
             # A click without dragging selects the OTHER handle, so the
             # keyboard arrows can still operate either overlapped bar.
@@ -1162,6 +1390,8 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         self._busy = False
         self._worker: Optional[TaskThread] = None
         self.crops: List[Crop] = []
+        self._draft_speed_enabled = False
+        self._draft_speed_rate = 1.0
         self.next_index = 1
         self._restoring_list = False
         self._session_ready = False
@@ -1232,6 +1462,36 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         self.file_label.setStyleSheet("color:#a9c1d5;padding:2px;")
         main.addWidget(self.file_label)
 
+        # Per-crop speed controls remain accessible with the right sidebar
+        # collapsed. In joined preview they edit only the saved Crop rate.
+        speed_row = QtWidgets.QHBoxLayout()
+        self.speed_checkbox = QtWidgets.QCheckBox("Speed")
+        self.speed_checkbox.setToolTip(
+            "Enable custom tempo for the current crop. Pitch is preserved like YouTube playback.")
+        self.speed_checkbox.setFocusPolicy(QtCore.Qt.NoFocus)
+        speed_row.addWidget(self.speed_checkbox)
+        self.speed_rate = QtWidgets.QDoubleSpinBox()
+        self.speed_rate.setDecimals(3)
+        self.speed_rate.setRange(MIN_SPEED_RATE, MAX_SPEED_RATE)
+        self.speed_rate.setSingleStep(0.05)
+        self.speed_rate.setSuffix("×")
+        self.speed_rate.setValue(1.0)
+        self.speed_rate.setKeyboardTracking(False)  # don't rebuild the timeline per keystroke
+        self.speed_rate.setFixedWidth(106)
+        self.speed_rate.setStyleSheet(
+            "QDoubleSpinBox {background:#1a2a40;color:white;border:1px solid #3c5975;"
+            "border-radius:3px;padding:5px;}")
+        self.speed_rate.setToolTip("0.05× to 32×. Uses pitch-preserving FFmpeg atempo on playback/export.")
+        self.speed_rate.hide()
+        speed_row.addWidget(self.speed_rate)
+        self.speed_target_label = QtWidgets.QLabel("Current crop · normal 1×")
+        self.speed_target_label.setStyleSheet("color:#a9c1d5;")
+        speed_row.addWidget(self.speed_target_label)
+        speed_row.addStretch(1)
+        main.addLayout(speed_row)
+        self.speed_checkbox.toggled.connect(self._speed_toggled)
+        self.speed_rate.valueChanged.connect(self._speed_rate_changed)
+
         self.waveform = WaveformWidget()
         self.waveform.leftHandleMoved.connect(lambda v: self.edit_left.setText(format_time(v)))
         self.waveform.rightHandleMoved.connect(lambda v: self.edit_right.setText(format_time(v)))
@@ -1240,9 +1500,21 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         self.waveform.handleFocusLost.connect(self.on_handle_focus_lost)
         self.waveform.dragFinished.connect(self.on_handle_drag_finished)
         self.waveform.previewBoundaryClicked.connect(self._preview_boundary_selected)
+        self.waveform.previewBoundaryDragged.connect(self._preview_boundary_dragged)
+        self.waveform.previewDragFinished.connect(self._preview_drag_finished)
+        self.wave_scroll = QtWidgets.QScrollArea()
+        self.wave_scroll.setWidgetResizable(True)
+        self.wave_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.wave_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.wave_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.wave_scroll.setMaximumHeight(WaveformWidget.MAX_WAVEFORM_HEIGHT)
+        self.wave_scroll.setMinimumHeight(115)
+        self.wave_scroll.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.wave_scroll.setAlignment(QtCore.Qt.AlignVCenter)
+        self.wave_scroll.setWidget(self.waveform)
         margins = QtWidgets.QHBoxLayout()
         margins.setContentsMargins(30, 0, 30, 0)
-        margins.addWidget(self.waveform, 1, QtCore.Qt.AlignVCenter)
+        margins.addWidget(self.wave_scroll, 1, QtCore.Qt.AlignVCenter)
         main.addLayout(margins, 1)
 
         bottom = QtWidgets.QHBoxLayout()
@@ -1307,6 +1579,7 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         self.crop_list.setDragEnabled(True)
         self.crop_list.setAcceptDrops(True)
         self.crop_list.itemDoubleClicked.connect(self.load_selected_crop)
+        self.crop_list.currentItemChanged.connect(self._on_crop_selection_changed)
         self.crop_list.model().rowsMoved.connect(self._list_reordered)
         v.addWidget(self.crop_list, 1)
         controls = QtWidgets.QHBoxLayout()
@@ -1356,7 +1629,7 @@ class MP3Trimmer(QtWidgets.QMainWindow):
             return
         try:
             path = self._session_path()
-            saved = {"version": 2, "next_index": self.next_index,
+            saved = {"version": 3, "next_index": self.next_index,
                      "sidebar_visible": not self.dock.isHidden(),
                      "crops": [asdict(c) for c in self.crops]}
             tmp = path + ".new"
@@ -1371,7 +1644,7 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         try:
             with open(self._session_path(), "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if data.get("version") != 2:
+            if data.get("version") not in (2, 3):
                 return
             self.crops = [Crop.from_record(rec) for rec in data.get("crops", [])]
             self.next_index = max(1, int(data.get("next_index", 1)))
@@ -1391,15 +1664,20 @@ class MP3Trimmer(QtWidgets.QMainWindow):
             self._session_ready = True
         self._refresh_edit_controls()
 
+    def _crop_description(self, crop: Crop) -> str:
+        action = "KEEP" if crop.keep else "REMOVE"
+        rate = (f" · {crop.playback_rate():g}× tempo" if crop.speed_enabled
+                else "")
+        return (f"{crop.name} · {format_time(crop.effective_duration())}{rate}\n"
+                f"{os.path.basename(crop.source)}  "
+                f"[{action} {format_time(crop.start)}–{format_time(crop.end)}]")
+
     def _rebuild_crop_list(self, selected_id: Optional[str] = None):
         self._restoring_list = True
         try:
             self.crop_list.clear()
             for crop in self.crops:
-                action = "KEEP" if crop.keep else "REMOVE"
-                description = f"{crop.name} · {format_time(crop.effective_duration())}\n"
-                description += f"{os.path.basename(crop.source)}  [{action} {format_time(crop.start)}–{format_time(crop.end)}]"
-                item = QtWidgets.QListWidgetItem(description)
+                item = QtWidgets.QListWidgetItem(self._crop_description(crop))
                 item.setData(QtCore.Qt.UserRole, crop.uid)
                 item.setToolTip(crop.source)
                 if not os.path.isfile(crop.source):
@@ -1425,11 +1703,7 @@ class MP3Trimmer(QtWidgets.QMainWindow):
             item = self.crop_list.item(row)
             if item.data(QtCore.Qt.UserRole) != uid:
                 continue
-            action = "KEEP" if crop.keep else "REMOVE"
-            item.setText(
-                f"{crop.name} · {format_time(crop.effective_duration())}\n"
-                f"{os.path.basename(crop.source)}  "
-                f"[{action} {format_time(crop.start)}–{format_time(crop.end)}]")
+            item.setText(self._crop_description(crop))
             # Avoid scroll jumps from clearing/repopulating the list on every arrow.
             item.setToolTip(crop.source)
             self.crop_list.setCurrentItem(item, QtCore.QItemSelectionModel.NoUpdate)
@@ -1462,6 +1736,93 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         item = self.crop_list.currentItem()
         return self._find_crop(item.data(QtCore.Qt.UserRole)) if item else None
 
+    def _speed_target_crop(self) -> Optional[Crop]:
+        if self.preview_mode:
+            if self.preview_boundary_id:
+                chosen = self._find_crop(self.preview_boundary_id[0])
+                if chosen:
+                    return chosen
+            return self._selected_crop()
+        return self._find_crop(self.editing_crop_id)
+
+    def _sync_speed_controls(self):
+        if not hasattr(self, "speed_checkbox"):
+            return
+        crop = self._speed_target_crop()
+        if self.preview_mode:
+            enabled = crop is not None and not self._busy
+            checked = crop.speed_enabled if crop else False
+            rate = crop.speed_rate if crop else 1.0
+            label = f"Editing {crop.name} · saved tempo" if crop else "Select a crop to adjust its speed"
+        else:
+            enabled = self.audio_samples is not None and not self._busy
+            checked, rate = self._draft_speed_enabled, self._draft_speed_rate
+            label = (f"Editing {crop.name} · saved on Update crop" if crop else
+                     "Current crop · saved when added/exported")
+        old = self.speed_checkbox.blockSignals(True)
+        self.speed_checkbox.setChecked(checked)
+        self.speed_checkbox.blockSignals(old)
+        old = self.speed_rate.blockSignals(True)
+        self.speed_rate.setValue(rate)
+        self.speed_rate.blockSignals(old)
+        self.speed_checkbox.setEnabled(enabled)
+        self.speed_rate.setEnabled(enabled)
+        self.speed_rate.setVisible(checked)
+        self.speed_target_label.setText(label)
+
+    def _on_crop_selection_changed(self, current, previous):
+        if self._restoring_list or not self.preview_mode:
+            return
+        uid = current.data(QtCore.Qt.UserRole) if current else None
+        if self.preview_boundary_id and uid != self.preview_boundary_id[0]:
+            self.preview_boundary_id = None
+            self.waveform.preview_selected = None
+            self.waveform.update()
+            self._update_preview_marker_description()
+        self._sync_speed_controls()
+
+    def _update_crop_speed(self):
+        """Speed edits modify only the Crop model and virtual joined timeline.
+
+        No decoded audio gets modified, and no FFmpeg processing occurs here.
+        The old playback file is discarded; Play builds a fresh one on demand.
+        """
+        crop = self._speed_target_crop()
+        if crop is None:
+            return
+        crop.speed_enabled = self.speed_checkbox.isChecked()
+        crop.speed_rate = validate_speed_rate(self.speed_rate.value())
+        self._preview_edited_crop_ids.add(crop.uid)
+        cue_key = self.preview_boundary_id
+        # Cue either the selected marker or the beginning of the changed crop.
+        old_seg = next((seg for seg in self._preview_segments if seg.crop_uid == crop.uid), None)
+        cue = (self._preview_cue_time(cue_key) if cue_key and cue_key[0] == crop.uid
+               else max(0.0, old_seg.preview_start - 3.0) if old_seg else 0.0)
+        self._rebuild_preview_timeline(cursor=cue)
+        self._refresh_crop_row(crop.uid)
+        self._save_session()
+        self.statusBar().showMessage(
+            f"{crop.name} saved at {crop.playback_rate():g}×; press Space to audition", 4500)
+
+    def _speed_toggled(self, checked: bool):
+        if self._busy:
+            return
+        self.speed_rate.setVisible(checked)
+        if self.preview_mode:
+            self._update_crop_speed()
+        else:
+            self._draft_speed_enabled = bool(checked)
+            self._stop_and_unload_media()
+
+    def _speed_rate_changed(self, rate: float):
+        if self._busy:
+            return
+        if self.preview_mode:
+            self._update_crop_speed()
+        else:
+            self._draft_speed_rate = validate_speed_rate(rate)
+            self._stop_and_unload_media()
+
     def _current_crop(self, uid: Optional[str] = None, name: str = "") -> Crop:
         if self.audio_samples is None or not self.original_file or self.preview_mode:
             raise ValueError("Open a source audio file and select a crop first")
@@ -1469,7 +1830,8 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         return Crop(uid or str(uuid.uuid4()), name,
                     self.original_file, self.waveform.left_frac * self.duration,
                     self.waveform.right_frac * self.duration,
-                    self.btn_keep.isChecked(), self.duration, stat.st_size, stat.st_mtime_ns)
+                    self.btn_keep.isChecked(), self.duration, stat.st_size, stat.st_mtime_ns,
+                    self._draft_speed_enabled, self._draft_speed_rate)
 
     def add_crop(self):
         if self._busy or self.preview_mode or self.audio_samples is None:
@@ -1608,6 +1970,9 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         self.duration = len(samples) / SAMPLE_RATE
         self.preview_mode = False
         self.editing_crop_id = crop.uid if crop else None
+        self._draft_speed_enabled = crop.speed_enabled if crop else False
+        self._draft_speed_rate = crop.speed_rate if crop else 1.0
+        self.waveform.restore_editor_height()
         self.waveform.set_audio_data(samples, self.duration, editable=True)
         self.set_mode(crop.keep if crop else True)
         if crop:
@@ -1652,6 +2017,7 @@ class MP3Trimmer(QtWidgets.QMainWindow):
             self._update_preview_marker_description()
         else:
             self.mode_label.setText("Space: play/pause · ←/→: move selected pink handle 0.05s")
+        self._sync_speed_controls()
 
     def _capture_editor_state(self):
         return dict(path=self.original_file, samples=self.audio_samples,
@@ -1659,7 +2025,9 @@ class MP3Trimmer(QtWidgets.QMainWindow):
                     left=self.waveform.left_frac * self.duration,
                     right=self.waveform.right_frac * self.duration,
                     cursor=self.waveform.cursor_frac * self.duration,
-                    keep=self.btn_keep.isChecked())
+                    keep=self.btn_keep.isChecked(),
+                    speed_enabled=self._draft_speed_enabled,
+                    speed_rate=self._draft_speed_rate)
 
     def preview_joined(self):
         if self._busy or not self.crops or self.preview_mode:
@@ -1680,7 +2048,7 @@ class MP3Trimmer(QtWidgets.QMainWindow):
                 cache[source] = (snapshot["samples"] if source == snapshot["path"]
                                  and snapshot["samples"] is not None
                                  else decode_mono_samples(source))
-            assemble_joined_preview(clips, cache)  # validate before changing UI
+            describe_joined_preview(clips, cache)  # validate timestamp map only; no PCM join
             return cache
 
         def completed(cache):
@@ -1692,33 +2060,37 @@ class MP3Trimmer(QtWidgets.QMainWindow):
             self.preview_boundary_id = None
             self._preview_edited_crop_ids = set()
             self.preview_mode = True
+            if not self._selected_crop() and self.crop_list.count():
+                self.crop_list.setCurrentRow(0)
             self._rebuild_preview_timeline(cursor=0)
             self._refresh_edit_controls()
             self.statusBar().showMessage(
-                "Joined preview: click a green START (top) or END (bottom) marker, then use ←/→ to fine-tune", 8000)
+                "Joined preview: each crop has its own row. Drag a boundary or use ←/→; Space auditions the updated join.", 8000)
 
         self._run_task("Decoding original sources for adjustable joined preview…", job, completed)
 
     def _rebuild_preview_timeline(self, cursor: Optional[float] = None):
-        """Recreate green segments in place; extension reads ORIGINAL source samples."""
+        """Only adjust Crop timestamps and draw virtual rows; no audio splicing."""
         if not self.preview_mode:
             return
-        samples, segments = assemble_joined_preview(self.crops, self._preview_source_samples)
-        # Unload old WAV before deleting, especially important on Windows.
+        segments, count = describe_joined_preview(self.crops, self._preview_source_samples)
+        # Edits invalidate playback, but waveform updates never allocate a
+        # joined PCM buffer or run audio filters while a boundary is dragged.
         self._stop_and_unload_media()
         self._destroy_joined_preview()
-        self.audio_samples = samples
+        self.audio_samples = np.empty(0, dtype=np.int16)  # preview-mode sentinel
         self.audio_rate = SAMPLE_RATE
-        self.duration = len(samples) / SAMPLE_RATE
+        self.duration = count / SAMPLE_RATE
         self._preview_segments = segments
         selected = self.preview_boundary_id
-        if selected and not any((s.crop_uid, s.part_index) == selected[:2]
-                                for s in segments):
+        if selected and not any((seg.crop_uid, seg.part_index) == selected[:2]
+                                for seg in segments):
             selected = None
             self.preview_boundary_id = None
-        self.waveform.set_audio_data(samples, self.duration, editable=False)
+        self.waveform.set_audio_data(self.audio_samples, self.duration, editable=False)
         self.waveform.set_keep_mode(True)
-        self.waveform.set_preview_segments(segments, selected)
+        self.waveform.set_preview_segments(segments, selected,
+                                           source_samples=self._preview_source_samples)
         if cursor is None and selected:
             seg = self.waveform.selected_preview_segment()
             cursor = seg.boundary_time(selected[2]) if seg else 0
@@ -1726,9 +2098,10 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         self.file_label.setText(
             f"Joined preview · {len(self.crops)} crops · {len(segments)} green pieces · {format_time(self.duration)}")
         self.file_label.setToolTip(
-            "Each green piece is joined in queue order. Top markers are source Starts; "
-            "bottom markers are source Ends. Arrow keys change the saved crop timestamps.")
+            "Crop boundaries are timestamps referencing original audio. "
+            "The waveform is virtual, and combined audio is built only on Play.")
         self._update_preview_marker_description()
+        self._sync_speed_controls()
 
     def _preview_boundary_selected(self, key):
         if not self.preview_mode:
@@ -1736,6 +2109,9 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         self.preview_boundary_id = key
         self.active_handle = None
         self._update_preview_marker_description()
+        if key:
+            self._refresh_crop_row(key[0])
+        self._sync_speed_controls()
 
     def _update_preview_marker_description(self):
         if not self.preview_mode:
@@ -1744,7 +2120,7 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         seg = next((s for s in self._preview_segments
                     if key and (s.crop_uid, s.part_index) == key[:2]), None)
         if seg is None:
-            self.mode_label.setText("Green joined preview · click START (top) / END (bottom), then ←/→ to adjust")
+            self.mode_label.setText("Each green row is one clip · drag a bar, or ←/→ to fine tune · Space plays all")
             self.edit_left.setText("—")
             self.edit_right.setText("—")
             return
@@ -1754,32 +2130,76 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         self.edit_left.setText(format_time(seg.source_start))
         self.edit_right.setText(format_time(seg.source_end))
         part = (f" · part {seg.part_index + 1}" if crop and not crop.keep else "")
-        suffix = "←/→ 50ms · Shift 5ms · Ctrl 1ms" if editable else "locked source edge"
-        self.mode_label.setText(f"{seg.crop_name}{part} {side.upper()} · {suffix}")
+        suffix = "drag or ←/→ 50ms · Shift 5ms · Ctrl 1ms · Space audition" if editable else "locked source edge"
+        self.mode_label.setText(f"{seg.crop_name}{part} {side.upper()} · {seg.speed_rate:g}× · {suffix}")
         self.statusBar().showMessage(
             f"{seg.crop_name}{part}: {side.upper()} at original {format_time(seg.original_time(side))} "
             f"of {os.path.basename(seg.source)} — {suffix}", 7500)
 
-    def _nudge_preview_boundary(self, delta: float):
-        key = self.preview_boundary_id
-        if not self.preview_mode or not key:
-            return
+    def _preview_cue_time(self, key: Optional[Tuple[str, int, str]]) -> float:
+        """Cue playback several seconds BEFORE the adjusted edit or join.
+
+        For Start boundaries choose the previous piece's End (the seam). This
+        allows Space to audition the preceding crop flowing into the new crop.
+        For End boundaries choose several seconds before that End.
+        """
+        if not key:
+            return 0.0
+        for index, seg in enumerate(self._preview_segments):
+            if (seg.crop_uid, seg.part_index) == key[:2]:
+                if key[2] == "start":
+                    # Audition the transition from INSIDE the previous piece,
+                    # even when the previous piece itself lasts under 3 sec.
+                    if index:
+                        previous = self._preview_segments[index - 1]
+                        return max(previous.preview_start, previous.preview_end - 3.0)
+                    return 0.0
+                # An End edit replays the tail of its own crop into the next.
+                return max(seg.preview_start, seg.preview_end - 3.0)
+        return 0.0
+
+    def _edit_preview_boundary(self, key: Tuple[str, int, str],
+                               *, delta: Optional[float] = None,
+                               absolute_source: Optional[float] = None,
+                               cue: bool = True) -> bool:
+        if not self.preview_mode:
+            return False
         uid, part, side = key
         crop = self._find_crop(uid)
         seg = next((s for s in self._preview_segments
                     if (s.crop_uid, s.part_index) == (uid, part)), None)
-        if crop is None or seg is None:
-            return
-        if not nudge_preview_boundary(crop, part, side, delta):
-            self.statusBar().showMessage(
-                f"{crop.name} {side.upper()}: source edge / adjacent boundary reached", 3000)
-            return
+        if crop is None or seg is None or not seg.boundary_editable(side):
+            return False
+        step = (float(absolute_source) - seg.original_time(side)
+                if absolute_source is not None else float(delta or 0))
+        if not nudge_preview_boundary(crop, part, side, step):
+            return False
+        self.preview_boundary_id = key
         self._preview_edited_crop_ids.add(uid)
-        # Keep the chosen marker and the same crop selected during graph rebuild.
-        self._rebuild_preview_timeline()
+        self._rebuild_preview_timeline(cursor=0.0)  # invalidate old playback, redraw timestamps
         self._refresh_crop_row(uid)
-        self.waveform.setFocus(QtCore.Qt.MouseFocusReason)
+        if cue:
+            self.waveform.set_cursor_time(self._preview_cue_time(key))
         self._save_session()
+        self.waveform.setFocus(QtCore.Qt.MouseFocusReason)
+        return True
+
+    def _preview_boundary_dragged(self, key, target_source: float):
+        self._edit_preview_boundary(key, absolute_source=target_source, cue=False)
+
+    def _preview_drag_finished(self, key):
+        if self.preview_mode:
+            # Stopped/unloaded during editing, so Space always plays the newest
+            # timeline rather than resuming a stale/previously completed WAV.
+            self.waveform.set_cursor_time(self._preview_cue_time(key))
+            self.waveform.setFocus(QtCore.Qt.MouseFocusReason)
+
+    def _nudge_preview_boundary(self, delta: float):
+        if not self.preview_mode or not self.preview_boundary_id:
+            return
+        if not self._edit_preview_boundary(self.preview_boundary_id, delta=delta):
+            self.statusBar().showMessage(
+                "Selected boundary: source edge or adjacent boundary reached", 3000)
 
     def exit_preview(self):
         if not self.preview_mode or self._busy:
@@ -1792,6 +2212,7 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         self._preview_source_samples.clear()
         self._preview_segments.clear()
         self.preview_boundary_id = None
+        self.waveform.restore_editor_height()
         self._preview_edited_crop_ids.clear()
         self.preview_mode = False
         if state and state["samples"] is not None:
@@ -1803,11 +2224,15 @@ class MP3Trimmer(QtWidgets.QMainWindow):
                 self.set_mode(state["keep"])
                 self.waveform.set_region(state["left"], state["right"])
                 self.waveform.set_cursor_time(state["cursor"])
+                self._draft_speed_enabled = state["speed_enabled"]
+                self._draft_speed_rate = state["speed_rate"]
+                self._sync_speed_controls()
         else:
             self.audio_samples = None
             self.duration = 0.0
             self.original_file = ""
             self.editing_crop_id = None
+            self.waveform.restore_editor_height()
             self.waveform.set_audio_data(np.empty(0, dtype=np.int16), 0)
             self.file_label.setText("No file loaded")
             self._refresh_edit_controls()
@@ -1853,8 +2278,21 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         if event.type() == QtCore.QEvent.KeyPress and self.isActiveWindow() and not self._busy:
             if QtWidgets.QApplication.activeModalWidget():
                 return False
-            if isinstance(self.focusWidget(), (QtWidgets.QLineEdit, QtWidgets.QTextEdit,
-                                               QtWidgets.QPlainTextEdit)):
+            focus = self.focusWidget()
+            speed_box = (focus if isinstance(focus, QtWidgets.QAbstractSpinBox)
+                         else focus.parentWidget() if isinstance(focus, QtWidgets.QLineEdit)
+                         and focus.parentWidget() is self.speed_rate else None)
+            if speed_box is self.speed_rate:
+                # Make Space a one-keystroke audition even immediately after
+                # typing a new rate; commit it before generating preview audio.
+                # Arrow keys still belong to the speed field while it is focused.
+                if event.key() == QtCore.Qt.Key_Space and not event.isAutoRepeat():
+                    self.speed_rate.interpretText()
+                    self.toggle_play()
+                    return True
+                return False
+            if isinstance(focus, (QtWidgets.QLineEdit, QtWidgets.QTextEdit,
+                                  QtWidgets.QPlainTextEdit, QtWidgets.QAbstractSpinBox)):
                 return False
             if event.key() == QtCore.Qt.Key_Space and not event.isAutoRepeat():
                 self.toggle_play()
@@ -1921,13 +2359,42 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         if self.audio_samples is None or self._busy:
             return
         if self.preview_mode:
+            if self.waveform.cursor_frac * self.duration >= self.duration - .01:
+                self.waveform.set_cursor_time(self._preview_cue_time(self.preview_boundary_id))
             path = self._joined_preview_path
+            if not path and any(abs(c.playback_rate() - 1.0) > 1e-8 for c in self.crops):
+                # Pitch preservation is applied ONLY upon Play, not while
+                # changing the numerical rate or dragging a source marker.
+                # FFmpeg runs on a background thread so the UI never freezes.
+                path = temporary_path(".wav")
+                clips = [copy.copy(c) for c in self.crops]
+                seek = round(self.waveform.cursor_frac * self.duration * 1000)
+                def work():
+                    try:
+                        render_audio(clips, path, "preview")
+                        return path
+                    except Exception:
+                        safe_unlink(path)
+                        raise
+                def ready(result):
+                    if not self.preview_mode:
+                        safe_unlink(result)
+                        return
+                    self._joined_preview_path = result
+                    self._begin_media(result, seek, {"mode": "joined"})
+                self._run_task("Rendering pitch-preserving joined preview…", work, ready)
+                return
             if not path:
                 path = temporary_path(".wav")
                 try:
-                    # Only materialize a playback WAV when Play is pressed;
-                    # arrow-key changes update the waveform without disk I/O.
-                    write_wav_fast(path, self.audio_samples, SAMPLE_RATE)
+                    # Joined editor edits ONLY source timestamps. Assemble the
+                    # temporary playback buffer when the user presses Space,
+                    # with no fades, destructive source edits, or hidden audio.
+                    joined, live_segments = assemble_joined_preview(
+                        self.crops, self._preview_source_samples)
+                    if live_segments != self._preview_segments:
+                        raise RuntimeError("The joined playback timeline changed unexpectedly")
+                    write_wav_fast(path, joined, SAMPLE_RATE)
                     self._joined_preview_path = path
                 except Exception as exc:
                     safe_unlink(path)
@@ -1935,6 +2402,9 @@ class MP3Trimmer(QtWidgets.QMainWindow):
                     return
             self._begin_media(path, round(self.waveform.cursor_frac * self.duration * 1000),
                               {"mode": "joined"})
+            return
+        if self._draft_speed_enabled and abs(self._draft_speed_rate - 1) > 1e-8:
+            self._play_speed_adjusted_source()
             return
         orig = self.waveform.cursor_frac * self.duration
         samples, mapping = self._build_playback_segment(orig)
@@ -1949,6 +2419,50 @@ class MP3Trimmer(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Playback error", str(exc))
             return
         self._begin_media(path, 0, mapping, generated_path=True)
+
+    def _play_speed_adjusted_source(self):
+        """Use the same pitch-preserving export pipeline for source audition."""
+        if not self.original_file or self.audio_samples is None:
+            return
+        rate = validate_speed_rate(self._draft_speed_rate)
+        cursor = self.waveform.cursor_frac * self.duration
+        a = self.waveform.left_frac * self.duration
+        b = self.waveform.right_frac * self.duration
+        pieces = []
+        if self.btn_keep.isChecked():
+            start = max(a, cursor)
+            if start < b:
+                pieces.append((start, b))
+            mapping = {"mode": "keep-speed", "offset": start, "rate": rate}
+        elif cursor < a:
+            if cursor < a:
+                pieces.append((cursor, a))
+            if b < self.duration:
+                pieces.append((b, self.duration))
+            mapping = {"mode": "remove-speed", "offset": cursor,
+                       "first": (a - cursor) / rate, "after": b, "rate": rate}
+        else:
+            start = max(b, cursor)
+            if start < self.duration:
+                pieces.append((start, self.duration))
+            mapping = {"mode": "keep-speed", "offset": start, "rate": rate}
+        if not pieces:
+            self.stop()
+            return
+        stat = os.stat(self.original_file)
+        clips = [Crop(str(uuid.uuid4()), "source-playback", self.original_file, start, end,
+                      True, self.duration, stat.st_size, stat.st_mtime_ns, True, rate)
+                 for start, end in pieces]
+        path = temporary_path(".wav")
+        def work():
+            try:
+                render_audio(clips, path, "preview")
+                return path
+            except Exception:
+                safe_unlink(path)
+                raise
+        self._run_task("Rendering pitch-preserving crop preview…", work,
+                       lambda result: self._begin_media(result, 0, mapping, generated_path=True))
 
     def _begin_media(self, path: str, seek_ms: int, mapping: Dict[str, Any], generated_path=False):
         self._stop_and_unload_media()
@@ -1975,6 +2489,12 @@ class MP3Trimmer(QtWidgets.QMainWindow):
             self._start_pending_player()
         elif status == QtMultimedia.QMediaPlayer.EndOfMedia:
             self.btn_play.setText("▶")
+            # After the final sample, pressing Space should replay rather than
+            # seeking to the very end of the old file and stopping instantly.
+            if self.preview_mode:
+                self.waveform.set_cursor_time(self._preview_cue_time(self.preview_boundary_id))
+            else:
+                self.waveform.set_cursor_time(0)
         elif status == QtMultimedia.QMediaPlayer.InvalidMedia and self._pending_play:
             self._pending_play = False
             self.statusBar().showMessage("Media player could not load preview; check Windows codecs", 10000)
@@ -1989,6 +2509,12 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         t = millis / 1000
         if mapping["mode"] == "joined":
             sec = t
+        elif mapping["mode"] == "keep-speed":
+            sec = mapping["offset"] + t * mapping["rate"]
+        elif mapping["mode"] == "remove-speed":
+            sec = (mapping["offset"] + t * mapping["rate"]
+                   if t <= mapping["first"] else
+                   mapping["after"] + (t - mapping["first"]) * mapping["rate"])
         elif mapping["mode"] == "keep":
             sec = mapping["offset"] + t
         else:
@@ -2005,7 +2531,12 @@ class MP3Trimmer(QtWidgets.QMainWindow):
         if state == QtMultimedia.QMediaPlayer.PlayingState:
             self.media_player.pause()
         elif state == QtMultimedia.QMediaPlayer.PausedState:
-            self.media_player.play()
+            # Paused playback is valid only while its mapping/audio file still
+            # matches the current timeline. Rebuild clears the mapping.
+            if self._playback_map is not None:
+                self.media_player.play()
+            else:
+                self.restart_playback()
         else:
             self.restart_playback()
 
