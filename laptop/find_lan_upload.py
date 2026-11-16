@@ -4,12 +4,16 @@ import http.client
 import ipaddress
 import json
 import mimetypes
+import os
 import socket
 import sys
 import urllib.parse
 import urllib.request
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
+
+from shared_history import flush_pending, load_set, save_set
+from upload_identity import upload_history_key, history_upload_match
 
 PORT = 1234
 TIMEOUT = 0.6
@@ -398,10 +402,15 @@ def write_summary(summary_path, summary):
         return
 
     path = Path(summary_path)
-    path.write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    # Persist each acknowledged phone receipt before attempting another file.
+    # Replacing atomically means a parent crash cannot leave a truncated summary.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    with temp.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
 
 
 def upload_one_file(base_url, file_path, token=""):
@@ -468,7 +477,7 @@ def upload_one_file(base_url, file_path, token=""):
         conn.close()
 
 
-def upload_files(base_url, files, token=""):
+def upload_files(base_url, files, token="", on_success=None, on_progress=None):
     successful = []
     failed = []
 
@@ -482,14 +491,30 @@ def upload_files(base_url, files, token=""):
                 f"receiver will store this as: {transport_name}"
             )
         try:
+            # Compute identity before the network upload. Once Android sends
+            # its success response, the receipt can be saved immediately.
+            item["history_key"] = upload_history_key(
+                file_path, base_dir=DEFAULT_UPLOAD_DIR,
+            )
             response = upload_one_file(base_url, file_path, token=token)
-            item["receiver_response"] = response
-            successful.append(item)
-            print(f"    OK: {item['name']}")
         except Exception as error:
             item["error"] = str(error)
             failed.append(item)
+            if on_progress is not None:
+                on_progress(item, False)
             print(f"    FAILED: {item['name']}: {error}")
+        else:
+            item["receiver_response"] = response
+            successful.append(item)
+            if on_progress is not None:
+                on_progress(item, True)
+            # Write the separate Android history's crash-safe Sheet journal
+            # IMMEDIATELY after the receiver's success acknowledgment. Never
+            # reinterpret a completed upload as a phone failure just because
+            # history synchronization may fail later.
+            if on_success is not None:
+                on_success(item)
+            print(f"    OK: {item['name']}")
 
     return successful, failed
 
@@ -595,6 +620,46 @@ def main():
     summary["attempted"] = attempted
     source_label = args.manifest or args.dir
 
+    # Check both current and historical Android receipts before probing the
+    # phone. Files already sent do not require the receiver to be online.
+    # Android and Drive are different namespaces in Trinity Shared History.
+    # Prepare the history snapshot before transferring any bytes, so each
+    # acknowledged phone receipt can immediately enter the durable Sheet WAL.
+    try:
+        android_history = load_set("android_uploaded")
+    except Exception as error:
+        summary["failed"] = attempted
+        summary["error"] = "Could not load shared Android upload history: " + str(error)
+        write_summary(args.summary_json, summary)
+        print(summary["error"])
+        sys.exit(1)
+
+    # Do not re-send current or historical already-confirmed phone files.
+    # Keep these separate from the current run's freshly uploaded successes.
+    pending = []
+    for path in files:
+        key = upload_history_key(path, base_dir=DEFAULT_UPLOAD_DIR)
+        prior = history_upload_match(android_history, path, history_key=key)
+        if prior:
+            label = "LEGACY HISTORY" if prior == "legacy" else "CONFIRMED HISTORY"
+            print(f"[ALREADY SENT TO PHONE - {label}] " + Path(path).name)
+        else:
+            pending.append(path)
+
+    write_summary(args.summary_json, summary)
+    if not pending:
+        # shared_history may have just imported legacy JSON into the Sheet.
+        # Confirm that the import and any unfinished WAL records are committed.
+        try:
+            flush_pending()
+        except Exception as error:
+            summary["history_sync_error"] = str(error)
+            write_summary(args.summary_json, summary)
+            print("Android history synchronization failed: " + str(error))
+            sys.exit(1)
+        print("All selected files have already been sent to Android; no LAN connection needed.")
+        return
+
     if not token:
         token = prompt_for_pairing_token(args.token_file)
 
@@ -627,7 +692,23 @@ def main():
     print(f"Found Android receiver: {url}")
     print(f"Uploading {len(files)} audio file(s) from: {source_label}")
 
-    successful, failed = upload_files(url, files, token=token)
+    def persist_result(item, is_success):
+        if is_success:
+            summary["successful"].append(item)
+        else:
+            summary["failed"].append(item)
+        write_summary(args.summary_json, summary)
+
+    def journal_success(item):
+        key = item["history_key"]
+        if key not in android_history:
+            android_history.add(key)
+            save_set("android_uploaded", android_history)
+
+    successful, failed = upload_files(
+        url, pending, token=token,
+        on_success=journal_success, on_progress=persist_result,
+    )
     auth_failed = [item for item in failed if "pairing token" in item.get("error", "").lower()]
     if auth_failed and len(auth_failed) == len(failed):
         print("")
@@ -636,20 +717,34 @@ def main():
         token = prompt_for_pairing_token(args.token_file)
         if token:
             retry_files = [item["path"] for item in failed]
-            retry_successful, retry_failed = upload_files(url, retry_files, token=token)
+            # Replace the first round's failure entries as retries complete.
+            summary["failed"] = []
+            write_summary(args.summary_json, summary)
+            retry_successful, retry_failed = upload_files(
+                url, retry_files, token=token,
+                on_success=journal_success, on_progress=persist_result,
+            )
             successful.extend(retry_successful)
             failed = retry_failed
 
     summary["successful"] = successful
     summary["failed"] = failed
-
     if failed:
         summary["error"] = f"{len(failed)} file(s) failed to upload."
+    write_summary(args.summary_json, summary)
+
+    try:
+        flush_pending()
+    except Exception as error:
+        summary["history_sync_error"] = str(error)
         write_summary(args.summary_json, summary)
-        print(summary["error"])
+        print("Android transfers were retained, but Google Sheets history synchronization failed: " + str(error))
+        print("Trinity's durable history journal will be replayed on the next run.")
         sys.exit(1)
 
-    write_summary(args.summary_json, summary)
+    if failed:
+        print(summary["error"])
+        sys.exit(1)
     print("Upload finished.")
 
 

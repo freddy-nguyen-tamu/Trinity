@@ -1,3 +1,4 @@
+
 import datetime
 import json
 import os
@@ -9,7 +10,7 @@ import time
 
 from upload_identity import (
     upload_history_key as build_upload_history_key,
-    history_has_audio, youtube_history_alias,
+    history_has_audio, history_upload_match, youtube_history_alias,
 )
 from shared_history import load_set, save_set, flush_pending
 
@@ -814,34 +815,84 @@ def pending_finished_test_files():
 
 
 def pending_finished_drive_upload_files():
-    uploaded_history = load_uploaded_history()
+    """Find pending Drive uploads AND files ready for two-sided cleanup.
+
+    Phone failures must never suppress Drive uploads. Conversely, a file
+    already on Drive must not be uploaded again while its phone transfer is
+    still outstanding. SHA-256 receipts are preferred; historical
+    filename-and-size receipts remain usable for files uploaded by old Trinity.
+    """
+    android_history = load_uploaded_history()
+    drive_history = load_drive_uploaded_history()
     pending = []
 
     for path in sorted(snapshot_finished_files()):
         if not is_supported_audio_file(path):
             continue
-
-        if not history_has_audio(uploaded_history, path, base_dir=FINISHED_DIR):
-            continue
-
-        pending.append(path)
+        key = uploaded_history_key(path)
+        # Read old filename|size receipts AND current SHA-256 receipts from
+        # the same independent namespaces, without rewriting historic rows.
+        on_drive = history_upload_match(drive_history, path, history_key=key)
+        on_phone = history_upload_match(android_history, path, history_key=key)
+        if not on_drive or on_phone:
+            pending.append(path)
 
     return pending
 
 
 def remember_successful_uploads(successful_items):
+    """Recover confirmed Android receipts into the independent Sheet history.
+
+    Recheck source identity before importing an earlier process's receipt: a
+    newly replaced file at the same path must never inherit an old upload.
+    The Android uploader also journals each receipt immediately; this is a
+    crash-recovery backstop for older versions and interrupted child runs.
+    """
     if not successful_items:
         return
 
     uploaded_history = load_uploaded_history()
-
+    newly_recorded = 0
     for item in successful_items:
+        if not isinstance(item, dict):
+            continue
         path = safe_finished_path(item.get("path", ""))
-        if path and os.path.exists(path):
-            uploaded_history.add(uploaded_history_key(path))
+        if not path or not os.path.isfile(path) or not is_supported_audio_file(path):
+            continue
+        if item.get("name") and os.path.basename(path) != item["name"]:
+            continue
+        if item.get("size") is not None and os.path.getsize(path) != int(item["size"]):
+            continue
+        key = uploaded_history_key(path)
+        if item.get("history_key") and item["history_key"] != key:
+            log(f"Android receipt no longer matches its source; retaining: {path}")
+            continue
+        if key not in uploaded_history:
+            uploaded_history.add(key)
+            newly_recorded += 1
 
-    save_uploaded_history(uploaded_history)
-    log(f"Recorded {len(successful_items)} successful upload(s) in uploaded history.")
+    if newly_recorded:
+        save_uploaded_history(uploaded_history)
+    log(f"Android history: {newly_recorded} new confirmed receipt(s) queued for Google Sheets.")
+
+
+def recover_previous_android_upload_summary():
+    """Replay per-file durable receipts before deciding what to resend.
+
+    The previous uploader's summary may survive an interrupted Trinity parent.
+    New summaries are updated after every acknowledged phone upload, rather
+    than only after the entire batch finishes.
+    """
+    if not os.path.isfile(UPLOAD_SUMMARY_FILE):
+        return
+    try:
+        with open(UPLOAD_SUMMARY_FILE, "r", encoding="utf-8") as handle:
+            summary = json.load(handle)
+        successful = summary.get("successful", []) if isinstance(summary, dict) else []
+        if successful:
+            remember_successful_uploads(successful)
+    except (OSError, ValueError, TypeError) as error:
+        log(f"Could not recover previous Android upload receipts: {error}")
 
 
 def remember_successful_drive_uploads(summary):
@@ -1166,16 +1217,19 @@ def print_drive_upload_summary(summary):
     failed = summary.get("failed") or []
     deleted = summary.get("deleted") or []
     delete_failed = summary.get("delete_failed") or []
+    awaiting_android = summary.get("awaiting_android") or []
 
     log("")
     log("GOOGLE DRIVE UPLOAD/DELETE SUMMARY")
     log("-" * 50)
     log(f"Attempted Drive upload: {len(attempted)} file(s)")
-    log(f"Successfully uploaded to Drive: {len(successful)} file(s)")
+    log(f"Confirmed on Drive (this run or earlier): {len(successful)} file(s)")
     print_numbered_files("Drive upload successes:", successful)
     log(f"Failed Drive upload: {len(failed)} file(s)")
     print_numbered_files("Drive upload failures:", failed)
-    log(f"Moved to system trash from finished/ after Drive upload: {len(deleted)} file(s)")
+    log(f"Drive confirmed; awaiting Android upload: {len(awaiting_android)} file(s)")
+    print_numbered_files("Waiting for phone:", awaiting_android)
+    log(f"Moved to system trash after BOTH histories confirmed: {len(deleted)} file(s)")
     print_numbered_files("Moved local files:", deleted)
     log(f"Uploaded to Drive but failed local trash move: {len(delete_failed)} file(s)")
     print_numbered_files("Local trash move failures:", delete_failed)
@@ -1185,29 +1239,28 @@ def print_drive_upload_summary(summary):
 
 
 def auto_drive_upload_then_delete(drive_candidates):
-    """Run verified, quota-aware Drive API uploads with independent account rotation.
+    """Upload to Drive independently of phone success, then reconcile both.
 
-    Android success must already be journaled in the shared Google Sheet.
-    The child handles each Drive success, Sheet confirmation and safe local
-    trash independently. On storage exhaustion it pauses Drive transfers and
-    optionally opens browser sign-in for a different account, without failing
-    Trinity's unrelated download, test or history processing work.
+    Each destination has its own namespace in the shared Google Sheet. A
+    one-sided success stays recorded and the local original is retained until
+    the exact file is confirmed on both destinations. Storage quota rotation
+    only affects Drive, not Android or the Sheets history account.
     """
     if not drive_candidates:
         log("")
-        log("No finished/ files are waiting for Drive upload/delete.")
+        log("No finished/ files need a Drive transfer or two-sided cleanup.")
         return
 
     log("")
     log("DRIVE UPLOAD: verified completion, partial history sync and quota rotation")
-    print_numbered_files("Android-confirmed candidates:", drive_candidates)
+    print_numbered_files("Drive-pending or two-sided cleanup candidates:", drive_candidates)
     files_to_upload = write_drive_upload_manifest(drive_candidates)
     if not files_to_upload:
         return
 
-    # All successful Android transfers have already been queued with the
-    # crash-recoverable Google Sheets history journal. Confirm it remotely
-    # BEFORE Drive-side deletions can be considered.
+    # Flush any pending phone receipts before the Drive child reads both
+    # histories. Drive uploads themselves do not require phone success.
+    # Two-sided recycling always requires verified remote Sheet records.
     try:
         flush_pending()
     except Exception as error:
@@ -1287,6 +1340,9 @@ def main():
     upload_summary = {"attempted": [], "successful": [], "failed": [], "error": None}
     downloaded_paths = []
     upload_candidates = []
+    # Import acknowledged phone transfers even if the previous parent run
+    # stopped before the normal post-upload summary/history step.
+    recover_previous_android_upload_summary()
     finished_before = snapshot_finished_files()
     upload_return_code = 0
 
@@ -1391,7 +1447,7 @@ def main():
     else:
         close_run_log()
 
-    # Ensure Android and Drive upload histories are committed together.
+    # Flush independent Android and Drive history rows to the same shared Sheet.
     flush_pending()
     if exit_code:
         sys.exit(exit_code)
@@ -1450,4 +1506,3 @@ def run_auto_thumbnail(upload_candidates):
 
 if __name__ == "__main__":
     main()
-

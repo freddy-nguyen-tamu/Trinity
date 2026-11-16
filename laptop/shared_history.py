@@ -1,3 +1,4 @@
+
 """Trinity's shared Google Sheets history store.
 
 All devices signing into the SAME Google account discover one spreadsheet
@@ -812,9 +813,10 @@ def flush_pending():
 
     A per-download fsynced local journal is the source of truth for unsynced
     completions. Before attempting uploads we read current Google history and
-    eliminate entries already uploaded by this or another device. Each bulk
-    request is verified independently, then only that request's journal keys
-    are removed. Remaining work is recoverable even after a mid-flush crash.
+    eliminate entries already uploaded by this or another device. All
+    size-bounded writes are confirmed by one full-sheet readback before
+    removing their local journal entries. An interrupted partial write
+    leaves the WAL intact for a deduplicated resume on the next run.
     """
     global _JOURNAL_HANDLE
     with LOCK:
@@ -828,9 +830,17 @@ def flush_pending():
         if already:
             _acknowledge_confirmed_rows(already, remote=remote)
         missing = [row for row in rows if not _row_already_applied(row, remote)]
-        writes = _append_bulk_rows(
-            missing, on_batch_confirmed=_acknowledge_confirmed_rows
-        ) if missing else 0
+        # Append every size-bounded batch first, then read the entire Sheet
+        # ONCE to verify all newly written rows. This avoids one full-history
+        # Google Sheets read after *each* batch. On an interrupted multi-batch
+        # append the complete local WAL remains intact; a rerun first scans
+        # remote history and skips already-committed rows safely.
+        if missing:
+            writes = _append_bulk_rows(missing)
+            verified, _ = _read_remote(force=True)
+            _acknowledge_confirmed_rows(missing, remote=verified)
+        else:
+            writes = 0
         if _PENDING:
             raise RuntimeError(
                 f"{len(_PENDING)} history changes remain unconfirmed; "

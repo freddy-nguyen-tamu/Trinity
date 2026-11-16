@@ -1,3 +1,4 @@
+
 import hashlib
 import os
 import re
@@ -142,6 +143,33 @@ def upload_history_key(path, base_dir=None):
     )
 
 
+def history_upload_match(history, path, *, base_dir=None, history_key=None, size=None):
+    """Find a confirmed upload in either generation of Trinity history.
+
+    Current receipts use upload-v2|...|sha256=... (exact bytes). Before that,
+    Trinity recorded successful Android and Drive transfers as
+    "filename.ext|byte_count". Their original entries are kept in the shared
+    Sheet unchanged; this recognises them without inventing a new SHA-256
+    receipt or treating filename-only matches as successes.
+
+    Return "v2", "legacy", or None. A legacy match has only the historical
+    filename-and-size assurance; it cannot prove the remote content hash.
+    """
+    if history_key is None:
+        history_key = upload_history_key(path, base_dir=base_dir)
+    if history_key in history:
+        return "v2"
+    if size is None:
+        try:
+            size = Path(path).stat().st_size
+        except OSError:
+            return None
+    old_key = f"{Path(path).name}|{int(size)}"
+    if old_key in history:
+        return "legacy"
+    return None
+
+
 def youtube_history_alias(path):
     """Portable marker for a YouTube ID seeded across Trinity devices.
 
@@ -158,4 +186,4 @@ def history_has_audio(history, path, base_dir=None):
     alias = youtube_history_alias(path)
     if alias and alias in history:
         return True
-    return upload_history_key(path, base_dir=base_dir) in history
+    return history_upload_match(history, path, base_dir=base_dir) is not None

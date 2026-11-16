@@ -59,3 +59,7 @@ laptop/_drive_storage_full.json
 laptop/_drive_storage_full.json.tmp
 laptop/_google_drive_oauth_token.json.tmp
 laptop/trinity.py.backup-pre-quota-*
+
+# Durable per-file Drive idempotency IDs; required across timed-out retries.
+laptop/_drive_reserved_upload_ids.json
+laptop/_drive_reserved_upload_ids.json.tmp
