@@ -1,9 +1,11 @@
+
 import os
 if os.environ.get("TRINITY_ENABLE_YTDLP_POT_PLUGIN", "").strip().lower() not in {"1", "true", "yes", "on"}:
     os.environ.setdefault("YTDLP_NO_PLUGINS", "1")
 
 import json
 import time
+import argparse
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 from youtube_url_tag import (
@@ -230,8 +232,21 @@ def try_download(
     return False
 
 
-def download_playlist(playlist_url):
+def write_failures(path, video_ids):
+    if not path:
+        return
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(video_ids, handle, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
+
+
+def download_playlist(playlist_url, failures_json=None):
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    failed_video_ids = []
+    write_failures(failures_json, failed_video_ids)
 
     history = load_history()
     recovered = recover_completed_mp3_ids(
@@ -357,11 +372,17 @@ def download_playlist(playlist_url):
             print(f"Saved to history immediately after successful download: {title}")
         else:
             print(f"Giving up for now: {title}")
+            failed_video_ids.append(video_id)
+            # Save progress before continuing so even a later crash keeps
+            # the explicit failures already observed in this run.
+            write_failures(failures_json, failed_video_ids)
 
     flush_pending()  # One quota-friendly Sheets upload for the entire playlist.
     print("\nAll done!")
 
 
 if __name__ == "__main__":
-    download_playlist(PLAYLIST_URL)
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--failures-json", default=None)
+    arguments = parser.parse_args()
+    download_playlist(PLAYLIST_URL, failures_json=arguments.failures_json)

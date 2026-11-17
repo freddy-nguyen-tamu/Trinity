@@ -1,9 +1,12 @@
+
 import os
 if os.environ.get("TRINITY_ENABLE_YTDLP_POT_PLUGIN", "").strip().lower() not in {"1", "true", "yes", "on"}:
     os.environ.setdefault("YTDLP_NO_PLUGINS", "1")
 
 import json
 import time
+import argparse
+import re
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 from youtube_url_tag import (
@@ -210,7 +213,7 @@ def try_download_video(
     return False
 
 
-def download_playlist(playlist_url):
+def download_playlist(playlist_url, failed_ids=None):
     """Download all mp3s from a playlist, skipping previously-downloaded ones."""
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -232,30 +235,40 @@ def download_playlist(playlist_url):
     last_history_sync = time.monotonic()
     print(f"Loaded {len(history)} previously downloaded entries.")
 
-    # ------------------------------------------------------------------
-    # FETCH PLAYLIST INFORMATION
-    # ------------------------------------------------------------------
-    print("Fetching playlist information...")
+    # Retry only the exact IDs reported by thumbnail.py. Avoid enumerating the
+    # playlist a second time and never restart an entire download pass.
+    if failed_ids is not None:
+        video_entries = [{"id": video_id, "title": video_id} for video_id in failed_ids]
+        print(f"Retrying {len(video_entries)} failed thumbnail.py video(s) only.")
+        last_unprocessed = len(video_entries)
+        streak_limit = float("inf")
+    else:
+        # ------------------------------------------------------------------
+        # FETCH PLAYLIST INFORMATION
+        # ------------------------------------------------------------------
+        print("Fetching playlist information...")
 
-    try:
-        video_entries = extract_playlist_entries(
-            playlist_url,
-            use_cookies=USE_COOKIES_FOR_PLAYLIST,
-        )
-    except Exception as e:
-        print(f"Playlist fetch failed in current mode: {e}")
+        try:
+            video_entries = extract_playlist_entries(
+                playlist_url,
+                use_cookies=USE_COOKIES_FOR_PLAYLIST,
+            )
+        except Exception as e:
+            print(f"Playlist fetch failed in current mode: {e}")
 
-        if USE_COOKIES_FOR_PLAYLIST:
-            print("Retrying playlist fetch without cookies...")
-            video_entries = extract_playlist_entries(playlist_url, use_cookies=False)
-        else:
-            print("Retrying playlist fetch with cookies...")
-            video_entries = extract_playlist_entries(playlist_url, use_cookies=True)
+            if USE_COOKIES_FOR_PLAYLIST:
+                print("Retrying playlist fetch without cookies...")
+                video_entries = extract_playlist_entries(playlist_url, use_cookies=False)
+            else:
+                print("Retrying playlist fetch with cookies...")
+                video_entries = extract_playlist_entries(playlist_url, use_cookies=True)
 
-    print(f"Playlist has {len(video_entries)} videos (YouTube playlist order).")
-    last_unprocessed = last_unprocessed_position(video_entries, history)
-    print(f"Last unprocessed playlist position: {last_unprocessed or 'none'}; "
-          "30-match early stop cannot skip IDs farther down.")
+        print(f"Playlist has {len(video_entries)} videos (YouTube playlist order).")
+        last_unprocessed = last_unprocessed_position(video_entries, history)
+        print(f"Last unprocessed playlist position: {last_unprocessed or 'none'}; "
+              "30-match early stop cannot skip IDs farther down.")
+
+        streak_limit = ALREADY_DOWNLOADED_STREAK_LIMIT
 
     # ------------------------------------------------------------------
     # DOWNLOAD EACH VIDEO
@@ -280,14 +293,14 @@ def download_playlist(playlist_url):
         if video_id in history:
             print(f"Skipping already downloaded: {video_title}")
             already_downloaded_streak += 1
-            if safe_to_stop(already_downloaded_streak, ALREADY_DOWNLOADED_STREAK_LIMIT,
+            if safe_to_stop(already_downloaded_streak, streak_limit,
                             index, last_unprocessed):
                 print(
                     f"Reached {ALREADY_DOWNLOADED_STREAK_LIMIT} already-downloaded "
                     "videos in a row; no later unprocessed IDs; stopping."
                 )
                 break
-            if already_downloaded_streak == ALREADY_DOWNLOADED_STREAK_LIMIT:
+            if already_downloaded_streak == streak_limit:
                 print(f"Reached {ALREADY_DOWNLOADED_STREAK_LIMIT} consecutive matches, "
                       f"but an unprocessed ID exists at position {last_unprocessed}; "
                       "continuing in playlist order.")
@@ -356,5 +369,17 @@ def download_playlist(playlist_url):
 
 
 if __name__ == "__main__":
-    download_playlist(PLAYLIST_URL)
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--failed-ids-json", default=None)
+    args = parser.parse_args()
+    ids = None
+    if args.failed_ids_json is not None:
+        with open(args.failed_ids_json, "r", encoding="utf-8") as handle:
+            ids = json.load(handle)
+        if not isinstance(ids, list) or any(
+            not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", item)
+            for item in ids
+        ):
+            parser.error("Invalid thumbnail failure manifest")
+        ids = list(dict.fromkeys(ids))
+    download_playlist(PLAYLIST_URL, failed_ids=ids)

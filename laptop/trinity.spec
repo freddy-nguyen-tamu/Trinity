@@ -1,18 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
-
+# A one-folder bundle starts without extracting its Python/Tk DLLs on every
+# launch. Only the launcher is bundled; the backend remains in laptop/.
 
 a = Analysis(
-    ['trinity.py'],
+    ['trinity_ui.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[
-        'googleapiclient.discovery',
-        'google.oauth2.service_account',
-        'google.oauth2.credentials',
-        'google.auth.transport.requests',
-        'google_auth_oauthlib.flow',
-    ],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -21,24 +16,25 @@ a = Analysis(
     optimize=0,
 )
 pyz = PYZ(a.pure)
-
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
-    name='trinity',
+    exclude_binaries=True,
+    name='Trinity',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
-    console=True,
+    upx=False,
+    console=False,
+    icon='trinity.ico',
     disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    name='Trinity',
 )

@@ -1,4 +1,5 @@
 
+
 import datetime
 import json
 import os
@@ -7,6 +8,15 @@ import shutil
 import subprocess
 import sys
 import time
+
+# Show the launcher before importing Drive, history, audio and other backend
+# modules.  A finished-only run will then skip downloads as usual.
+if __name__ == "__main__" and not any(
+    flag in sys.argv[1:] for flag in ("--headless", "--interactive")
+):
+    from trinity_ui import launch_ui, run_backend
+    launch_ui(run_backend)
+    raise SystemExit(0)
 
 from upload_identity import (
     upload_history_key as build_upload_history_key,
@@ -48,7 +58,10 @@ def resolve_python_executable():
     )
 
 
-PYTHON_EXE = resolve_python_executable()
+# Resolve only when a child is launched, so the UI can open even when a
+# frozen executable needs a separate Python interpreter configured.
+def child_python():
+    return resolve_python_executable()
 
 def current_app_dir():
     if getattr(sys, "frozen", False):
@@ -62,6 +75,7 @@ WORKING_DOWNLOADS_DIR = os.path.join(SCRIPTS_DIR, "_working_downloads")
 FINISHED_DIR = os.path.join(SCRIPTS_DIR, "finished")
 LOG_FILE = os.path.join(SCRIPTS_DIR, "trinity_run_log.txt")
 DOWNLOAD_MANIFEST_FILE = os.path.join(SCRIPTS_DIR, "_last_downloaded_manifest.json")
+THUMBNAIL_FAILURES_FILE = os.path.join(SCRIPTS_DIR, "_thumbnail_failed_ids.json")
 TEST_MANIFEST_FILE = os.path.join(SCRIPTS_DIR, "_last_test_manifest.json")
 UPLOAD_SUMMARY_FILE = os.path.join(SCRIPTS_DIR, "_last_upload_summary.json")
 DRIVE_UPLOAD_MANIFEST_FILE = os.path.join(SCRIPTS_DIR, "_last_drive_upload_delete_manifest.json")
@@ -121,11 +135,14 @@ def close_run_log():
 
 
 def write_log_raw(text):
-    try:
-        sys.stdout.write(text)
-    except UnicodeEncodeError:
-        sys.stdout.write(text.encode("utf-8", errors="replace").decode("utf-8", errors="replace"))
-    sys.stdout.flush()
+    # PyInstaller --windowed sets sys.stdout to None. The file log remains
+    # available while the graphical launcher stays console-free.
+    if sys.stdout is not None:
+        try:
+            sys.stdout.write(text)
+        except UnicodeEncodeError:
+            sys.stdout.write(text.encode("utf-8", errors="replace").decode("utf-8", errors="replace"))
+        sys.stdout.flush()
 
     if _LOG_HANDLE:
         _LOG_HANDLE.write(text)
@@ -985,7 +1002,7 @@ def run_script(script_name, extra_args=None, check=True):
     child_env["PYTHONUNBUFFERED"] = "1"
 
     process = subprocess.Popen(
-        [PYTHON_EXE, "-u", script_path, *args],
+        [child_python(), "-u", script_path, *args],
         cwd=SCRIPTS_DIR,
         text=True,
         encoding="utf-8",
@@ -993,6 +1010,7 @@ def run_script(script_name, extra_args=None, check=True):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=child_env,
+        **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
     )
 
     try:
@@ -1312,28 +1330,64 @@ def print_run_summary(downloaded_paths, upload_summary, upload_candidates):
     return successful
 
 
-def main():
+def run_download_with_fallback():
+    """Only retry actual thumbnail.py failures with the alternate downloader.
+
+    thumbnail.py returns success even when individual videos fail, so the
+    per-video manifest is authoritative. A crash triggers an unfiltered
+    recovery scan, since unvisited playlist IDs are then unknown.
+    """
+    remove_file_if_exists(THUMBNAIL_FAILURES_FILE, "clearing old thumbnail failures")
+    code = run_script(
+        "thumbnail.py",
+        ["--failures-json", THUMBNAIL_FAILURES_FILE],
+        check=False,
+    )
+    if code:
+        log("thumbnail.py stopped early; running mediahuman.py to recover unvisited videos.")
+        run_script("mediahuman.py")
+        return
+
+    try:
+        with open(THUMBNAIL_FAILURES_FILE, "r", encoding="utf-8") as handle:
+            failed = json.load(handle)
+        if not isinstance(failed, list) or any(
+            not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id)
+            for video_id in failed
+        ):
+            raise ValueError("Invalid failed video ID list")
+    except (OSError, ValueError) as error:
+        # Missing/corrupt manifest makes a clean exit untrustworthy.
+        log(f"thumbnail.py failure report unavailable ({error}); running recovery scan.")
+        run_script("mediahuman.py")
+        return
+
+    if failed:
+        log(f"thumbnail.py could not download {len(failed)} video(s); retrying only those IDs.")
+        run_script("mediahuman.py", ["--failed-ids-json", THUMBNAIL_FAILURES_FILE])
+    else:
+        log("thumbnail.py had no failures; skipping mediahuman.py entirely.")
+
+
+def main(should_upload=None, skip_playlist_on_30=None, lazy_playlist=None, finished_only=False):
     prepare_output_dirs()
     open_run_log()
 
-    log("")
-    log("Send downloaded files to Android and Google Drive after download?")
-    should_upload = input("Type yes / no (default: yes): ").strip().lower() in {"", "yes", "y"}
+    # Direct Python callers may still use interactive legacy mode by passing
+    # None. Normal UI/headless launches supply all saved booleans.
+    if should_upload is None:
+        should_upload = input("Send files to Android and Google Drive? (Y/n): ").strip().lower() in {"", "yes", "y"}
+    if skip_playlist_on_30 is None:
+        skip_playlist_on_30 = input("Stop after 30 consecutive downloaded videos? (Y/n): ").strip().lower() in {"", "yes", "y"}
+    if lazy_playlist is None:
+        lazy_playlist = input("Stream playlist fetching? (y/N): ").strip().lower() in {"yes", "y"}
+
+    should_upload = bool(should_upload) or bool(finished_only)
     log(f"Upload to Android and Drive: {'yes' if should_upload else 'no'}")
-    log("")
-
-    log("Skip the rest of the playlist when 30 already-downloaded videos are detected in a row?")
-    skip_playlist_on_30 = input("Type yes / no (default: yes): ").strip().lower() in {"", "yes", "y"}
     log(f"Skip playlist after 30 skips: {'yes' if skip_playlist_on_30 else 'no'}")
-    log("")
-
-    os.environ["TRINITY_SKIP_PLAYLIST_ON_30"] = "1" if skip_playlist_on_30 else "0"
-
-    log("Use streaming playlist fetching? (yes = lazy enumeration, no = eager; both scan ALL IDs)")
-    lazy_playlist = input("Type yes / no (default: no): ").strip().lower() in {"yes", "y"}
     log(f"Lazy playlist fetching: {'yes' if lazy_playlist else 'no'}")
-    log("")
-
+    log(f"Finished-only transfer: {'yes' if finished_only else 'no'}")
+    os.environ["TRINITY_SKIP_PLAYLIST_ON_30"] = "1" if skip_playlist_on_30 else "0"
     os.environ["TRINITY_LAZY_PLAYLIST"] = "1" if lazy_playlist else "0"
 
     exit_code = 0
@@ -1346,62 +1400,39 @@ def main():
     finished_before = snapshot_finished_files()
     upload_return_code = 0
 
-    scripts_before_upload = [
-        "thumbnail.py",
-        "mediahuman.py",
-        "test.py",
-    ]
-
     try:
-        for script in scripts_before_upload:
-            if script == "test.py" and not has_working_audio_files():
-                log("")
-                log("No new working audio files found; skipping normal _working_downloads test.py.")
-                moved_after_test = move_working_items_to_finished()
-                downloaded_paths, upload_candidates = prepare_upload_candidates_after_test(
-                    finished_before,
-                    moved_after_test,
-                    mark_downloaded_as_test_processed=False,
-                )
-                run_auto_thumbnail(upload_candidates)
-                if should_upload:
-                    upload_summary, upload_return_code = run_upload_step(upload_candidates)
-                    if upload_return_code != 0:
-                        if is_nonfatal_upload_failure(upload_summary):
-                            log("")
-                            log(
-                                "No Android LAN upload URL was found. Downloaded files "
-                                "were already moved to finished/, so the program will exit normally."
-                            )
-                        else:
-                            exit_code = upload_return_code
-                else:
-                    log("Skipping Android upload (user chose not to send files).")
-                continue
+        if finished_only:
+            # No thumbnail, mediahuman, test, auto-thumbnail or working-file
+            # moves. Existing independent transfer histories still prevent
+            # duplicates and allow one-sided retries / two-sided cleanup.
+            log("Finished-only: skipping download and preprocessing stages.")
+            upload_candidates = pending_finished_upload_files()
+            upload_summary, upload_return_code = run_upload_step(upload_candidates)
+        else:
+            run_download_with_fallback()
+            if has_working_audio_files():
+                run_script("test.py")
+                mark_as_processed = True
+            else:
+                log("No working audio; skipping normal _working_downloads test.py.")
+                mark_as_processed = False
+            moved_after_test = move_working_items_to_finished()
+            downloaded_paths, upload_candidates = prepare_upload_candidates_after_test(
+                finished_before,
+                moved_after_test,
+                mark_downloaded_as_test_processed=mark_as_processed,
+            )
+            run_auto_thumbnail(upload_candidates)
+            if should_upload:
+                upload_summary, upload_return_code = run_upload_step(upload_candidates)
+            else:
+                log("Skipping Android upload (user chose not to send files).")
 
-            run_script(script)
-
-            if script == "test.py":
-                moved_after_test = move_working_items_to_finished()
-                downloaded_paths, upload_candidates = prepare_upload_candidates_after_test(
-                    finished_before,
-                    moved_after_test,
-                    mark_downloaded_as_test_processed=True,
-                )
-                run_auto_thumbnail(upload_candidates)
-                if should_upload:
-                    upload_summary, upload_return_code = run_upload_step(upload_candidates)
-                    if upload_return_code != 0:
-                        if is_nonfatal_upload_failure(upload_summary):
-                            log("")
-                            log(
-                                "No Android LAN upload URL was found. Downloaded files "
-                                "were already moved to finished/, so the program will exit normally."
-                            )
-                        else:
-                            exit_code = upload_return_code
-                else:
-                    log("Skipping Android upload (user chose not to send files).")
+        if upload_return_code:
+            if is_nonfatal_upload_failure(upload_summary):
+                log("No Android LAN receiver found; keeping files for a later retry.")
+            else:
+                exit_code = upload_return_code
 
     except KeyboardInterrupt:
         log("")
@@ -1414,7 +1445,7 @@ def main():
             # Do not move .part fragments (or an incompletely postprocessed
             # MP3) out of the download directory after an interrupted run.
             # yt-dlp needs the original filenames to resume next time.
-            cleanup_moved = move_working_items_to_finished() if exit_code == 0 else []
+            cleanup_moved = move_working_items_to_finished() if exit_code == 0 and not finished_only else []
             if exit_code:
                 log("Working files and partial downloads were kept for the next run.")
             if cleanup_moved:
@@ -1480,9 +1511,10 @@ def run_auto_thumbnail(upload_candidates):
     child_env["PYTHONUNBUFFERED"] = "1"
     args = ["--manifest", manifest_path]
 
-    log(f"  Python: {PYTHON_EXE}")
+    python_exe = child_python()
+    log(f"  Python: {python_exe}")
     process = subprocess.Popen(
-        [PYTHON_EXE, "-u", script_path, *args],
+        [python_exe, "-u", script_path, *args],
         cwd=SCRIPTS_DIR,
         text=True,
         encoding="utf-8",
@@ -1490,13 +1522,14 @@ def run_auto_thumbnail(upload_candidates):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=child_env,
+        **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
     )
     if process.stdout:
         for line in process.stdout:
             write_log_raw(line)
     return_code = process.wait()
     if return_code == 0:
-        log(f"FINISHED: auto_thumbnail.py (using {PYTHON_EXE})")
+        log(f"FINISHED: auto_thumbnail.py (using {python_exe})")
     else:
         log(f"ERROR: auto_thumbnail.py exited with code {return_code}.")
 
@@ -1505,4 +1538,9 @@ def run_auto_thumbnail(upload_candidates):
 
 
 if __name__ == "__main__":
-    main()
+    # The default GUI is dispatched above, before expensive imports.
+    if "--interactive" in sys.argv:
+        main()
+    elif "--headless" in sys.argv:
+        from trinity_ui import load_options
+        main(**load_options())

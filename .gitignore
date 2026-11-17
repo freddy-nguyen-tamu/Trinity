@@ -1,3 +1,5 @@
+=======================================================
+
 # Runtime download/output folders
 _working_downloads/
 finished/
@@ -63,3 +65,9 @@ laptop/trinity.py.backup-pre-quota-*
 # Durable per-file Drive idempotency IDs; required across timed-out retries.
 laptop/_drive_reserved_upload_ids.json
 laptop/_drive_reserved_upload_ids.json.tmp
+
+# Trinity local UI preferences and per-run downloader recovery manifests
+laptop/_trinity_ui_settings.json
+laptop/_trinity_ui_settings.json.tmp
+laptop/_thumbnail_failed_ids.json
+laptop/_thumbnail_failed_ids.json.tmp
