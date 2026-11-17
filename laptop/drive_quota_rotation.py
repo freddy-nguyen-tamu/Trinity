@@ -246,7 +246,20 @@ def new_drive_service(credentials):
     from google_auth_httplib2 import AuthorizedHttp
     from googleapiclient.discovery import build
 
-    http = AuthorizedHttp(credentials, http=httplib2.Http(timeout=DRIVE_HTTP_TIMEOUT_SECONDS))
+    transport = httplib2.Http(timeout=DRIVE_HTTP_TIMEOUT_SECONDS)
+    # Drive's resumable-upload protocol returns HTTP 308 (Resume Incomplete)
+    # after each accepted non-final chunk, normally WITHOUT a Location header.
+    # httplib2's default treats 308 as a redirect and raises
+    # RedirectMissingLocation before googleapiclient can handle that chunk.
+    # Match googleapiclient.http.build_http(): keep normal redirects enabled,
+    # but let 308 pass through to the resumable-upload implementation.
+    if not hasattr(transport, 'redirect_codes'):
+        raise RuntimeError(
+            'httplib2 is too old for Drive resumable uploads. '
+            'Update httplib2 to version 0.17 or newer.'
+        )
+    transport.redirect_codes = set(transport.redirect_codes) - {308}
+    http = AuthorizedHttp(credentials, http=transport)
     return build('drive', 'v3', http=http, cache_discovery=False)
 
 
@@ -369,6 +382,11 @@ def is_retryable_drive_failure(exc):
         'server disconnected', 'incomplete read', 'broken pipe',
         'temporarily unavailable', 'ssl eof occurred', 'getaddrinfo failed',
         'unable to find the server at',
+        # httplib2 can raise RedirectMissingLocation during Google's
+        # resumable upload handshake. The outcome is unknown: retry ONLY
+        # through ensure_drive_file(), which checks Drive first and reuses
+        # the already-persisted file ID so no duplicate can be created.
+        'redirected but the response is missing a location',
     ))
 
 

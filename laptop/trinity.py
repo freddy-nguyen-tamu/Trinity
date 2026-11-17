@@ -1,11 +1,14 @@
 
 
 import datetime
+from contextlib import contextmanager
 import json
 import os
 import re
 import shutil
 import subprocess
+import threading
+import signal
 import sys
 import time
 
@@ -18,6 +21,7 @@ if __name__ == "__main__" and not any(
     launch_ui(run_backend)
     raise SystemExit(0)
 
+from youtube_url_tag import has_incomplete_companion, recover_completed_mp3_ids
 from upload_identity import (
     upload_history_key as build_upload_history_key,
     history_has_audio, history_upload_match, youtube_history_alias,
@@ -106,6 +110,91 @@ YOUTUBE_ID_IN_NAME_RE = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
 SIZE_SUFFIX_RE = re.compile(r"^(?P<name>.*)\|(?P<size>\d+)$")
 
 _LOG_HANDLE = None
+
+RUN_LOCK_FILE = os.path.join(SCRIPTS_DIR, "_trinity_active.lock")
+
+# A GUI launch uses a unique per-run cancellation marker. Direct CLI runs do
+# not have one and retain their normal Ctrl+C semantics. Never delete a marker
+# belonging to another UI/process.
+_GUI_STOP_MARKER = os.environ.get("TRINITY_STOP_FILE", "").strip()
+
+
+def _stop_requested():
+    return bool(_GUI_STOP_MARKER and os.path.isfile(_GUI_STOP_MARKER))
+
+
+def _check_stop_requested():
+    if _stop_requested():
+        raise KeyboardInterrupt
+
+
+def _watch_child_cancel(process, done):
+    """Stop a script blocked in network IO when its parent UI is closed.
+
+    Existing .part files and transactional upload receipts remain on disk.
+    The UI also owns an OS job/tree fail-safe for grandchildren, such as
+    ffmpeg or helper subprocesses that don't honor this cancellation flag.
+    """
+    while not done.wait(0.20):
+        if not _stop_requested():
+            continue
+        # Let the current operation finish naturally if it can; the parent
+        # checks the stop marker before starting another stage.
+        if done.wait(2.0):
+            break
+        if process.poll() is None:
+            try:
+                if os.name == "nt":
+                    process.terminate()
+                else:
+                    os.killpg(process.pid, signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                pass
+        break
+
+
+
+@contextmanager
+def exclusive_trinity_run():
+    """An OS-owned lock prevents two launchers from handling the same files.
+
+    Unlike a PID/stale marker, this lock is automatically released after a
+    crash or forced termination. It covers downloads, testing and BOTH uploads.
+    """
+    os.makedirs(SCRIPTS_DIR, exist_ok=True)
+    with open(RUN_LOCK_FILE, "a+b") as lock:
+        lock.seek(0, os.SEEK_END)
+        if lock.tell() == 0:
+            lock.write(b"0")
+            lock.flush()
+        lock.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                raise RuntimeError(
+                    "Trinity is already running in another window. "
+                    "Do not start a second pipeline while the first is active."
+                ) from None
+        else:
+            import fcntl
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise RuntimeError(
+                    "Trinity is already running in another window. "
+                    "Do not start a second pipeline while the first is active."
+                ) from None
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -333,21 +422,27 @@ def move_working_items_to_finished():
         return moved_paths
 
     for item_name in sorted(os.listdir(WORKING_DOWNLOADS_DIR)):
-        # Never move yt-dlp's resumable fragments into finished/.
+        source_path = os.path.join(WORKING_DOWNLOADS_DIR, item_name)
         if item_name.casefold().endswith((".part", ".ytdl", ".tmp", ".temp")):
             log(f"Preserved incomplete download for resume: {item_name}")
             continue
-        source_path = os.path.join(WORKING_DOWNLOADS_DIR, item_name)
+        # Image thumbnails are embedded into MP3 by the downloader and
+        # auto_thumbnail; loose webp/mp4 and partial files are never uploads.
+        if not os.path.isfile(source_path) or not item_name.casefold().endswith(".mp3"):
+            continue
+        if not ready_audio(source_path):
+            log(f"Preserved incomplete/unreadable working audio: {item_name}")
+            continue
         destination_path = unique_destination(os.path.join(FINISHED_DIR, item_name))
         try:
             retry_file_operation(
                 f"moving {source_path} to finished/",
-                lambda s=source_path, d=destination_path: shutil.move(s, d),
+                lambda src=source_path, dst=destination_path: shutil.move(src, dst),
             )
             moved_paths.append(destination_path)
             log(f"Moved to finished: {destination_path}")
-        except Exception as e:
-            log(f"WARNING: Could not move working item to finished/ after retries: {source_path} ({e})")
+        except Exception as error:
+            log(f"WARNING: Could not move finished audio: {source_path} ({error})")
 
     return expand_files(moved_paths)
 
@@ -367,6 +462,46 @@ def is_supported_audio_file(path):
     return os.path.splitext(path)[1].lower() in SUPPORTED_AUDIO_EXTENSIONS
 
 
+def ready_audio(path):
+    """Reject partial, corrupt or currently incomplete files before upload.
+
+    Uses the same validation on previous finished/ files as on new downloads;
+    the original is always retained when its readiness is uncertain.
+    """
+    if not os.path.isfile(path) or not is_supported_audio_file(path):
+        return False
+    try:
+        if os.path.getsize(path) < 4096 or has_incomplete_companion(path):
+            return False
+        if MutagenFile is None:
+            return False
+        audio = MutagenFile(path)
+        info = getattr(audio, "info", None)
+        return info is not None and float(getattr(info, "length", 0) or 0) >= 1.0
+    except Exception:
+        return False
+
+
+def ready_finished_audio(path):
+    if not ready_audio(path):
+        log(f"SKIPPED incomplete/unreadable finished audio (kept safely): {path}")
+        return False
+    # A source in the working directory may still be downloading even if an
+    # earlier, similarly named output was moved to finished/ by a bad run.
+    source = os.path.join(WORKING_DOWNLOADS_DIR, os.path.basename(path))
+    source_stem, source_ext = os.path.splitext(source)
+    # Failed overlapping runs created "Title (1).mp3" while leaving
+    # "Title.mp4.part" behind. Treat numbered copies as the same source.
+    original_stem = re.sub(r" \(\d+\)$", "", source_stem)
+    candidates = [source]
+    if original_stem != source_stem:
+        candidates.append(original_stem + source_ext)
+    if any(has_incomplete_companion(candidate) for candidate in candidates):
+        log(f"SKIPPED finished audio with matching active partial: {path}")
+        return False
+    return True
+
+
 def has_working_audio_files():
     if not os.path.isdir(WORKING_DOWNLOADS_DIR):
         return False
@@ -375,7 +510,7 @@ def has_working_audio_files():
         path = os.path.join(WORKING_DOWNLOADS_DIR, name)
         if not os.path.isfile(path):
             continue
-        if is_supported_audio_file(path):
+        if name.casefold().endswith(".mp3") and ready_audio(path):
             return True
 
     return False
@@ -480,7 +615,7 @@ def pending_finished_upload_files():
     pending = []
 
     for path in sorted(snapshot_finished_files()):
-        if not is_supported_audio_file(path):
+        if not ready_finished_audio(path):
             continue
         if not history_has_audio(uploaded_history, path, base_dir=FINISHED_DIR):
             pending.append(path)
@@ -799,7 +934,7 @@ def pending_finished_test_files():
     skipped_previously_attempted_no_lyrics = 0
 
     for path in sorted(snapshot_finished_files()):
-        if not is_supported_audio_file(path):
+        if not ready_finished_audio(path):
             continue
 
         missing_title_or_artist = audio_missing_title_or_artist(path)
@@ -844,7 +979,7 @@ def pending_finished_drive_upload_files():
     pending = []
 
     for path in sorted(snapshot_finished_files()):
-        if not is_supported_audio_file(path):
+        if not ready_finished_audio(path):
             continue
         key = uploaded_history_key(path)
         # Read old filename|size receipts AND current SHA-256 receipts from
@@ -987,6 +1122,7 @@ def load_upload_summary(downloaded_paths):
 
 
 def run_script(script_name, extra_args=None, check=True):
+    _check_stop_requested()
     script_path = os.path.join(SCRIPTS_DIR, script_name)
     args = extra_args or []
 
@@ -1010,9 +1146,15 @@ def run_script(script_name, extra_args=None, check=True):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=child_env,
-        **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
+        **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}),
     )
 
+    done = threading.Event()
+    watcher = None
+    if _GUI_STOP_MARKER:
+        watcher = threading.Thread(target=_watch_child_cancel, args=(process, done),
+                                   daemon=True, name="TrinityChildCancel")
+        watcher.start()
     try:
         if process.stdout:
             for line in process.stdout:
@@ -1020,16 +1162,23 @@ def run_script(script_name, extra_args=None, check=True):
     except KeyboardInterrupt:
         log("")
         log(f"Interrupted while running {script_name}; terminating child process...")
-        process.terminate()
+        if process.poll() is None:
+            process.terminate()
         try:
-            process.wait(timeout=5)
+            process.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            log(f"{script_name} did not exit after terminate; killing it...")
             process.kill()
             process.wait()
         raise
+    finally:
+        done.set()
+        if watcher is not None:
+            watcher.join(timeout=0.3)
+        if process.stdout is not None:
+            process.stdout.close()
 
     return_code = process.wait()
+    _check_stop_requested()
 
     if return_code == 0:
         log(f"FINISHED: {script_name}")
@@ -1042,6 +1191,8 @@ def run_script(script_name, extra_args=None, check=True):
 
 
 def run_upload_step(downloaded_paths):
+    _check_stop_requested()
+    downloaded_paths = [p for p in downloaded_paths if ready_finished_audio(p)]
     if not downloaded_paths:
         log("")
         log("No finished/ files need Android upload.")
@@ -1107,7 +1258,7 @@ def prepare_upload_candidates_after_test(finished_before, moved_after_test, mark
     upload_candidates = sorted(
         path
         for path in set(downloaded_paths) | set(pending_finished_upload_files())
-        if is_supported_audio_file(path)
+        if ready_finished_audio(path)
     )
 
     return downloaded_paths, upload_candidates
@@ -1184,8 +1335,8 @@ def write_drive_upload_manifest(successful_items):
         if not os.path.exists(path):
             log(f"Skipped missing Drive manifest item: {path}")
             continue
-        if not is_supported_audio_file(path):
-            log(f"Skipped non-audio Drive manifest item: {path}")
+        if not ready_finished_audio(path):
+            log(f"Skipped incomplete/unreadable Drive manifest item: {path}")
             continue
 
         files.append(os.path.abspath(path))
@@ -1257,6 +1408,7 @@ def print_drive_upload_summary(summary):
 
 
 def auto_drive_upload_then_delete(drive_candidates):
+    _check_stop_requested()
     """Upload to Drive independently of phone success, then reconcile both.
 
     Each destination has its own namespace in the shared Google Sheet. A
@@ -1286,6 +1438,7 @@ def auto_drive_upload_then_delete(drive_candidates):
         log("Unconfirmed history and all local originals are preserved.")
         return
 
+    _check_stop_requested()
     result = run_script(
         "drive_quota_rotation.py",
         [
@@ -1331,6 +1484,7 @@ def print_run_summary(downloaded_paths, upload_summary, upload_candidates):
 
 
 def run_download_with_fallback():
+    _check_stop_requested()
     """Only retry actual thumbnail.py failures with the alternate downloader.
 
     thumbnail.py returns success even when individual videos fail, so the
@@ -1365,11 +1519,17 @@ def run_download_with_fallback():
     if failed:
         log(f"thumbnail.py could not download {len(failed)} video(s); retrying only those IDs.")
         run_script("mediahuman.py", ["--failed-ids-json", THUMBNAIL_FAILURES_FILE])
+        recovered = recover_completed_mp3_ids(WORKING_DOWNLOADS_DIR, FINISHED_DIR)
+        unresolved = sorted(set(failed) - set(recovered))
+        if unresolved:
+            log(f"ERROR: {len(unresolved)} download(s) remain unverified: {', '.join(unresolved)}")
+            log("Upload stages are blocked until these downloads are resolved.")
+            raise SystemExit(1)
     else:
         log("thumbnail.py had no failures; skipping mediahuman.py entirely.")
 
 
-def main(should_upload=None, skip_playlist_on_30=None, lazy_playlist=None, finished_only=False):
+def _main_under_lock(should_upload=None, skip_playlist_on_30=None, lazy_playlist=None, finished_only=False):
     prepare_output_dirs()
     open_run_log()
 
@@ -1401,6 +1561,7 @@ def main(should_upload=None, skip_playlist_on_30=None, lazy_playlist=None, finis
     upload_return_code = 0
 
     try:
+        _check_stop_requested()
         if finished_only:
             # No thumbnail, mediahuman, test, auto-thumbnail or working-file
             # moves. Existing independent transfer histories still prevent
@@ -1423,6 +1584,7 @@ def main(should_upload=None, skip_playlist_on_30=None, lazy_playlist=None, finis
                 mark_downloaded_as_test_processed=mark_as_processed,
             )
             run_auto_thumbnail(upload_candidates)
+            _check_stop_requested()
             if should_upload:
                 upload_summary, upload_return_code = run_upload_step(upload_candidates)
             else:
@@ -1440,6 +1602,9 @@ def main(should_upload=None, skip_playlist_on_30=None, lazy_playlist=None, finis
         exit_code = 130
     except SystemExit as e:
         exit_code = e.code if isinstance(e.code, int) else 1
+    except Exception as error:
+        log(f"ERROR: Trinity processing stopped: {error}")
+        exit_code = 1
     finally:
         try:
             # Do not move .part fragments (or an incompletely postprocessed
@@ -1453,7 +1618,7 @@ def main(should_upload=None, skip_playlist_on_30=None, lazy_playlist=None, finis
                 upload_candidates = sorted(
                     path
                     for path in set(upload_candidates) | set(cleanup_moved)
-                    if is_supported_audio_file(path)
+                    if ready_finished_audio(path)
                 )
         except Exception as e:
             log(f"ERROR: Could not move working files to {FINISHED_DIR}: {e}")
@@ -1461,7 +1626,7 @@ def main(should_upload=None, skip_playlist_on_30=None, lazy_playlist=None, finis
 
     successful_items = print_run_summary(downloaded_paths, upload_summary, upload_candidates)
     remember_successful_uploads(successful_items)
-    drive_candidates = pending_finished_drive_upload_files()
+    drive_candidates = pending_finished_drive_upload_files() if exit_code == 0 and should_upload else []
 
     if exit_code == 0:
         log("")
@@ -1470,26 +1635,50 @@ def main(should_upload=None, skip_playlist_on_30=None, lazy_playlist=None, finis
         log("")
         log(f"STOPPED WITH EXIT CODE {exit_code}")
 
-    if should_upload:
+    if should_upload and exit_code == 0:
         try:
+            _check_stop_requested()
             auto_drive_upload_then_delete(drive_candidates)
+        except KeyboardInterrupt:
+            log("Stop requested. Preserving all local files and transfer receipts.")
+            exit_code = 130
         finally:
             close_run_log()
     else:
+        if exit_code:
+            log("Upload stages skipped: download or processing did not finish successfully.")
         close_run_log()
 
-    # Flush independent Android and Drive history rows to the same shared Sheet.
+    # Flush any already acknowledged transfers before exiting, when possible.
+    # Pending journals on disk remain recoverable if the stop is escalated.
     flush_pending()
     if exit_code:
         sys.exit(exit_code)
 
 
+def main(should_upload=None, skip_playlist_on_30=None, lazy_playlist=None, finished_only=False):
+    try:
+        with exclusive_trinity_run():
+            return _main_under_lock(
+                should_upload=should_upload,
+                skip_playlist_on_30=skip_playlist_on_30,
+                lazy_playlist=lazy_playlist,
+                finished_only=finished_only,
+            )
+    except RuntimeError as error:
+        if "Trinity is already running" not in str(error):
+            raise
+        print(f"ERROR: {error}", flush=True)
+        raise SystemExit(73) from None
+
+
 def run_auto_thumbnail(upload_candidates):
+    _check_stop_requested()
     files_to_check = list(upload_candidates) if upload_candidates else []
     if not files_to_check:
         for name in sorted(os.listdir(FINISHED_DIR)):
             path = os.path.join(FINISHED_DIR, name)
-            if os.path.isfile(path) and is_supported_audio_file(path):
+            if ready_finished_audio(path):
                 files_to_check.append(path)
 
     if not files_to_check:
@@ -1522,12 +1711,26 @@ def run_auto_thumbnail(upload_candidates):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=child_env,
-        **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
+        **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}),
     )
-    if process.stdout:
-        for line in process.stdout:
-            write_log_raw(line)
-    return_code = process.wait()
+    done = threading.Event()
+    watcher = None
+    if _GUI_STOP_MARKER:
+        watcher = threading.Thread(target=_watch_child_cancel, args=(process, done),
+                                   daemon=True, name="TrinityChildCancel")
+        watcher.start()
+    try:
+        if process.stdout:
+            for line in process.stdout:
+                write_log_raw(line)
+        return_code = process.wait()
+    finally:
+        done.set()
+        if watcher is not None:
+            watcher.join(timeout=0.3)
+        if process.stdout is not None:
+            process.stdout.close()
+    _check_stop_requested()
     if return_code == 0:
         log(f"FINISHED: auto_thumbnail.py (using {python_exe})")
     else:

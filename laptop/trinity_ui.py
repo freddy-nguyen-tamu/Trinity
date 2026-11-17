@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from collections import deque
 import json
+import codecs
+import signal
+import uuid
 import os
 import re
 from pathlib import Path
@@ -137,53 +139,76 @@ def _python_command():
     raise FileNotFoundError("Python is required for Trinity's companion scripts.")
 
 
-def run_backend(*, on_output=None, **options):
-    """Stream original Python output in real time without blocking the UI."""
+def run_backend(*, output_path=None, on_output=None, on_process=None, stop_file=None, **options):
+    """Run the unchanged backend without routing its output through Tk.
+
+    The desktop UI directs stdout/stderr to a file descriptor. The operating
+    system writes to that file directly, so neither Python nor Tk processes
+    thousands of per-video progress lines on the critical download path.
+    The optional callback is kept for callers that need the old API.
+    """
+    if output_path is not None and on_output is not None:
+        raise ValueError("Choose output_path or on_output, not both")
+
     project = _project_dir()
-    # The existing --headless entry uses the settings saved before START.
     command = [*_python_command(), "-u", str(project / "trinity.py"), "--headless"]
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    if stop_file is not None:
+        env["TRINITY_STOP_FILE"] = str(stop_file)
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    process = subprocess.Popen(
-        command,
+    kwargs = dict(
         cwd=project,
         env=env,
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
         creationflags=flags,
+        **({"start_new_session": True} if os.name != "nt" else {}),
     )
-    try:
-        if process.stdout:
-            # TextIOWrapper normalizes carriage-return progress updates. This
-            # also captures everything child processes print via trinity.py.
-            for chunk in process.stdout:
-                if on_output is not None:
-                    on_output(chunk)
-                elif sys.stdout is not None:
-                    sys.stdout.write(chunk)
-                    sys.stdout.flush()
-    finally:
-        if process.stdout:
-            process.stdout.close()
-    code = process.wait()
+
+    if output_path is not None:
+        # The parent launcher closes its handle immediately after spawning.
+        # The child inherits the output handle and continues writing on its own.
+        with Path(output_path).open("ab", buffering=0) as sink:
+            process = subprocess.Popen(command, stdout=sink, **kwargs)
+        if on_process is not None:
+            on_process(process)
+        code = process.wait()
+    else:
+        # Backward-compatible path for callers that request a callback or a
+        # normal console, without imposing a pipe on the graphical launcher.
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace", bufsize=1, **kwargs,
+        )
+        if on_process is not None:
+            on_process(process)
+        try:
+            if process.stdout:
+                for chunk in process.stdout:
+                    if on_output is not None:
+                        on_output(chunk)
+                    elif sys.stdout is not None:
+                        sys.stdout.write(chunk)
+                        sys.stdout.flush()
+        finally:
+            if process.stdout:
+                process.stdout.close()
+        code = process.wait()
     if code:
         raise RuntimeError(f"Trinity backend stopped with exit code {code}")
 
 
 _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-_MAX_VISIBLE = 150_000
-_TRIM_AT = 200_000
-_MAX_QUEUED = 240_000
-_MAX_BATCH = 36_000
+# Keep a small visible terminal. Copy All always reads the full file on disk.
+# Reading and rendering are deliberately decoupled from the running backend.
+_MAX_VISIBLE = 24_000
+_TRIM_AT = 34_000
+_MAX_BATCH = 12_000
+_MAX_BACKLOG = 96_000
+_TERMINAL_POLL_MS = 450
 _TERMINAL_FILE = SETTINGS_FILE.with_name("terminal_output.log")
-
 
 def _put_clipboard(root, text):
     """Copy Unicode faithfully, including very long logs on Windows."""
@@ -260,6 +285,128 @@ def _load_recent_terminal(path, max_bytes=70_000):
         return ""
 
 
+def another_backend_running():
+    """Non-destructive check; the backend owns the authoritative run lock."""
+    try:
+        lock_path = _project_dir() / "_trinity_active.lock"
+        with lock_path.open("a+b") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                except OSError:
+                    return True
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    return True
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return False
+    except (OSError, FileNotFoundError):
+        return False  # The backend itself will reject any collision.
+
+
+
+
+class _WindowsJob:
+    """Windows Job Object: closing it stops the backend and ALL descendants.
+
+    Prevents ffmpeg/yt-dlp/grandchildren from surviving a UI close even if a
+    script ignores cancellation or spawns a separate process. Uses the WinAPI
+    already present on Windows; no third-party dependency or polling loop.
+    """
+    def __init__(self, process):
+        import ctypes
+        from ctypes import wintypes
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [("ReadOperationCount", ctypes.c_uint64),
+                        ("WriteOperationCount", ctypes.c_uint64),
+                        ("OtherOperationCount", ctypes.c_uint64),
+                        ("ReadTransferCount", ctypes.c_uint64),
+                        ("WriteTransferCount", ctypes.c_uint64),
+                        ("OtherTransferCount", ctypes.c_uint64)]
+
+        class BASIC_LIMIT(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                        ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD),
+                        ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t),
+                        ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class EXTENDED_LIMIT(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", BASIC_LIMIT),
+                        ("IoInfo", IO_COUNTERS),
+                        ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                    ctypes.c_void_p, wintypes.DWORD]
+        kernel.SetInformationJobObject.restype = wintypes.BOOL
+        kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        handle = kernel.CreateJobObjectW(None, None)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            limits = EXTENDED_LIMIT()
+            limits.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE
+            if not kernel.SetInformationJobObject(handle, 9,
+                    ctypes.byref(limits), ctypes.sizeof(limits)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not kernel.AssignProcessToJobObject(handle, int(process._handle)):
+                raise ctypes.WinError(ctypes.get_last_error())
+        except BaseException:
+            kernel.CloseHandle(handle)
+            raise
+        self._kernel = kernel
+        self._handle = handle
+
+    def close(self):
+        if self._handle:
+            self._kernel.CloseHandle(self._handle)
+            self._handle = None
+
+
+def _force_stop_tree(process, job=None):
+    """Emergency cleanup; always scope to this UI's child process tree."""
+    if job is not None:
+        job.close()  # KILL_ON_JOB_CLOSE also kills any surviving descendants.
+    if process is None or process.poll() is not None:
+        return
+    if os.name == "nt":
+        # Used only if Job assignment failed / child survived closing the job.
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=5, creationflags=subprocess.CREATE_NO_WINDOW, check=False)
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            process.kill()
+
 def launch_ui(run_pipeline):
     """Fast, minimalist UI. The backend and stdout reader never touch Tk."""
     import tkinter as tk
@@ -279,18 +426,20 @@ def launch_ui(run_pipeline):
             self.root.minsize(390, 440)
             self.running = False
             self.closed = False
+            self.closing = False
+            self._close_started = None
+            self._backend_process = None
+            self._process_job = None
+            self._process_lock = threading.Lock()
+            self._stop_file = None
             self.values = {
                 key: tk.BooleanVar(master=self.root, value=value)
                 for key, value in load_options().items()
             }
             self.indicators = {}
-            self._queue_lock = threading.Lock()
-            self._queued = deque()
-            self._queued_chars = 0
-            self._dropped = False
-            self._writer_lock = threading.Lock()
-            self._writer = None
-            self._writer_flush = 0.0
+            self._reader = None
+            self._reader_offset = 0
+            self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
             self._worker_finished = False
             self._worker_failure = None
             self._display_chars = 0
@@ -376,7 +525,7 @@ def launch_ui(run_pipeline):
             self.append_visible(_load_recent_terminal(_TERMINAL_FILE))
             self.redraw_all()
             self.root.protocol("WM_DELETE_WINDOW", self.close)
-            self.root.after(60, self.drain_output)
+            self.root.after(_TERMINAL_POLL_MS, self.drain_output)
 
         def make_option(self, parent, key, caption, bg, ink, line, tk):
             row = tk.Frame(parent, bg=bg, height=39, cursor="hand2", takefocus=True)
@@ -430,102 +579,157 @@ def launch_ui(run_pipeline):
                 return False
 
         def start(self):
-            if self.running or not self.persist():
+            if self.running or self.closing or not self.persist():
+                return
+            if another_backend_running():
+                messagebox.showwarning(
+                    "Trinity", "A Trinity run is already active. "
+                    "Wait for it to finish before starting another.", parent=self.root
+                )
                 return
             try:
                 _TERMINAL_FILE.parent.mkdir(parents=True, exist_ok=True)
-                writer = _TERMINAL_FILE.open("w", encoding="utf-8",
-                                             errors="replace", buffering=32768)
+                # Reset the full log BEFORE opening a reader or launching the
+                # subprocess, eliminating append/truncate races on Windows.
+                with _TERMINAL_FILE.open("wb"):
+                    pass
+                if self._reader is not None:
+                    self._reader.close()
+                self._reader = _TERMINAL_FILE.open("rb", buffering=0)
             except OSError as error:
                 messagebox.showerror("Trinity", f"Could not open terminal log:\n{error}",
                                      parent=self.root)
                 return
-            with self._writer_lock:
-                self._writer = writer
-                self._writer_flush = time.monotonic()
-            with self._queue_lock:
-                self._queued.clear()
-                self._queued_chars = 0
-                self._dropped = False
+            self._reader_offset = 0
+            self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
             self.terminal.configure(state="normal")
             self.terminal.delete("1.0", "end")
             self.terminal.configure(state="disabled")
             self._display_chars = 0
             self._worker_finished = False
             self._worker_failure = None
+            self._backend_process = None
+            self._process_job = None
+            self._stop_file = SETTINGS_FILE.parent / ("stop-" + uuid.uuid4().hex + ".flag")
             self.running = True
             self.start_button.configure(text="RUNNING", state="disabled")
             threading.Thread(target=self.worker, args=(self.current_options(),),
-                             daemon=False, name="TrinityBackend").start()
+                             daemon=True, name="TrinityBackend").start()
 
-        def push_output(self, chunk):
-            """Called by the worker: never touches any Tk widget."""
-            # Normalize terminal control codes for readable copy/paste and
-            # prevent CR-based yt-dlp progress from overwriting earlier lines.
-            chunk = _ANSI.sub("", str(chunk)).replace("\r\n", "\n").replace("\r", "\n")
-            if not chunk:
-                return
-            with self._writer_lock:
-                if self._writer is not None:
-                    self._writer.write(chunk)
-                    now = time.monotonic()
-                    if now - self._writer_flush >= .2:
-                        self._writer.flush()
-                        self._writer_flush = now
-            with self._queue_lock:
-                self._queued.append(chunk)
-                self._queued_chars += len(chunk)
-                if self._queued_chars > _MAX_QUEUED:
-                    self._dropped = True
-                    while self._queued_chars > _MAX_QUEUED // 2 and self._queued:
-                        removed = self._queued.popleft()
-                        self._queued_chars -= len(removed)
+        def register_process(self, process):
+            with self._process_lock:
+                self._backend_process = process
+                if os.name == "nt":
+                    try:
+                        self._process_job = _WindowsJob(process)
+                    except OSError as error:
+                        # Built-in taskkill /T /F remains a last-resort backup.
+                        self._append_shutdown_log(
+                            f"[Windows process containment unavailable: {error}]\n")
+                if self.closing:
+                    self._request_stop()
+
+        def _append_shutdown_log(self, value):
+            try:
+                with _TERMINAL_FILE.open("ab", buffering=0) as output:
+                    output.write(value.encode("utf-8", "replace"))
+            except OSError:
+                pass
+
+        def _request_stop(self):
+            if self._stop_file is not None:
+                try:
+                    self._stop_file.write_text("stop\n", encoding="ascii")
+                except OSError as error:
+                    self._append_shutdown_log(f"[Could not signal cancellation: {error}]\n")
+
+        def _cleanup_stop_file(self):
+            if self._stop_file is not None:
+                try:
+                    self._stop_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                self._stop_file = None
 
         def worker(self, options):
             failure = None
             try:
-                run_pipeline(on_output=self.push_output, **options)
+                # A direct file descriptor, not stdout=PIPE. The Python
+                # backend runs at its normal speed regardless of UI rendering.
+                run_pipeline(output_path=_TERMINAL_FILE,
+                             on_process=self.register_process,
+                             stop_file=self._stop_file, **options)
             except BaseException as error:
                 if not (isinstance(error, SystemExit) and error.code in (None, 0)):
                     failure = error
-                    self.push_output("".join(traceback.format_exception(
-                        type(error), error, error.__traceback__)))
+                    details = "".join(traceback.format_exception(
+                        type(error), error, error.__traceback__))
+                    try:
+                        with _TERMINAL_FILE.open("ab", buffering=0) as sink:
+                            sink.write(details.encode("utf-8", errors="replace"))
+                    except OSError:
+                        pass
             finally:
-                with self._writer_lock:
-                    if self._writer is not None:
-                        try:
-                            self._writer.flush()
-                        finally:
-                            self._writer.close()
-                            self._writer = None
-                with self._queue_lock:
-                    self._worker_failure = failure
-                    self._worker_finished = True
+                # Single writer (the child) is complete before this flag is
+                # updated. Tk's polling always does bounded work.
+                # Once the backend exits, close the job to stop any orphaned
+                # grandchildren before allowing another launch or UI exit.
+                with self._process_lock:
+                    job = self._process_job
+                    self._process_job = None
+                    if job is not None:
+                        job.close()
+                    self._backend_process = None
+                self._worker_failure = failure
+                self._worker_finished = True
 
         def drain_output(self):
             if self.closed:
                 return
-            chunks = []
-            size = 0
-            with self._queue_lock:
-                dropped = self._dropped
-                self._dropped = False
-                while self._queued and size < _MAX_BATCH:
-                    chunk = self._queued.popleft()
-                    self._queued_chars -= len(chunk)
-                    chunks.append(chunk)
-                    size += len(chunk)
-                finished = self._worker_finished and not self._queued
-                failure = self._worker_failure
-            if dropped:
-                self.append_visible("\n[Earlier output omitted from view; Copy All includes it.]\n")
-            if chunks:
-                self.append_visible("".join(chunks))
-            if finished and self.running:
+            if self._reader is not None:
+                try:
+                    # Never read more than a small batch per redraw. When a
+                    # downloader floods output, jump forward rather than
+                    # making the UI burn CPU trying to catch up. The full log
+                    # is still recorded byte-for-byte for the Copy All icon.
+                    self._reader.seek(0, os.SEEK_END)
+                    end = self._reader.tell()
+                    remaining = end - self._reader_offset
+                    if remaining > _MAX_BACKLOG:
+                        self._reader_offset = max(0, end - _MAX_BATCH)
+                        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                        self.append_visible(
+                            "\n[Older output omitted from view; Copy All includes everything.]\n"
+                        )
+                    self._reader.seek(self._reader_offset)
+                    data = self._reader.read(_MAX_BATCH)
+                    self._reader_offset += len(data)
+                    if data:
+                        visible = self._decoder.decode(data)
+                        visible = _ANSI.sub("", visible).replace("\r\n", "\n").replace("\r", "\n")
+                        self.append_visible(visible)
+                    if self._worker_finished and self._reader_offset >= end:
+                        remainder = self._decoder.decode(b"", final=True)
+                        self.append_visible(remainder)
+                        self._reader.close()
+                        self._reader = None
+                except OSError as error:
+                    self.append_visible(f"\n[Terminal view unavailable: {error}]\n")
+                    try:
+                        self._reader.close()
+                    except OSError:
+                        pass
+                    self._reader = None
+            if self._worker_finished and self.running and self._reader is None:
                 self.running = False
-                self.start_button.configure(text="DONE" if failure is None else "RETRY",
-                                            state="normal")
-            self.root.after(70, self.drain_output)
+                if not self.closing:
+                    self._cleanup_stop_file()
+                self.start_button.configure(
+                    text="DONE" if self._worker_failure is None else "RETRY",
+                    state="normal",
+                )
+            if not self.closing:
+                self.root.after(_TERMINAL_POLL_MS, self.drain_output)
 
         def append_visible(self, value):
             if not value:
@@ -544,12 +748,11 @@ def launch_ui(run_pipeline):
 
         def copy_all(self, event=None):
             try:
-                with self._writer_lock:
-                    if self._writer is not None:
-                        self._writer.flush()
-                # The full text lives on disk; never depend on trimmed Tk text.
+                # The complete output is written straight from the child.
+                # Nothing is omitted from Copy All when the view is throttled.
                 text = (_TERMINAL_FILE.read_text(encoding="utf-8", errors="replace")
                         if _TERMINAL_FILE.is_file() else "")
+                text = _ANSI.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
             except OSError as error:
                 messagebox.showerror("Trinity", f"Could not copy terminal:\n{error}",
                                      parent=self.root)
@@ -577,13 +780,64 @@ def launch_ui(run_pipeline):
             self.terminal.tag_add("sel", "1.0", "end-1c")
             return "break"
 
-        def close(self):
-            if not self.running and not self.persist():
+        def _finish_closing(self):
+            if not self.closing or self.closed:
                 return
-            # Like the previous GUI, closing the window does not terminate an
-            # upload in progress. The worker keeps draining the child pipe.
-            self.closed = True
-            self.root.destroy()
+            process = self._backend_process
+            if self._worker_finished or (process is None and not self.running):
+                with self._process_lock:
+                    job = self._process_job
+                    self._process_job = None
+                    if job is not None:
+                        job.close()
+                self._cleanup_stop_file()
+                self.closed = True
+                if self._reader is not None:
+                    self._reader.close()
+                    self._reader = None
+                self.root.destroy()
+                return
+            # The backend gets time to release file handles and persist the
+            # independent phone/Drive histories. After the deadline, make a
+            # best-effort tree termination to prevent any lingering workers.
+            if self._close_started is not None and time.monotonic() - self._close_started > 10:
+                self._append_shutdown_log("\n[Shutdown deadline reached: stopping remaining subprocesses.]\n")
+                with self._process_lock:
+                    process = self._backend_process
+                    job = self._process_job
+                    self._process_job = None
+                try:
+                    _force_stop_tree(process, job)
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    self._append_shutdown_log(f"[Process cleanup warning: {error}]\n")
+                # Wait for the process waiter to observe termination before
+                # closing the UI; never assume cleanup has succeeded.
+                self._close_started = None
+            self.root.after(150, self._finish_closing)
+
+        def close(self):
+            if self.closing or self.closed:
+                return
+            # Failure to save a checkbox must never strand active processes
+            # or block cancellation behind a modal dialog.
+            try:
+                save_options(self.current_options())
+            except OSError as error:
+                self._append_shutdown_log(f"[Could not save preferences: {error}]\n")
+            if not self.running:
+                self._cleanup_stop_file()
+                self.closed = True
+                if self._reader is not None:
+                    self._reader.close()
+                    self._reader = None
+                self.root.destroy()
+                return
+            self.closing = True
+            self._close_started = time.monotonic()
+            self.start_button.configure(text="STOPPING", state="disabled")
+            self._append_shutdown_log("\n[Closing Trinity: requesting graceful stop...]\n")
+            self._request_stop()
+            self._finish_closing()
 
     TrinityWindow().root.mainloop()
 

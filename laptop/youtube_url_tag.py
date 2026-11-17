@@ -8,6 +8,60 @@ from mutagen.id3 import COMM, WOAS
 YOUTUBE_ID_COMMENT_PREFIX = "YouTube ID:"
 
 
+def has_incomplete_companion(audio_path):
+    """Never publish an MP3 while yt-dlp still has an associated partial.
+
+    In particular, yt-dlp may be writing title.mp4.part while a retry has
+    already generated title.mp3. The MP3 is not safe to publish until the
+    partial is resolved, even when it opens in a metadata parser.
+    """
+    folder = os.path.dirname(os.path.abspath(audio_path))
+    stem = os.path.splitext(os.path.basename(audio_path))[0].casefold()
+    if not os.path.isdir(folder):
+        return False
+    try:
+        return any(
+            name.casefold().startswith(stem + ".") and
+            name.casefold().endswith((".part", ".ytdl", ".tmp", ".temp"))
+            for name in os.listdir(folder)
+        )
+    except OSError:
+        return True
+
+
+def valid_completed_mp3(path):
+    """Check an actual readable audio stream, not just yt-dlp's exit code."""
+    if not path or not os.path.isfile(path) or has_incomplete_companion(path):
+        return False
+    try:
+        if os.path.getsize(path) < 4096:
+            return False
+        audio = MP3(path)
+        return float(getattr(audio.info, "length", 0) or 0) >= 1.0
+    except Exception:
+        return False
+
+
+def _stored_youtube_ids(audio):
+    """Read all existing ID3 identities to avoid retagging another video."""
+    ids = set()
+    if audio.tags:
+        for frame in audio.tags.getall("COMM"):
+            for value in getattr(frame, "text", []) or []:
+                text = str(value)
+                match = re.search(r"YouTube ID:\s*([A-Za-z0-9_-]{11})", text)
+                if match:
+                    ids.add(match.group(1))
+        for frame in audio.tags.getall("WOAS"):
+            match = re.search(
+                r"(?:youtube\.com/watch\?v=|youtu\.be/)([A-Za-z0-9_-]{11})",
+                str(getattr(frame, "url", "")), re.I,
+            )
+            if match:
+                ids.add(match.group(1))
+    return ids
+
+
 def youtube_watch_url(video_id):
     video_id = str(video_id or "").strip()
     if not video_id:
@@ -65,7 +119,14 @@ def write_youtube_metadata_tags(mp3_path, youtube_url, video_id=""):
     if not mp3_path or not os.path.isfile(mp3_path):
         return False
 
+    if not valid_completed_mp3(mp3_path):
+        return False
     audio = MP3(mp3_path)
+    existing_ids = _stored_youtube_ids(audio)
+    if video_id and existing_ids and existing_ids != {video_id}:
+        raise ValueError(
+            f"File belongs to another YouTube video ({sorted(existing_ids)}): {mp3_path}"
+        )
     if audio.tags is None:
         audio.add_tags()
 
@@ -122,21 +183,9 @@ def tag_downloaded_mp3_with_youtube_url(
             if name.casefold().endswith(".mp3") and video_marker in name.casefold():
                 _add_candidate(candidates, os.path.join(download_dir, name))
 
-    if os.path.isdir(download_dir):
-        recent_mp3s = []
-        for name in os.listdir(download_dir):
-            if not name.casefold().endswith(".mp3"):
-                continue
-            path = os.path.join(download_dir, name)
-            try:
-                modified_at = os.path.getmtime(path)
-            except OSError:
-                continue
-            if modified_at >= max(0, started_at - 2):
-                recent_mp3s.append((modified_at, path))
-
-        for _, path in sorted(recent_mp3s, reverse=True):
-            _add_candidate(candidates, path)
+    # Never grab a conveniently recent MP3 from an unrelated download.  A
+    # concurrent run previously caused mismatched tags and duplicate files.
+    # yt-dlp's own requested_downloads/prepare_filename identify this video.
 
     seen = set()
     for path in candidates:
@@ -144,7 +193,7 @@ def tag_downloaded_mp3_with_youtube_url(
         if lowered in seen:
             continue
         seen.add(lowered)
-        if not os.path.isfile(path):
+        if not valid_completed_mp3(path):
             continue
 
         try:
@@ -153,6 +202,16 @@ def tag_downloaded_mp3_with_youtube_url(
             print(f"Could not embed YouTube metadata in {path}: {error}")
             continue
 
+        # A clean, unambiguous embedded identity is required before history
+        # may be updated. A different file/failed tag update is not success.
+        try:
+            tagged = MP3(path)
+            if not valid_completed_mp3(path) or _stored_youtube_ids(tagged) != {video_id}:
+                print(f"MP3 identity could not be verified: {path}")
+                continue
+        except Exception as error:
+            print(f"MP3 verification failed for {path}: {error}")
+            continue
         if changed:
             print(f"Embedded YouTube metadata in MP3: {os.path.basename(path)}")
         else:
@@ -189,7 +248,7 @@ def recover_completed_mp3_ids(*folders):
                     continue
                 path = os.path.join(current, name)
                 try:
-                    if os.path.getsize(path) < 4096:
+                    if not valid_completed_mp3(path):
                         continue
                     tags = ID3(path)
                     ids = []

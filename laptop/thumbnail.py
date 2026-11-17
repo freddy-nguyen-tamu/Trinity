@@ -221,7 +221,7 @@ def try_download(
             ydl_opts_no_ignore = {**ydl_opts, "ignoreerrors": False}
             with YoutubeDL(ydl_opts_no_ignore) as ydl:
                 info = ydl.extract_info(url, download=True)
-                tag_downloaded_mp3_with_youtube_url(
+                completed_path = tag_downloaded_mp3_with_youtube_url(
                     info=info,
                     ydl=ydl,
                     youtube_url=url,
@@ -229,6 +229,11 @@ def try_download(
                     started_at=started_at,
                     video_id=video_id,
                 )
+            if not completed_path:
+                # yt-dlp can exit successfully without a verified final MP3.
+                # Do not advance the playlist's durable download history.
+                print(f"Download produced no verified MP3: {video_id}")
+                return False
             return True
 
         except DownloadError as e:
