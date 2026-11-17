@@ -6,13 +6,13 @@ if os.environ.get("TRINITY_ENABLE_YTDLP_POT_PLUGIN", "").strip().lower() not in 
 import json
 import time
 import argparse
+from contextlib import contextmanager
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 from youtube_url_tag import (
     tag_downloaded_mp3_with_youtube_url, youtube_watch_url, recover_completed_mp3_ids,
 )
 from shared_history import load_set, save_set, flush_pending
-from playlist_scan import last_unprocessed_position, safe_to_stop
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "_working_downloads")
@@ -122,33 +122,56 @@ def is_private_or_unavailable(entry):
     return False
 
 
+class PlaylistFetchError(RuntimeError):
+    """Playlist metadata could not be fetched, including a later page."""
+
+
+@contextmanager
 def get_playlist_entries(playlist_url, use_cookies=False):
-    lazy = os.environ.get("TRINITY_LAZY_PLAYLIST", "0") == "1"
+    """Keep yt-dlp open while consuming playlist pages on demand.
+
+    `extract_info(process=False)` returns the extractor's raw entries iterator.
+    The old processed extraction and `list(entries)` both fetched *every*
+    playlist item before the 30-consecutive-match check could run.
+    """
+    stream = (os.environ.get("TRINITY_LAZY_PLAYLIST", "0") == "1"
+              or ALREADY_DOWNLOADED_STREAK_LIMIT != float("inf"))
     ydl_opts = {
         "extract_flat": True,
         "skip_download": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["web"],
-            }
-        },
+        "extractor_args": {"youtube": {"player_client": ["web"]}},
         "retries": 10,
         "extractor_retries": 10,
         "socket_timeout": 30,
+        "lazy_playlist": stream,
     }
     if use_cookies:
         ydl_opts.update(make_cookie_opts())
-    if lazy:
-        # Stream entries from YouTube, but enumerate the ENTIRE playlist.
-        # Capping at 200 silently misses newer IDs added farther down.
-        ydl_opts["lazy_playlist"] = True
 
     with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(playlist_url, download=False)
-        entries = list(info.get("entries") or [])
-    # Preserve every playlist position. Dropping unavailable/empty entries
-    # would falsely join two runs of known IDs into one consecutive streak.
-    return entries
+        try:
+            info = ydl.extract_info(playlist_url, download=False, process=False)
+            if not isinstance(info, dict) or info.get("entries") is None:
+                raise PlaylistFetchError("YouTube did not return playlist entries")
+            entries = info["entries"]
+            if not stream:
+                entries = list(entries)
+            total = len(entries) if not stream else info.get("playlist_count")
+        except Exception as exc:
+            raise PlaylistFetchError("Could not fetch playlist metadata") from exc
+
+        if stream:
+            print("Streaming playlist entries; fetching only as far as needed.")
+        elif total is not None:
+            print(f"Playlist has {total} entries (YouTube playlist order).")
+
+        def checked_entries():
+            try:
+                yield from entries
+            except Exception as exc:
+                raise PlaylistFetchError("Could not fetch the next playlist page") from exc
+
+        yield checked_entries(), total
 
 
 def try_download(
@@ -243,43 +266,16 @@ def write_failures(path, video_ids):
     os.replace(temp_path, path)
 
 
-def download_playlist(playlist_url, failures_json=None):
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    failed_video_ids = []
-    write_failures(failures_json, failed_video_ids)
-
-    history = load_history()
-    recovered = recover_completed_mp3_ids(
-        DOWNLOAD_DIR, os.path.join(BASE_DIR, "finished")
-    )
-    recovered_ids = set(recovered) - history
-    if recovered_ids:
-        # Durable local journal is fsynced before playlist processing starts.
-        # If syncing Google fails, these completed files remain locally
-        # recoverable and will not be downloaded again after restarting.
-        save_history(history | recovered_ids)
-        history.update(recovered_ids)
-        print(f"Recovered {len(recovered_ids)} completed tagged MP3(s) into local "
-              "pending download history.", flush=True)
+def process_playlist_entries(entries, total, history, failed_video_ids, failures_json):
+    """Stop on the thirtieth *consecutive* known ID, not after a full pre-scan."""
     last_history_sync = time.monotonic()
-    print(f"Loaded {len(history)} previously downloaded entries from {HISTORY_FILE}.")
-
-    print("Fetching playlist information...")
-    try:
-        entries = get_playlist_entries(playlist_url, use_cookies=True)
-    except Exception as e:
-        print(f"Playlist fetch failed with cookies: {e}")
-        print("Retrying playlist fetch without cookies...")
-        entries = get_playlist_entries(playlist_url, use_cookies=False)
-
-    print(f"Playlist has {len(entries)} entries (YouTube playlist order).")
-    last_unprocessed = last_unprocessed_position(entries, history)
-    print(f"Last unprocessed playlist position: {last_unprocessed or 'none'}; "
-          "30-match early stop cannot skip IDs farther down.")
-
     already_downloaded_streak = 0
 
     for index, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict):
+            print(f"Skipping playlist entry #{index}: no metadata")
+            already_downloaded_streak = 0
+            continue
         if is_private_or_unavailable(entry):
             title = entry.get("title") or f"video #{index}"
             print(f"Skipping private/unavailable video: {title}")
@@ -297,27 +293,22 @@ def download_playlist(playlist_url, failures_json=None):
         # Read new entries from other laptops during long-running playlists.
         # Throttling prevents excessive Sheets API requests.
         if time.monotonic() - last_history_sync >= 30:
-            history = load_history()
+            history.update(load_history())
             last_history_sync = time.monotonic()
 
         if video_id in history:
             print(f"Skipping already downloaded: {title}")
             already_downloaded_streak += 1
-            if safe_to_stop(already_downloaded_streak, ALREADY_DOWNLOADED_STREAK_LIMIT,
-                            index, last_unprocessed):
-                print(
-                    f"Reached {ALREADY_DOWNLOADED_STREAK_LIMIT} already-downloaded "
-                    "videos in a row; no later unprocessed IDs; stopping."
-                )
-                break
-            if already_downloaded_streak == ALREADY_DOWNLOADED_STREAK_LIMIT:
-                print(f"Reached {ALREADY_DOWNLOADED_STREAK_LIMIT} consecutive matches, "
-                      f"but an unprocessed ID exists at position {last_unprocessed}; "
-                      "continuing in playlist order.")
+            if already_downloaded_streak >= ALREADY_DOWNLOADED_STREAK_LIMIT:
+                print(f"Reached {ALREADY_DOWNLOADED_STREAK_LIMIT} consecutive "
+                      "already-downloaded videos at playlist position "
+                      f"{index}; stopping without fetching older entries.")
+                return
             continue
 
         already_downloaded_streak = 0
-        print(f"\n[{index}/{len(entries)}] Processing: {title}")
+        progress = f"{index}/{total}" if total is not None else str(index)
+        print(f"\n[{progress}] Processing: {title}")
 
         success = False
 
@@ -377,7 +368,38 @@ def download_playlist(playlist_url, failures_json=None):
             # the explicit failures already observed in this run.
             write_failures(failures_json, failed_video_ids)
 
-    flush_pending()  # One quota-friendly Sheets upload for the entire playlist.
+
+
+def download_playlist(playlist_url, failures_json=None):
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    failed_video_ids = []
+    write_failures(failures_json, failed_video_ids)
+
+    history = load_history()
+    recovered = recover_completed_mp3_ids(
+        DOWNLOAD_DIR, os.path.join(BASE_DIR, "finished")
+    )
+    recovered_ids = set(recovered) - history
+    if recovered_ids:
+        save_history(history | recovered_ids)
+        history.update(recovered_ids)
+        print(f"Recovered {len(recovered_ids)} completed tagged MP3(s) into local "
+              "pending download history.", flush=True)
+    print(f"Loaded {len(history)} previously downloaded entries from {HISTORY_FILE}.")
+
+    print("Fetching playlist information...")
+    try:
+        with get_playlist_entries(playlist_url, use_cookies=True) as (entries, total):
+            process_playlist_entries(entries, total, history, failed_video_ids, failures_json)
+    except PlaylistFetchError as exc:
+        # A later page may fail even after some successful downloads. Their
+        # history is already durable, so restarting from the top is safe.
+        print(f"Playlist fetch with cookies failed: {exc}")
+        print("Retrying playlist scan without cookies...")
+        with get_playlist_entries(playlist_url, use_cookies=False) as (entries, total):
+            process_playlist_entries(entries, total, history, failed_video_ids, failures_json)
+
+    flush_pending()  # One quota-friendly Sheets upload for the entire scan.
     print("\nAll done!")
 
 
