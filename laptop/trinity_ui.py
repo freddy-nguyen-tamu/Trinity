@@ -1,3 +1,4 @@
+
 """Compact, dependency-free desktop launcher for Trinity's existing pipeline."""
 
 from __future__ import annotations
@@ -137,6 +138,161 @@ def _python_command():
         if found and "WindowsApps" not in found:
             return [found]
     raise FileNotFoundError("Python is required for Trinity's companion scripts.")
+
+
+def _app_icon_path():
+    """Locate the real Trinity icon in source and packaged UI builds.
+
+    PyInstaller 6 stores one-folder bundled data under _internal (sys._MEIPASS).
+    Prefer it, but also support unbundled Python and older build layouts.
+    """
+    candidates = [Path(getattr(sys, "_MEIPASS", APP_DIR)), APP_DIR]
+    candidates.extend(list(APP_DIR.parents)[:4])
+    for folder in candidates:
+        icon = folder / "trinity.ico"
+        if icon.is_file():
+            return icon
+    return None
+
+
+def _set_windows_window_icon(window, icon_path):
+    """Use the original multi-size Windows icon for both large and small UI.
+
+    Tk's generated 32x32 PhotoImage used to override the real EXE icon and
+    looked blurry in the title bar/taskbar. Load native HICONs at the monitor's
+    system icon sizes instead, preserving high-DPI ICO frames when available.
+    The original Trinity executable's resource is the fallback if the asset
+    is not separately present. No website favicon is used.
+    """
+    if os.name != "nt":
+        return ()
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetParent.argtypes = [wintypes.HWND]
+        user32.GetParent.restype = wintypes.HWND
+        user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                        ctypes.c_size_t, ctypes.c_ssize_t]
+        user32.SendMessageW.restype = ctypes.c_ssize_t
+        user32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR,
+                                      wintypes.UINT, ctypes.c_int, ctypes.c_int,
+                                      wintypes.UINT]
+        user32.LoadImageW.restype = wintypes.HANDLE
+
+        window.update_idletasks()
+        tk_handle = window.winfo_id()
+        # Tk has a native wrapper HWND around its client HWND.
+        hwnd = user32.GetParent(tk_handle) or tk_handle
+        dpi = 96
+        if hasattr(user32, "GetDpiForWindow"):
+            user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+            user32.GetDpiForWindow.restype = wintypes.UINT
+            dpi = user32.GetDpiForWindow(hwnd) or dpi
+
+        def metrics(x, y):
+            if hasattr(user32, "GetSystemMetricsForDpi"):
+                user32.GetSystemMetricsForDpi.argtypes = [ctypes.c_int, wintypes.UINT]
+                user32.GetSystemMetricsForDpi.restype = ctypes.c_int
+                return (max(1, user32.GetSystemMetricsForDpi(x, dpi)),
+                        max(1, user32.GetSystemMetricsForDpi(y, dpi)))
+            user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+            user32.GetSystemMetrics.restype = ctypes.c_int
+            return (max(1, user32.GetSystemMetrics(x)),
+                    max(1, user32.GetSystemMetrics(y)))
+
+        icons = []
+        if icon_path is not None:
+            # Give any Tk child dialogs the same real icon, never the
+            # 32x32, hand-rendered three-bar placeholder.
+            try:
+                window.iconbitmap(default=str(icon_path))
+            except Exception:
+                pass
+            for dimensions in (metrics(11, 12), metrics(49, 50)):
+                handle = user32.LoadImageW(
+                    None, str(icon_path), 1, *dimensions, 0x0010  # LR_LOADFROMFILE
+                )
+                icons.append(int(handle) if handle else 0)
+        else:
+            icons = [0, 0]
+
+        if not all(icons) and getattr(sys, "frozen", False):
+            shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+            shell32.ExtractIconExW.argtypes = [wintypes.LPCWSTR, ctypes.c_int,
+                                               ctypes.POINTER(wintypes.HANDLE),
+                                               ctypes.POINTER(wintypes.HANDLE),
+                                               wintypes.UINT]
+            shell32.ExtractIconExW.restype = wintypes.UINT
+            user32.DestroyIcon.argtypes = [wintypes.HANDLE]
+            user32.DestroyIcon.restype = wintypes.BOOL
+            large, small = wintypes.HANDLE(), wintypes.HANDLE()
+            if shell32.ExtractIconExW(sys.executable, 0,
+                                      ctypes.byref(large), ctypes.byref(small), 1):
+                for index, extracted in enumerate((large.value, small.value)):
+                    if not icons[index] and extracted:
+                        icons[index] = int(extracted)
+                    elif extracted:
+                        user32.DestroyIcon(extracted)
+
+        # ICON_BIG=1, ICON_SMALL=0. Win32 uses the two source resolutions
+        # directly rather than stretching a Python-generated 32px bitmap.
+        for index, icon_type in ((0, 1), (1, 0)):
+            if icons[index]:
+                user32.SendMessageW(hwnd, 0x0080, icon_type, icons[index])
+        return tuple(icon for icon in icons if icon)
+    except Exception:
+        # Icon setup must never prevent a functional Trinity UI from opening.
+        return ()
+
+
+def _release_windows_icons(handles):
+    if os.name != "nt" or not handles:
+        return
+    try:
+        import ctypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.DestroyIcon.argtypes = [ctypes.c_void_p]
+        for handle in set(handles):
+            user32.DestroyIcon(handle)
+    except Exception:
+        pass
+
+
+def _trimmer_python_command():
+    """Use the interpreter behind `python mp3trimmer.py` for the Qt editor.
+
+    Windows' `py -3` launcher may select a *different* Python installation
+    without PyQt5. The main pipeline may still use its own interpreter; the
+    editor must match the already-working `python mp3trimmer.py` command.
+    Resolve only when clicked so startup remains fast.
+    """
+    explicit = os.environ.get("TRINITY_TRIMMER_PYTHON", "").strip()
+    if explicit:
+        interpreter = Path(explicit).expanduser()
+        if not interpreter.is_file():
+            raise FileNotFoundError(
+                f"TRINITY_TRIMMER_PYTHON does not exist: {interpreter}"
+            )
+        return [str(interpreter)]
+    if not getattr(sys, "frozen", False):
+        return [sys.executable]
+    # `python` is deliberately first here, NOT `py -3`. The latter caused
+    # ModuleNotFoundError: PyQt5 when launching from bundled Trinity.exe.
+    installed = shutil.which("python")
+    if installed:
+        return [installed]
+    return _python_command()
+
+
+def _trimmer_command():
+    """Run the standalone Qt editor from laptop/, independent of the pipeline."""
+    project = _project_dir()
+    script = project / "mp3trimmer.py"
+    if not script.is_file():
+        raise FileNotFoundError(f"MP3 Trimmer was not found: {script}")
+    return [*_trimmer_python_command(), str(script)], project
 
 
 def run_backend(*, output_path=None, on_output=None, on_process=None, stop_file=None, **options):
@@ -430,6 +586,7 @@ def launch_ui(run_pipeline):
             self._close_started = None
             self._backend_process = None
             self._process_job = None
+            self._trimmer_process = None
             self._process_lock = threading.Lock()
             self._stop_file = None
             self.values = {
@@ -444,12 +601,19 @@ def launch_ui(run_pipeline):
             self._worker_failure = None
             self._display_chars = 0
 
-            icon_image = tk.PhotoImage(width=32, height=32, master=self.root)
-            icon_image.put(bg, to=(0, 0, 32, 32))
-            for left, top in ((5, 11), (13, 5), (21, 9)):
-                icon_image.put(ink, to=(left, top, left + 6, 27))
-            self.root.iconphoto(True, icon_image)
-            self.native_icon = icon_image
+            # Use the original multi-resolution Windows app icon from the
+            # compiled executable or laptop/trinity.ico. Do not replace it
+            # with a 32x32 PhotoImage or a website favicon.
+            self.native_icons = _set_windows_window_icon(
+                self.root, _app_icon_path()
+            )
+            if self.native_icons:
+                self.root.bind(
+                    "<Destroy>",
+                    lambda event: _release_windows_icons(self.native_icons)
+                    if event.widget is self.root else None,
+                    add="+",
+                )
 
             wrapper = tk.Frame(self.root, bg=bg)
             wrapper.pack(fill="both", expand=True, padx=25, pady=(22, 20))
@@ -474,14 +638,27 @@ def launch_ui(run_pipeline):
             ):
                 self.make_option(choices, key, caption, bg, ink, line, tk)
 
+            # Keep the pipeline's primary action prominent and offer the
+            # independent editor alongside it, without changing the layout
+            # of the existing options or terminal. Both fit on narrow windows.
+            actions = tk.Frame(wrapper, bg=bg)
+            actions.pack(fill="x", pady=(15, 16))
             self.start_button = tk.Button(
-                wrapper, text="START", bg=ink, fg=paper,
+                actions, text="START", bg=ink, fg=paper,
                 activebackground="#343434", activeforeground=paper,
                 disabledforeground="#dddddd", borderwidth=0, relief="flat",
                 font=("Segoe UI", 11, "bold"), cursor="hand2",
                 command=self.start, takefocus=True,
             )
-            self.start_button.pack(fill="x", ipady=9, pady=(15, 16))
+            self.start_button.pack(side="left", fill="x", expand=True, ipady=9)
+            self.trimmer_button = tk.Button(
+                actions, text="MP3 TRIMMER", bg=paper, fg=ink,
+                activebackground="#e9e9e6", activeforeground=ink,
+                borderwidth=1, relief="solid", highlightthickness=0,
+                font=("Segoe UI", 10, "bold"), cursor="hand2",
+                command=self.launch_trimmer, takefocus=True,
+            )
+            self.trimmer_button.pack(side="left", padx=(10, 0), ipady=8)
 
             console = tk.Frame(wrapper, bg=ink, highlightthickness=0, bd=0)
             console.pack(fill="both", expand=True)
@@ -577,6 +754,64 @@ def launch_ui(run_pipeline):
                 messagebox.showerror("Trinity", f"Could not save preferences:\n{error}",
                                      parent=self.root)
                 return False
+
+        def launch_trimmer(self):
+            """Open the Qt editor independently of the running pipeline.
+
+            Do not register it in the pipeline's shutdown Job Object: closing
+            Trinity must not kill an editor where unsaved crops may remain.
+            """
+            if self.closing or self.closed:
+                return
+            if self._trimmer_process is not None and self._trimmer_process.poll() is None:
+                messagebox.showinfo(
+                    "Trinity", "MP3 Trimmer is already running.", parent=self.root
+                )
+                return
+            try:
+                command, project = _trimmer_command()
+                # PyInstaller's windowed launcher has no visible stderr. Keep
+                # editor errors separate from the pipeline's live terminal.
+                error_log = SETTINGS_FILE.with_name("mp3trimmer_launch.log")
+                error_log.parent.mkdir(parents=True, exist_ok=True)
+                with error_log.open("wb") as output:
+                    process = subprocess.Popen(
+                        command, cwd=project, stdin=subprocess.DEVNULL,
+                        stdout=output, stderr=subprocess.STDOUT,
+                        **({"creationflags": subprocess.CREATE_NO_WINDOW |
+                            subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+                           else {"start_new_session": True}),
+                    )
+            except (OSError, ValueError) as error:
+                messagebox.showerror(
+                    "MP3 Trimmer", f"Could not launch MP3 Trimmer:\n{error}",
+                    parent=self.root,
+                )
+                return
+            self._trimmer_process = process
+            self.root.after(1000, self._monitor_trimmer, process, error_log)
+
+        def _monitor_trimmer(self, process, error_log):
+            if self.closed or self.closing:
+                return
+            code = process.poll()
+            if code is None:
+                self.root.after(1000, self._monitor_trimmer, process, error_log)
+                return
+            if self._trimmer_process is process:
+                self._trimmer_process = None
+            if code != 0:
+                try:
+                    details = error_log.read_text(encoding="utf-8", errors="replace")[-2500:].strip()
+                except OSError:
+                    details = ""
+                messagebox.showerror(
+                    "MP3 Trimmer",
+                    f"MP3 Trimmer exited with code {code}." +
+                    (f"\n\n{details}" if details else
+                     "\n\nCheck that PyQt5, NumPy, Mutagen and FFmpeg are installed."),
+                    parent=self.root,
+                )
 
         def start(self):
             if self.running or self.closing or not self.persist():

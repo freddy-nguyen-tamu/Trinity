@@ -1,3 +1,4 @@
+
 import argparse
 import datetime
 import json
@@ -301,6 +302,37 @@ def build_drive_service(service_account_json):
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
 
+def _oauth_refresh_permanently_invalid(error):
+    """Reauthorize only if Google explicitly rejects the saved grant."""
+    from google.auth.exceptions import RefreshError
+
+    return isinstance(error, RefreshError) and (
+        "invalid_grant" in str(error).lower()
+        or "token has been expired or revoked" in str(error).lower()
+    )
+
+
+def _save_oauth_token_atomic(token_path, credentials):
+    """Never truncate the last good refresh token during an interrupted save."""
+    token_path = Path(token_path)
+    temp_path = token_path.with_name(token_path.name + f".{os.getpid()}.tmp")
+    try:
+        def write_and_replace():
+            with temp_path.open("w", encoding="utf-8") as handle:
+                handle.write(credentials.to_json())
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, token_path)
+
+        retry_file_operation(f"saving Google Drive login {token_path}", write_and_replace)
+        try:
+            token_path.chmod(0o600)
+        except OSError:
+            pass
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 def build_oauth_drive_service(oauth_client_json, oauth_token_json):
     try:
         from google.auth.transport.requests import Request
@@ -322,18 +354,39 @@ def build_oauth_drive_service(oauth_client_json, oauth_token_json):
         raise FileNotFoundError(f"OAuth client JSON does not exist: {client_path}")
 
     credentials = None
-    if token_path.exists():
-        credentials = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+    if token_path.is_file():
+        try:
+            credentials = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+        except (ValueError, KeyError, TypeError) as error:
+            print("Saved Google Drive credentials are invalid; browser authorization "
+                  f"is required: {error}", flush=True)
+        if credentials and not set(SCOPES).issubset(set(credentials.scopes or [])):
+            print("Google Drive scopes changed; browser approval is required.", flush=True)
+            credentials = None
 
-    if credentials and credentials.expired and credentials.refresh_token:
-        credentials.refresh(Request())
+    if credentials and not credentials.valid and credentials.refresh_token:
+        try:
+            credentials.refresh(Request())
+        except Exception as error:
+            if _oauth_refresh_permanently_invalid(error):
+                print("Google revoked or expired the saved Drive grant; "
+                      "browser sign-in is required.", flush=True)
+                credentials = None
+            else:
+                raise RuntimeError(
+                    "Google Drive automatic refresh failed, but the saved login "
+                    "was PRESERVED. No new sign-in was requested. Retry when "
+                    "Google or network access is restored. Error: " + str(error)
+                ) from error
 
-    if not credentials or not credentials.valid:
+    if not credentials or not credentials.valid or not credentials.refresh_token:
         flow = InstalledAppFlow.from_client_secrets_file(str(client_path), SCOPES)
         print("Starting Google OAuth local callback server...", flush=True)
         credentials = flow.run_local_server(
             port=0,
             open_browser=False,
+            access_type="offline",
+            prompt="select_account consent",
             authorization_prompt_message=(
                 "\n"
                 "GOOGLE DRIVE OAUTH LOGIN URL\n"
@@ -344,12 +397,14 @@ def build_oauth_drive_service(oauth_client_json, oauth_token_json):
                 "Waiting for Google to redirect back to this computer...\n"
             ),
         )
+        if not credentials.refresh_token:
+            raise RuntimeError(
+                "Google did not issue an offline Drive refresh token. "
+                "Check the Google OAuth consent settings."
+            )
 
-    retry_file_operation(
-        f"writing OAuth token {token_path}",
-        lambda: token_path.write_text(credentials.to_json(), encoding="utf-8"),
-    )
-
+    # Keep the existing credentials until an atomic replacement succeeds.
+    _save_oauth_token_atomic(token_path, credentials)
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
 
@@ -712,5 +767,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

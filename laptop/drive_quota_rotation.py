@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """Verified Drive uploads with browser account rotation and crash-safe Sheet history.
 
@@ -277,6 +276,20 @@ def close_drive_connection(service):
             break
 
 
+def _oauth_refresh_permanently_invalid(error):
+    """Only invalid_grant is evidence that browser reauthorization is needed.
+
+    Network errors, API outages, and many misconfigurations must not trigger
+    repeated browser logins or destroy a usable cached refresh token.
+    """
+    from google.auth.exceptions import RefreshError
+
+    return isinstance(error, RefreshError) and (
+        'invalid_grant' in str(error).lower()
+        or 'token has been expired or revoked' in str(error).lower()
+    )
+
+
 def authenticate(force=False, token_path=None, client_json=None):
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
@@ -287,23 +300,43 @@ def authenticate(force=False, token_path=None, client_json=None):
     if not force and token_path.is_file():
         try:
             creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-            if not set(SCOPES).issubset(set(creds.scopes or [])):
-                creds = None
-            if creds and expired_and_refreshable(creds):
-                creds.refresh(Request())
-        except Exception as error:
-            print('Cached Drive login needs reauthorization: ' + str(error), flush=True)
+        except (ValueError, KeyError, TypeError) as error:
+            print('Saved Drive credentials are unreadable; browser sign-in is required: '
+                  + str(error), flush=True)
+        if creds and not set(SCOPES).issubset(set(creds.scopes or [])):
+            print('Drive access scope has changed; browser approval is required.', flush=True)
             creds = None
-    if not creds or not creds.valid:
+        if creds and not creds.valid and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception as error:
+                if _oauth_refresh_permanently_invalid(error):
+                    print('Google rejected the saved Drive refresh token; browser '
+                          'reauthorization is required.', flush=True)
+                    creds = None
+                else:
+                    raise RuntimeError(
+                        'Drive automatic token refresh failed temporarily or due to '
+                        'a configuration problem. Saved login was PRESERVED; '
+                        'no browser reauthorization was attempted. Try again '
+                        'when Google/network access is restored. Error: '
+                        + str(error)
+                    ) from error
+    # A cached access token alone is not a persistent login. Obtain an offline
+    # refresh token once, rather than prompting again on every later run.
+    if not creds or not creds.valid or not creds.refresh_token:
         config = oauth_app(client_json)
         flow = InstalledAppFlow.from_client_config(config, SCOPES)
         print('Select a Google account with AVAILABLE storage and Editor access to the same Drive folder.', flush=True)
         print('A browser sign-in should open; the authorization URL is also printed below.', flush=True)
         creds = flow.run_local_server(
             port=0, open_browser=True,
-            prompt='select_account consent',
+            access_type='offline', prompt='select_account consent',
             authorization_prompt_message='Google Drive account-selection URL: {url}',
         )
+        if not creds.refresh_token:
+            raise RuntimeError('Google did not issue a Drive offline refresh token. '
+                               'Check the OAuth client and consent configuration.')
     # Do not cache the newly selected account until its identity and folder
     # permissions have been verified by the caller.
     service = new_drive_service(creds)

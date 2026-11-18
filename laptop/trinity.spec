@@ -6,7 +6,9 @@ a = Analysis(
     ['trinity_ui.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    # The icon in the PE resources does not automatically become a Tk icon.
+    # Bundle the original .ico so the runtime window can load it directly.
+    datas=[('trinity.ico', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

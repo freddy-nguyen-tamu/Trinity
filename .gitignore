@@ -1,3 +1,4 @@
+
 =======================================================
 
 # Runtime download/output folders
@@ -60,6 +61,9 @@ _pending_sheet_history_*.json.tmp
 laptop/_drive_storage_full.json
 laptop/_drive_storage_full.json.tmp
 laptop/_google_drive_oauth_token.json.tmp
+# Atomic OAuth cache writes must never expose refresh tokens to Git
+laptop/_google_sheets_history_token.json.*.tmp
+laptop/_google_drive_oauth_token.json.*.tmp
 laptop/trinity.py.backup-pre-quota-*
 
 # Durable per-file Drive idempotency IDs; required across timed-out retries.

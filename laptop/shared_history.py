@@ -1,4 +1,3 @@
-
 """Trinity's shared Google Sheets history store.
 
 All devices signing into the SAME Google account discover one spreadsheet
@@ -102,6 +101,35 @@ def _config_id():
     return value
 
 
+def _oauth_refresh_permanently_invalid(error):
+    """Only a revoked/expired refresh token justifies browser reauthorization."""
+    from google.auth.exceptions import RefreshError
+
+    return isinstance(error, RefreshError) and (
+        'invalid_grant' in str(error).lower()
+        or 'token has been expired or revoked' in str(error).lower()
+    )
+
+
+def _atomic_save_oauth_token(path, credentials):
+    """Persist refreshed credentials without truncating the last good token."""
+    path = Path(path)
+    temp = path.with_name(path.name + f'.{os.getpid()}.tmp')
+    try:
+        with temp.open('w', encoding='utf-8') as handle:
+            handle.write(credentials.to_json())
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    finally:
+        if temp.exists():
+            temp.unlink()
+
+
 def _credentials():
     """Use Downloads/credentials.json automatically; also accept Trinity keys."""
     service_env = os.environ.get("TRINITY_HISTORY_SERVICE_ACCOUNT_JSON", "").strip()
@@ -173,23 +201,38 @@ def _credentials():
     if token_path.is_file():
         try:
             auth = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-            if not set(SCOPES).issubset(set(auth.scopes or [])):
-                auth = None
-        except (ValueError, KeyError, json.JSONDecodeError):
+        except (ValueError, KeyError, json.JSONDecodeError) as error:
+            print('Saved Sheets credentials are unreadable; browser sign-in '
+                  'is required: ' + str(error), flush=True)
+        if auth and not set(SCOPES).issubset(set(auth.scopes or [])):
+            print('Sheets history OAuth scopes changed; browser approval '
+                  'is required.', flush=True)
             auth = None
-    if auth and auth.expired and auth.refresh_token:
+    if auth and not auth.valid and auth.refresh_token:
         try:
             auth.refresh(Request())
-        except Exception:
-            auth = None
-    if not auth or not auth.valid:
+        except Exception as error:
+            if _oauth_refresh_permanently_invalid(error):
+                print('Google rejected the Sheets history refresh token; '
+                      'browser reauthorization is required.', flush=True)
+                auth = None
+            else:
+                raise RuntimeError(
+                    'Sheets automatic token refresh failed temporarily or due '
+                    'to a configuration problem. Saved login was PRESERVED; '
+                    'not opening a new browser login. No Sheets history '
+                    'operation was attempted. Error: ' + str(error)
+                ) from error
+    if not auth or not auth.valid or not auth.refresh_token:
         flow = InstalledAppFlow.from_client_secrets_file(str(client), SCOPES)
-        auth = flow.run_local_server(port=0, open_browser=True)
-    token_path.write_text(auth.to_json(), encoding="utf-8")
-    try:
-        token_path.chmod(0o600)
-    except OSError:
-        pass
+        auth = flow.run_local_server(
+            port=0, open_browser=True, access_type='offline',
+            prompt='select_account consent'
+        )
+        if not auth.refresh_token:
+            raise RuntimeError('Google did not issue a Sheets offline refresh '
+                               'token. Check OAuth client and consent settings.')
+    _atomic_save_oauth_token(token_path, auth)
     return auth
 
 
