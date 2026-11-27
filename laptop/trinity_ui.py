@@ -1,4 +1,3 @@
-
 """Compact, dependency-free desktop launcher for Trinity's existing pipeline."""
 
 from __future__ import annotations
@@ -129,14 +128,18 @@ def _python_command():
         if not path.is_file():
             raise FileNotFoundError(f"TRINITY_PYTHON_EXE not found: {path}")
         return [str(path)]
+    # The backend uses yt-dlp as a Python module. Prefer the same `python`
+    # selected by a normal CMD prompt; `py -3` can refer to another Python
+    # installation, so `pip install -U yt-dlp` may otherwise update the wrong
+    # environment. The UI's updater uses this *same* command.
+    for name in ("python", "python3"):
+        found = shutil.which(name)
+        if found and "windowsapps" not in found.lower():
+            return [found]
     if os.name == "nt":
         launcher = shutil.which("py")
         if launcher:
             return [launcher, "-3"]
-    for name in ("python", "python3"):
-        found = shutil.which(name)
-        if found and "WindowsApps" not in found:
-            return [found]
     raise FileNotFoundError("Python is required for Trinity's companion scripts.")
 
 
@@ -293,6 +296,16 @@ def _trimmer_command():
     if not script.is_file():
         raise FileNotFoundError(f"MP3 Trimmer was not found: {script}")
     return [*_trimmer_python_command(), str(script)], project
+
+
+def _yt_dlp_update_command():
+    """Upgrade yt-dlp and its matched JS solver in the backend's interpreter.
+
+    `yt-dlp[default]` includes the upstream `yt-dlp-ejs` dependency, which is
+    required for current YouTube player challenges. A bare `pip install -U
+    yt-dlp` may leave the separately packaged JS solver out of date.
+    """
+    return [*_python_command(), "-m", "pip", "install", "-U", "yt-dlp[default]"]
 
 
 def run_backend(*, output_path=None, on_output=None, on_process=None, stop_file=None, **options):
@@ -587,6 +600,8 @@ def launch_ui(run_pipeline):
             self._backend_process = None
             self._process_job = None
             self._trimmer_process = None
+            self.updating_yt_dlp = False
+            self._yt_dlp_update_result = None
             self._process_lock = threading.Lock()
             self._stop_file = None
             self.values = {
@@ -658,7 +673,15 @@ def launch_ui(run_pipeline):
                 font=("Segoe UI", 10, "bold"), cursor="hand2",
                 command=self.launch_trimmer, takefocus=True,
             )
-            self.trimmer_button.pack(side="left", padx=(10, 0), ipady=8)
+            self.trimmer_button.pack(side="left", padx=(8, 0), ipady=8)
+            self.update_yt_dlp_button = tk.Button(
+                actions, text="UPDATE yt-dlp", bg=paper, fg=ink,
+                activebackground="#e9e9e6", activeforeground=ink,
+                disabledforeground="#888888", borderwidth=1, relief="solid",
+                highlightthickness=0, font=("Segoe UI", 9, "bold"),
+                cursor="hand2", command=self.update_yt_dlp, takefocus=True,
+            )
+            self.update_yt_dlp_button.pack(side="left", padx=(8, 0), ipady=8)
 
             console = tk.Frame(wrapper, bg=ink, highlightthickness=0, bd=0)
             console.pack(fill="both", expand=True)
@@ -722,7 +745,7 @@ def launch_ui(run_pipeline):
             tk.Frame(parent, bg=line, height=1).pack(fill="x")
 
         def toggle(self, key):
-            if self.running:
+            if self.running or self.updating_yt_dlp:
                 return
             active = not self.values[key].get()
             self.values[key].set(active)
@@ -813,8 +836,99 @@ def launch_ui(run_pipeline):
                     parent=self.root,
                 )
 
+        def update_yt_dlp(self):
+            """Run pip on the backend's Python, never in the Tk event loop.
+
+            An update during a running downloader could replace the package
+            underneath imports or a future child process. Require an idle
+            pipeline, preserve the complete result in the console log, and
+            display failure diagnostics instead of claiming an update succeeded.
+            """
+            if self.closed or self.closing or self.updating_yt_dlp:
+                return
+            if self.running or another_backend_running():
+                messagebox.showwarning(
+                    "Trinity", "Finish the current Trinity download before "
+                    "updating yt-dlp.", parent=self.root,
+                )
+                return
+            try:
+                command = _yt_dlp_update_command()
+            except (OSError, ValueError) as error:
+                messagebox.showerror(
+                    "Update yt-dlp", f"Could not find the downloader's Python:\n{error}",
+                    parent=self.root,
+                )
+                return
+            self.updating_yt_dlp = True
+            self._yt_dlp_update_result = None
+            self.start_button.configure(state="disabled")
+            self.update_yt_dlp_button.configure(text="UPDATING…", state="disabled")
+            self._write_update_output(
+                "\n[Updating yt-dlp + its JS solver in the Python used by Trinity]\n"
+                f"Python: {' '.join(command[:2]) if len(command) > 1 and command[1] == '-3' else command[0]}\n"
+                f"Command: {' '.join(command)}\n"
+            )
+            threading.Thread(
+                target=self._yt_dlp_update_worker, args=(command,),
+                daemon=True, name="TrinityYtDlpUpdate",
+            ).start()
+
+        def _write_update_output(self, value):
+            # This is only called from the Tk thread when the pipeline is idle.
+            # Preserve the full log for Copy All without streaming pip output
+            # through a Tk queue or expensive line-by-line UI updates.
+            try:
+                _TERMINAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+                with _TERMINAL_FILE.open("ab", buffering=0) as sink:
+                    sink.write(value.encode("utf-8", "replace"))
+            except OSError:
+                pass
+            self.append_visible(value[-_MAX_BATCH:] if len(value) > _MAX_BATCH else value)
+
+        def _yt_dlp_update_worker(self, command):
+            """Only write a result flag here; all Tk calls happen on Tk thread."""
+            try:
+                result = subprocess.run(
+                    command, cwd=_project_dir(), stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    encoding="utf-8", errors="replace", check=False,
+                    **({"creationflags": subprocess.CREATE_NO_WINDOW}
+                       if os.name == "nt" else {}),
+                )
+                output = result.stdout or ""
+                self._yt_dlp_update_result = (result.returncode, output)
+            except Exception as error:
+                self._yt_dlp_update_result = (None, f"{type(error).__name__}: {error}")
+
+        def _complete_yt_dlp_update(self):
+            result = self._yt_dlp_update_result
+            if not self.updating_yt_dlp or result is None:
+                return
+            self.updating_yt_dlp = False
+            self._yt_dlp_update_result = None
+            code, output = result
+            if output:
+                # The terminal is bounded; all output is still kept on disk.
+                self._write_update_output(output)
+            self._write_update_output(
+                "\n[yt-dlp update completed successfully]\n" if code == 0
+                else f"\n[yt-dlp update failed: {code}]\n"
+            )
+            self.update_yt_dlp_button.configure(
+                text="UPDATE yt-dlp", state="normal"
+            )
+            self.start_button.configure(state="normal")
+            if code != 0:
+                messagebox.showerror(
+                    "Update yt-dlp",
+                    "yt-dlp could not be updated in Trinity's Python environment."
+                    "\n\n" + (output[-1800:].strip() or "Check the terminal for details."),
+                    parent=self.root,
+                )
+
         def start(self):
-            if self.running or self.closing or not self.persist():
+            if self.running or self.updating_yt_dlp or self.closing or not self.persist():
                 return
             if another_backend_running():
                 messagebox.showwarning(
@@ -921,6 +1035,7 @@ def launch_ui(run_pipeline):
         def drain_output(self):
             if self.closed:
                 return
+            self._complete_yt_dlp_update()
             if self._reader is not None:
                 try:
                     # Never read more than a small batch per redraw. When a
@@ -1053,6 +1168,12 @@ def launch_ui(run_pipeline):
         def close(self):
             if self.closing or self.closed:
                 return
+            if self.updating_yt_dlp:
+                messagebox.showinfo(
+                    "Trinity", "The yt-dlp update is still running. "
+                    "Close Trinity after it finishes.", parent=self.root,
+                )
+                return
             # Failure to save a checkbox must never strand active processes
             # or block cancellation behind a modal dialog.
             try:
@@ -1079,3 +1200,4 @@ def launch_ui(run_pipeline):
 
 if __name__ == "__main__":
     launch_ui(run_backend)
+

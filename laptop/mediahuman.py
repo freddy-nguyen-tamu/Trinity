@@ -1,14 +1,16 @@
-
 import os
 if os.environ.get("TRINITY_ENABLE_YTDLP_POT_PLUGIN", "").strip().lower() not in {"1", "true", "yes", "on"}:
     os.environ.setdefault("YTDLP_NO_PLUGINS", "1")
 
 import json
+import sys
 import time
 import argparse
 from contextlib import contextmanager
 import re
 from yt_dlp import YoutubeDL
+from yt_dlp.version import __version__ as YTDLP_VERSION
+import yt_dlp
 from yt_dlp.utils import DownloadError
 from youtube_url_tag import (
     tag_downloaded_mp3_with_youtube_url, youtube_watch_url, recover_completed_mp3_ids,
@@ -69,8 +71,10 @@ def make_cookie_opts():
 
 def make_common_ydl_opts(use_cookies=False, video_download=False, player_clients=None):
     opts = {
-        # Python API format (dict, not list)
-        "js_runtimes": {"node": {}},
+        # Use yt-dlp's supported default JS runtime (Deno is available on
+        # this installation). Forcing Node here broke the fallback when only
+        # Deno was installed. The matched EJS solver is installed alongside
+        # yt-dlp by Trinity's updater; GitHub remains a permitted fallback.
         "remote_components": ["ejs:github"],
 
         # retry/network hardening
@@ -361,6 +365,10 @@ def process_video_entries(video_entries, count, history, streak_limit):
 
 def download_playlist(playlist_url, failed_ids=None):
     """Download only the needed entries and retain history idempotency."""
+    # Diagnose multiple Windows Python installations without guessing: the
+    # interactive CMD yt-dlp may be different from Trinity's bundled launcher.
+    print(f"Trinity downloader: yt-dlp {YTDLP_VERSION} from {yt_dlp.__file__}; "
+          f"Python: {sys.executable}", flush=True)
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     history = load_history()
     recovered = recover_completed_mp3_ids(
@@ -409,3 +417,4 @@ if __name__ == "__main__":
             parser.error("Invalid thumbnail failure manifest")
         ids = list(dict.fromkeys(ids))
     download_playlist(PLAYLIST_URL, failed_ids=ids)
+

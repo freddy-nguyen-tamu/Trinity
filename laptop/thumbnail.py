@@ -1,13 +1,15 @@
-
 import os
 if os.environ.get("TRINITY_ENABLE_YTDLP_POT_PLUGIN", "").strip().lower() not in {"1", "true", "yes", "on"}:
     os.environ.setdefault("YTDLP_NO_PLUGINS", "1")
 
 import json
+import sys
 import time
 import argparse
 from contextlib import contextmanager
 from yt_dlp import YoutubeDL
+from yt_dlp.version import __version__ as YTDLP_VERSION
+import yt_dlp
 from yt_dlp.utils import DownloadError
 from youtube_url_tag import (
     tag_downloaded_mp3_with_youtube_url, youtube_watch_url, recover_completed_mp3_ids,
@@ -376,6 +378,10 @@ def process_playlist_entries(entries, total, history, failed_video_ids, failures
 
 
 def download_playlist(playlist_url, failures_json=None):
+    # Diagnose multiple Windows Python installations without guessing: the
+    # interactive CMD yt-dlp may be different from Trinity's bundled launcher.
+    print(f"Trinity downloader: yt-dlp {YTDLP_VERSION} from {yt_dlp.__file__}; "
+          f"Python: {sys.executable}", flush=True)
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     failed_video_ids = []
     write_failures(failures_json, failed_video_ids)
@@ -413,3 +419,4 @@ if __name__ == "__main__":
     parser.add_argument("--failures-json", default=None)
     arguments = parser.parse_args()
     download_playlist(PLAYLIST_URL, failures_json=arguments.failures_json)
+
