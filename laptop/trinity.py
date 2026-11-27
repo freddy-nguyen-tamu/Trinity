@@ -1,5 +1,3 @@
-
-
 import datetime
 from contextlib import contextmanager
 import json
@@ -1121,6 +1119,104 @@ def load_upload_summary(downloaded_paths):
     }
 
 
+_LINGUA_READY = False
+
+
+def _ensure_lyrics_language_detector():
+    """Repair missing lyrics-detector dependency in the *backend's* Python.
+
+    The import name is ``lingua`` but the correct PyPI distribution is
+    ``lingua-language-detector``. Since Trinity may be a PyInstaller launcher,
+    the package must be installed with child_python(), not an unrelated CMD
+    `pip` or a different Python launcher. Check only when the lyrics phase is
+    about to run; on success do not touch the environment or make network calls.
+    """
+    global _LINGUA_READY
+    if _LINGUA_READY:
+        return
+
+    py = child_python()
+    probe = [py, "-c", "from lingua import Language, LanguageDetectorBuilder"]
+    flags = ({"creationflags": subprocess.CREATE_NO_WINDOW}
+             if os.name == "nt" else {"start_new_session": True})
+
+    def verify():
+        return subprocess.run(
+            probe, cwd=SCRIPTS_DIR, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", timeout=90,
+            **flags,
+        )
+
+    try:
+        checked = verify()
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"Cannot check Trinity's lyrics language detector: {error}") from error
+    if checked.returncode == 0:
+        _LINGUA_READY = True
+        return
+
+    _check_stop_requested()
+    log("Missing/incompatible lingua language detector in Trinity's backend Python: " + py)
+    log("Installing the official lingua-language-detector package in the same Python environment...")
+    install = [py, "-m", "pip", "install", "--disable-pip-version-check",
+               "--only-binary=:all:", "--upgrade", "lingua-language-detector"]
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
+    try:
+        process = subprocess.Popen(
+            install, cwd=SCRIPTS_DIR, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+            text=True, encoding="utf-8", errors="replace", **flags,
+        )
+    except OSError as error:
+        raise RuntimeError(f"Could not start pip for Trinity's Python ({py}): {error}") from error
+
+    done = threading.Event()
+    watcher = None
+    if _GUI_STOP_MARKER:
+        watcher = threading.Thread(target=_watch_child_cancel, args=(process, done),
+                                   daemon=True, name="TrinityDependencyInstallCancel")
+        watcher.start()
+    try:
+        if process.stdout:
+            for line in process.stdout:
+                write_log_raw(line)
+    except KeyboardInterrupt:
+        if process.poll() is None:
+            process.terminate()
+        raise
+    finally:
+        done.set()
+        if watcher is not None:
+            watcher.join(timeout=0.3)
+        if process.stdout is not None:
+            process.stdout.close()
+
+    code = process.wait()
+    _check_stop_requested()
+    if code:
+        raise RuntimeError(
+            "Could not install lingua-language-detector in Trinity's Python "
+            f"({py}); pip exit code {code}. Audio/history remain unchanged. "
+            "See the Trinity log for the actual pip error."
+        )
+    try:
+        checked = verify()
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"Could not verify lingua installation: {error}") from error
+    if checked.returncode:
+        raise RuntimeError(
+            "Installed lingua-language-detector, but Python still cannot "
+            "import its Language/LanguageDetectorBuilder API. Check for a "
+            "conflicting 'lingua' package. No audio or history was discarded. "
+            + (checked.stdout or "")[-1500:]
+        )
+    _LINGUA_READY = True
+    log("Lyrics language detector is ready in Trinity's backend Python.")
+
+
 def run_script(script_name, extra_args=None, check=True):
     _check_stop_requested()
     script_path = os.path.join(SCRIPTS_DIR, script_name)
@@ -1132,6 +1228,11 @@ def run_script(script_name, extra_args=None, check=True):
 
     if not os.path.exists(script_path):
         raise SystemExit(f"Missing script: {script_path}")
+
+    # test.py imports lingua eagerly; recover the dependency before invoking
+    # the script rather than failing after successful YouTube downloads.
+    if script_name == "test.py":
+        _ensure_lyrics_language_detector()
 
     child_env = os.environ.copy()
     child_env["PYTHONIOENCODING"] = "utf-8"
@@ -1747,3 +1848,4 @@ if __name__ == "__main__":
     elif "--headless" in sys.argv:
         from trinity_ui import load_options
         main(**load_options())
+

@@ -130,20 +130,42 @@ def _atomic_save_oauth_token(path, credentials):
             temp.unlink()
 
 
-def _credentials():
-    """Use Downloads/credentials.json automatically; also accept Trinity keys."""
-    service_env = os.environ.get("TRINITY_HISTORY_SERVICE_ACCOUNT_JSON", "").strip()
+def _oauth_client_from_saved_token(path):
+    """Recover public Desktop OAuth *client configuration* from a local login.
+
+    An authorized-user JSON already contains the app client_id and client_secret.
+    It is enough to refresh the saved login, and can also start a new Google
+    browser consent flow when Google has actually revoked its refresh token.
+    Never copy the access/refresh tokens into an OAuth client configuration.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(data, dict) or not data.get("client_id"):
+        return None
+    return {"installed": {
+        "client_id": data["client_id"],
+        "client_secret": data.get("client_secret", ""),
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "redirect_uris": ["http://localhost"],
+    }}
+
+
+def _oauth_client_from_existing_config():
+    """Discover an existing Google Desktop OAuth app only when consent is needed.
+
+    No new JSON download is required after a first successful Sheets/Drive
+    browser login. Existing files remain a compatible first-time bootstrap.
+    """
     client_env = os.environ.get("TRINITY_HISTORY_OAUTH_CLIENT_JSON", "").strip()
-    if service_env:
-        candidates = [Path(service_env).expanduser()]
-    elif client_env:
+    if client_env:
         candidates = [Path(client_env).expanduser()]
     else:
         candidates = []
         for name in ("credentials.json", "google_drive_oauth_client.json"):
             candidates.extend(_possible_locations(name))
-        # Google Cloud Console often downloads an OAuth client with a long
-        # client_secret_*.json filename; accept that without renaming it.
         folders = [APP_DIR, SCRIPT_DIR, APP_DIR.parent, SCRIPT_DIR.parent,
                    Path.cwd(), Path.home() / "Downloads"]
         profile = os.environ.get("USERPROFILE")
@@ -154,84 +176,129 @@ def _credentials():
                 candidates.extend(sorted(folder.glob(pattern)))
         candidates.extend(_possible_locations("wavestack2-cbe4e94e8a01.json"))
 
-    # Prefer an interactive OAuth Desktop client for regular Google Drive users.
-    # Some machines have unrelated service-account credentials.json files; those
-    # cannot create files in a personal My Drive and must not silently win.
-    options = []
+    desktop, web, service = [], [], []
     for candidate in candidates:
         if not candidate.is_file():
             continue
         try:
-            content = json.loads(candidate.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError) as exc:
-            if service_env or client_env:
-                raise ValueError(f"Invalid Google JSON credentials: {candidate}: {exc}") from exc
+            data = json.loads(candidate.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as error:
+            if client_env:
+                raise ValueError(f"Invalid Google OAuth JSON at {candidate}: {error}") from error
             continue
-        if "installed" in content:
-            options.append((0, candidate, content))
-        elif "web" in content:
-            options.append((1, candidate, content))
-        elif content.get("type") == "service_account":
-            options.append((2, candidate, content))
-    if not options:
-        raise FileNotFoundError(
-            "No Google OAuth client found. Expected Downloads/credentials.json "
-            "or a client_secret*.json file (Google OAuth Desktop app)."
-        )
-    _, client, data = min(options, key=lambda option: option[0])
-    if data.get("type") == "service_account":
-        # An explicitly shared existing Sheet works with a service account.
-        # Personal My Drive does not grant service accounts storage quota.
+        if "installed" in data:
+            desktop.append(data)
+        elif "web" in data:
+            web.append(data)
+        elif data.get("type") == "service_account":
+            service.append(candidate)
+
+    if desktop:
+        return desktop[0], None
+    if web:
+        # Preserve compatibility with explicitly configured web clients, but
+        # recommend native Desktop clients for random loopback callback ports.
+        return web[0], None
+    if service:
+        return None, service[0]
+    return None, None
+
+
+def _credentials():
+    """Keep Sheets history signed in without requiring a JSON on every run.
+
+    The account, sheet ID and scopes are unchanged. Reauthorization still uses
+    Google's normal browser account picker; the token never leaves local
+    private storage or gets committed to GitHub.
+    """
+    service_env = os.environ.get("TRINITY_HISTORY_SERVICE_ACCOUNT_JSON", "").strip()
+    if service_env:
+        # An explicitly selected service account overrides interactive sign-in.
         if not _config_id():
-            raise RuntimeError(
-                "Service-account credentials need an existing spreadsheet ID "
-                "shared with that account. For personal Google Drive, use "
-                "the Desktop OAuth client JSON in Downloads."
-            )
+            raise RuntimeError("Service-account credentials need a spreadsheet ID "
+                               "shared with that account (TRINITY_HISTORY_SHEET_ID).")
         from google.oauth2 import service_account
-        return service_account.Credentials.from_service_account_file(str(client), scopes=SCOPES)
+        return service_account.Credentials.from_service_account_file(
+            str(Path(service_env).expanduser()), scopes=SCOPES)
 
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
 
-    # The file stores an OAuth refresh token, not history. Never commit it.
     token_path = APP_DIR / TOKEN_NAME
     auth = None
     if token_path.is_file():
         try:
             auth = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-        except (ValueError, KeyError, json.JSONDecodeError) as error:
-            print('Saved Sheets credentials are unreadable; browser sign-in '
-                  'is required: ' + str(error), flush=True)
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+            print("Saved Sheets credentials are unreadable; Google browser "
+                  "sign-in will be needed: " + str(error), flush=True)
         if auth and not set(SCOPES).issubset(set(auth.scopes or [])):
-            print('Sheets history OAuth scopes changed; browser approval '
-                  'is required.', flush=True)
+            print("Sheets OAuth scopes changed; one new Google browser "
+                  "approval is required.", flush=True)
             auth = None
+
     if auth and not auth.valid and auth.refresh_token:
         try:
             auth.refresh(Request())
         except Exception as error:
             if _oauth_refresh_permanently_invalid(error):
-                print('Google rejected the Sheets history refresh token; '
-                      'browser reauthorization is required.', flush=True)
+                print("Google rejected the saved Sheets history refresh token. "
+                      "If this OAuth app is in External/Testing, Google normally "
+                      "expires the token after seven days; publishing or eligible "
+                      "Personal mode is required for longer-lived approval. "
+                      "Opening Google sign-in again.", flush=True)
                 auth = None
             else:
                 raise RuntimeError(
-                    'Sheets automatic token refresh failed temporarily or due '
-                    'to a configuration problem. Saved login was PRESERVED; '
-                    'not opening a new browser login. No Sheets history '
-                    'operation was attempted. Error: ' + str(error)
+                    "Sheets automatic token refresh failed temporarily or due "
+                    "to a configuration problem. Saved login was PRESERVED; "
+                    "not opening another browser sign-in. No Sheets history "
+                    "operation was attempted. Error: " + str(error)
                 ) from error
-    if not auth or not auth.valid or not auth.refresh_token:
-        flow = InstalledAppFlow.from_client_secrets_file(str(client), SCOPES)
-        auth = flow.run_local_server(
-            port=0, open_browser=True, access_type='offline',
-            prompt='select_account consent'
-        )
-        if not auth.refresh_token:
-            raise RuntimeError('Google did not issue a Sheets offline refresh '
-                               'token. Check OAuth client and consent settings.')
+
+    if auth and auth.valid and auth.refresh_token:
+        # This is the common path, including after process/computer restarts.
+        # Crucially, it does not look for any OAuth client JSON or open a browser.
+        _atomic_save_oauth_token(token_path, auth)
+        return auth
+
+    # Google requires an OAuth application client ID for a browser flow. Reuse
+    # client information *already stored in a local successful login* first.
+    # This also supports the first Sheets login on a laptop with an existing
+    # Drive account login, without asking for a separate credentials download.
+    client_config = _oauth_client_from_saved_token(token_path)
+    if client_config is None:
+        client_config = _oauth_client_from_saved_token(
+            APP_DIR / "_google_drive_oauth_token.json")
+    if client_config is None:
+        client_config, service_client = _oauth_client_from_existing_config()
+        if service_client is not None:
+            if not _config_id():
+                raise RuntimeError(
+                    "Service-account credentials need a spreadsheet ID "
+                    "shared with that account. A personal Google Drive account "
+                    "must use browser Google sign-in instead.")
+            from google.oauth2 import service_account
+            return service_account.Credentials.from_service_account_file(
+                str(service_client), scopes=SCOPES)
+    if client_config is None:
+        raise RuntimeError(
+            "Google Sheets history needs an OAuth application client ID for "
+            "its FIRST browser sign-in. Trinity can reuse a saved Sheets/Drive "
+            "login or an existing Desktop OAuth client JSON automatically; "
+            "no credentials download is needed after initial setup. If none "
+            "exists, the application owner must first configure an OAuth "
+            "Desktop client. Google does not support anonymous OAuth sign-in.")
+
+    flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+    auth = flow.run_local_server(
+        port=0, open_browser=True, access_type="offline",
+        prompt="select_account consent",
+    )
+    if not auth.refresh_token:
+        raise RuntimeError("Google did not issue a Sheets offline refresh "
+                           "token. Check OAuth client and consent settings.")
     _atomic_save_oauth_token(token_path, auth)
     return auth
 
@@ -999,3 +1066,4 @@ def check_connection():
 def shared_sheet_url():
     with LOCK:
         return f"https://docs.google.com/spreadsheets/d/{_sheet_id()}/edit"
+
